@@ -111,6 +111,7 @@ class PlotWindow(QMainWindow):
                 }
         self.mock_data_mode = False  # Add mock data mode flag
         self.mock_data_df = pd.DataFrame()  # Add mock data DataFrame
+        self.plot_window_minutes = 10  # Rolling window size in minutes
 
         # Calibration values
         self.calibration_glutamate = 0.996
@@ -386,9 +387,17 @@ class PlotWindow(QMainWindow):
             ax = self.figure.add_subplot(111)
             for metabolite, values in metabolites.items():
                 scaled_values = values * self.gain_values[metabolite]
-                ax.plot(df["t[min]"], scaled_values, label=metabolite) #
-            ax.set_xlim(0, df["t[min]"].max())
-            ax.set_ylim(0, df.max())
+                ax.plot(df["t[min]"], scaled_values, label=metabolite)
+            
+            # Auto-scrolling window: show last N minutes
+            max_time = df["t[min]"].max()
+            if max_time > self.plot_window_minutes:
+                ax.set_xlim(max_time - self.plot_window_minutes, max_time)
+            else:
+                ax.set_xlim(0, max(self.plot_window_minutes, max_time))
+            
+            # Auto-scale y-axis
+            ax.set_ylim(bottom=0)
 
         except Exception as e:
             #print(e)
@@ -396,7 +405,7 @@ class PlotWindow(QMainWindow):
         self.canvas.draw_idle()
         ax.set_xlabel("Time (minutes)")
         ax.set_ylabel("mA")
-        ax.set_title("Time Series Data for Selected Channels")
+        ax.set_title(f"Time Series Data (Last {self.plot_window_minutes} Minutes)")
         ax.legend()
         ax.grid(True)
 
@@ -678,8 +687,19 @@ class SettingsDialog(QDialog):
     def accept_settings(self):
         """Update t_sampling and t_buffer when OK is pressed."""
         global t_sampling, t_buffer
+        # Update global variables for new sequences
         t_sampling = self.sampling_time_spinbox.value()
         t_buffer = self.buffer_time_spinbox.value()
+        
+        # Update instance variables if parent is AMUZAGUI
+        if hasattr(self.parent(), 'settings_lock'):
+            gui = self.parent()
+            with gui.settings_lock:
+                gui.t_buffer = t_buffer
+                gui.t_sampling = t_sampling
+            if gui.is_sampling:
+                gui.add_to_display(f"⚙️ Settings updated: Buffer={t_buffer}s, Sampling={t_sampling}s (applied to remaining wells)")
+        
         super().accept()
 
 
@@ -758,8 +778,17 @@ class AMUZAGUI(QWidget):
 
         # Set up the window
         self.setWindowTitle("AMUZA Controller")
-        self.setGeometry(100, 100, 1250, 400)
-        self.setFixedSize(1250, 500)  # Prevents the window from being resized
+        self.setGeometry(100, 100, 1250, 500)
+        
+        # Instance variables for dynamic timing updates
+        self.t_buffer = t_buffer
+        self.t_sampling = t_sampling
+        self.settings_lock = threading.Lock()
+        
+        # Track current sampling state
+        self.is_sampling = False
+        self.current_well_index = 0
+        self.pending_well_updates = False
 
         # Main layout - Horizontal
         self.main_layout = QHBoxLayout(self)
@@ -1000,6 +1029,9 @@ class AMUZAGUI(QWidget):
                 return
             # Reset method list
             self.method = []
+            self.current_well_index = 0
+            self.is_sampling = True
+            
             # Adjust temperature before starting
             connection.AdjustTemp(6)
             # Map the wells and create method sequences
@@ -1007,12 +1039,12 @@ class AMUZAGUI(QWidget):
             for loc in locations:
                 # Append the method sequence for each location
                 self.method.append(
-                    AMUZA_Master.Sequence([AMUZA_Master.Method([loc], t_sampling)])
+                    AMUZA_Master.Sequence([AMUZA_Master.Method([loc], self.t_sampling)])
                 )
 
             # Start the Control_Move process in a separate thread
             thread = threading.Thread(
-                target=self.Control_Move, args=(self.method, t_sampling), daemon=True
+                target=self.Control_Move, args=(self.method,), daemon=True
             )
             thread.start()
         else:
@@ -1034,6 +1066,8 @@ class AMUZAGUI(QWidget):
                     return
                 # Reset method list
                 self.method = []
+                self.current_well_index = 0
+                self.is_sampling = True
 
                 # Adjust temperature before moving
                 connection.AdjustTemp(6)
@@ -1043,38 +1077,93 @@ class AMUZAGUI(QWidget):
                 for loc in locations:
                     # Append the method sequence for each location
                     self.method.append(
-                        AMUZA_Master.Sequence([AMUZA_Master.Method([loc], t_sampling)])
+                        AMUZA_Master.Sequence([AMUZA_Master.Method([loc], self.t_sampling)])
                     )
 
                 # Start the Control_Move process in a separate thread
-                thread = threading.Thread(target=self.Control_Move, args=(self.method, t_sampling), daemon=True)
+                thread = threading.Thread(target=self.Control_Move, args=(self.method,), daemon=True)
                 thread.start()
             else:
                 self.add_to_display("No wells selected for MOVE.")
 
 
-    def Control_Move(self, method, duration):
-        """Simulate movement of the AMUZA system."""
-        for i, step in enumerate(method):
-            if self.stop_flag:
-                self.process_stopped_signal.emit()  # Emit stop signal
-                return  # Exit the method immediately
-            
-            time.sleep(t_buffer)  # Simulate buffer time
-            connection.Move(step)  # Perform the move operation
-            self.well_complete_signal.emit(i)  # Emit signal for well completion
-            
-            delay = 1
-            time.sleep(duration + 9 + delay)  # Simulate move duration
+    def Control_Move(self, method):
+        """Simulate movement of the AMUZA system with dynamic runtime updates."""
+        try:
+            for i, step in enumerate(method):
+                self.current_well_index = i
+                
+                # Check for stop flag
+                if self.stop_flag:
+                    self.process_stopped_signal.emit()
+                    return
+                
+                # Check if well list was updated (wells added/removed during sampling)
+                updated_wells = self._check_well_list_updates()
+                if updated_wells is not None:
+                    # Rebuild method list for remaining wells
+                    remaining_wells = updated_wells[i:]
+                    if not remaining_wells:
+                        self.add_to_display("⚠️ All remaining wells removed. Stopping.")
+                        self.process_stopped_signal.emit()
+                        return
+                    
+                    # Update well list and method for remaining wells
+                    self.well_list = updated_wells
+                    locations = connection.well_mapping(remaining_wells)
+                    method = []
+                    for loc in locations:
+                        method.append(
+                            AMUZA_Master.Sequence([AMUZA_Master.Method([loc], self.t_sampling)])
+                        )
+                    self.add_to_display(f"🔄 Well list updated: {', '.join(remaining_wells)} remaining")
+                    # Reset loop with new method
+                    step = method[0]
+                    i = 0
+                
+                # Get current timing values (may have been updated via settings)
+                with self.settings_lock:
+                    current_buffer = self.t_buffer
+                    current_sampling = self.t_sampling
+                
+                # Interruptible buffer time (uses current value)
+                if not self._interruptible_sleep(current_buffer):
+                    self.process_stopped_signal.emit()
+                    return
+                
+                connection.Move(step)  # Perform the move operation
+                self.well_complete_signal.emit(i)  # Emit signal for well completion
+                
+                delay = 1
+                # Interruptible move duration (uses current value)
+                if not self._interruptible_sleep(current_sampling + 9 + delay):
+                    self.process_stopped_signal.emit()
+                    return
 
-        self.move_complete_signal.emit()  # Emit completion signal if not stopped
+            self.move_complete_signal.emit()  # Emit completion signal if not stopped
+        finally:
+            self.is_sampling = False
 
+    def _check_well_list_updates(self):
+        """Check if well list was updated during sampling."""
+        global ctrl_selected_wells
+        
+        # Get current selected wells
+        current_selection = self.order(list(ctrl_selected_wells))
+        
+        # If selection changed, return updated list
+        if current_selection != self.well_list:
+            return current_selection
+        
+        return None
+    
     def update_display_for_well(self, well_index):
         """Update the display when a well is completed."""
         current_text = self.display_screen.toPlainText()
-        updated_text = f"{current_text}{self.well_list[well_index]}, "
-        self.display_screen.setPlainText(updated_text)
-        self.display_screen.moveCursor(self.display_screen.textCursor().End)
+        if well_index < len(self.well_list):
+            updated_text = f"{current_text}{self.well_list[well_index]}, "
+            self.display_screen.setPlainText(updated_text)
+            self.display_screen.moveCursor(self.display_screen.textCursor().End)
 
     def on_moves_complete(self):
         """Handle completion of all moves."""
@@ -1083,6 +1172,17 @@ class AMUZAGUI(QWidget):
     def on_process_stopped(self):
         """Handle the process being stopped."""
         self.add_to_display("Process stopped by the user.")
+
+    def _interruptible_sleep(self, total_seconds):
+        """Sleep in small chunks, checking stop_flag frequently. Returns False if stopped."""
+        sleep_chunk = 0.5  # Check every 0.5 seconds
+        elapsed = 0
+        while elapsed < total_seconds:
+            if self.stop_flag:
+                return False
+            time.sleep(min(sleep_chunk, total_seconds - elapsed))
+            elapsed += sleep_chunk
+        return True
 
     def open_settings_dialog(self):
         """Open the settings dialog to adjust t_sampling and t_buffer."""
@@ -1136,14 +1236,6 @@ class AMUZAGUI(QWidget):
         connection.Eject()
         self.add_to_display("Ejecting tray.")
         self.inserted = False
-
-    def resizeEvent(self, event):
-        """Lock the aspect ratio of the window."""
-        width = event.size().width()
-        aspect_ratio = 9 / 4
-        new_height = int(width / aspect_ratio)
-        self.resize(QSize(width, new_height))
-        super().resizeEvent(event)
 
     def mousePressEvent(self, event: QMouseEvent):
         """Handle mouse press event to start a selection or toggle a single well."""

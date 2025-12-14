@@ -147,6 +147,10 @@ class AmuzaConnection:
         else:
             print(f"? {cmd}")
     
+    def checkProgress(self):
+        """Check if the AMUZA is currently executing a command."""
+        return self.isInProgress
+    
     def connect(self):
         if logs:
             print("Attempting to Connect to AMUZA")
