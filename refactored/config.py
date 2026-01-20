@@ -119,17 +119,19 @@ class FileConfig:
     SENSOR_READINGS_FOLDER: str = "Sensor_Readings"
     AMUZA_LOGS_FOLDER: str = "Amuza_Logs"
     OUTPUT_FILE_PATH: str = "Sensor_Readings/output.csv"
-    
+    SETTINGS_FOLDER: str = ".mabip"  # In user home directory
+
     # File formats
     SENSOR_FILENAME_FORMAT: str = "Sensor_readings_{timestamp}.txt"
     AMUZA_LOG_FORMAT: str = "AMUZA-{timestamp}.log"
     TIMESTAMP_FORMAT: str = "%d_%m_%y_%H_%M"
     LOG_TIMESTAMP_FORMAT: str = "%Y-%m-%d_%H-%M-%S"
-    
+    SETTINGS_FILENAME: str = "settings.json"
+
     # Log rotation
     MAX_LOG_FILES: int = 10
     MAX_LOG_SIZE_MB: int = 10
-    
+
     # Data format
     DATA_SEPARATOR: str = "\t"
     HEADER_ROWS_SKIP: int = 3

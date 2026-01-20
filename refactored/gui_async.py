@@ -13,6 +13,7 @@ Key improvements:
 import asyncio
 import logging
 import sys
+import time
 from pathlib import Path
 from typing import Optional, List, Dict, Set
 from datetime import datetime
@@ -67,7 +68,9 @@ logger = logging.getLogger(__name__)
 
 class WellLabel(QLabel):
     """Interactive well label for well plate selection"""
-    
+
+    COMPLETED_COLOR = "#ffd700"  # Gold color for completed wells
+
     def __init__(self, well_id: str, row: int, col: int, size: int):
         super().__init__(well_id)
         self.well_id = well_id
@@ -75,7 +78,8 @@ class WellLabel(QLabel):
         self.col = col
         self.is_selected = False
         self.is_ctrl_selected = False
-        
+        self.is_completed = False
+
         # Styling
         self.setAlignment(Qt.AlignCenter)
         self.setFixedSize(size, size)
@@ -93,32 +97,44 @@ class WellLabel(QLabel):
         """)
         # Mouse events will be handled by parent widget
         self.setAttribute(Qt.WA_TransparentForMouseEvents, False)
-    
+
     def set_selected(self, selected: bool):
         """Update selection state"""
         self.is_selected = selected
         self._update_appearance()
-    
+
     def set_ctrl_selected(self, ctrl_selected: bool):
         """Update control selection state"""
         self.is_ctrl_selected = ctrl_selected
         self._update_appearance()
-    
+
+    def set_completed(self, completed: bool):
+        """Update completed state"""
+        self.is_completed = completed
+        self._update_appearance()
+
     def _update_appearance(self):
         """Update visual appearance based on state"""
-        if self.is_ctrl_selected:
+        if self.is_completed:
+            color = self.COMPLETED_COLOR
+            text_color = "black"
+        elif self.is_ctrl_selected:
             color = UI.CTRL_WELL_COLOR
+            text_color = "black"
         elif self.is_selected:
             color = UI.SELECTED_WELL_COLOR
+            text_color = "black"
         else:
             color = "white"
-        
+            text_color = "black"
+
         self.setStyleSheet(f"""
             QLabel {{
                 border: 1px solid black;
                 background-color: {color};
                 border-radius: 0px;
                 font-weight: 600;
+                color: {text_color};
             }}
             QLabel:hover {{
                 background-color: {color};
@@ -128,43 +144,111 @@ class WellLabel(QLabel):
 
 
 class PlotWindow(QMainWindow):
-    """Real-time plotting window with incremental file reading"""
-    
+    """
+    Real-time plotting window with OPTIMIZED rendering.
+
+    Optimizations:
+    - Pre-created line artists with set_data() instead of clear/replot
+    - draw_idle() for deferred rendering
+    - Direct data callback support (no file polling needed)
+    - Efficient numpy-based rolling window
+    - Proper y-axis scaling (allows negative values)
+    """
+
+    # Maximum points to keep in memory for rolling display
+    MAX_POINTS = 10000
+
     def __init__(self, app_state: AppState):
         super().__init__()
         self.app_state = app_state
-        
-        # File reading state
-        self.data_file = FILES.OUTPUT_FILE_PATH
+
+        # File reading state (for backward compatibility)
+        self.data_file = None
         self.last_file_position = 0
+        self.last_line_count = 0
         self.cached_data = pd.DataFrame()
-        self.full_data = pd.DataFrame()  # Store ALL data for saving
-        self.loaded_file_path = None  # Track loaded file for save
-        
-        # Raw file auto-save
-        self.raw_file_path = Path(FILES.OUTPUT_FILE_PATH).parent / f"raw_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-        self.raw_file_initialized = False
-        
+        self.full_data = pd.DataFrame()
+        self.loaded_file_path = None
+        self.header_lines_skipped = False
+
+        # OPTIMIZED: Use deque with maxlen for efficient bounded data storage
+        # This automatically discards old data when limit is reached - no memory growth!
+        from collections import deque
+        self._time_data = deque(maxlen=self.MAX_POINTS)  # Time in seconds
+        self._channel_data = {i: deque(maxlen=self.MAX_POINTS) for i in range(1, 8)}  # Channels 1-7
+
+        # Track if we're receiving data via callback (skip file polling if so)
+        self._using_callback = False
+
         # Plot configuration
         self.rolling_window_minutes = UI.PLOT_WINDOW_MINUTES
-        self.show_full_graph = False  # When True, show entire graph instead of rolling window
-        
-        # Metabolite gain values (calibration)
-        self.gain_values = {
-            "Glutamate": 3.394,
-            "Glutamine": 0.974,
-            "Glucose": 1.5,
-            "Lactate": 0.515,
-        }
-        
+        self.show_full_graph = False
+
+        # Metabolite gain values (from app_state)
+        self.gain_values = app_state.calibration_gains.copy()
+
+        # OPTIMIZED: Pre-created line artists (will be set in _init_ui)
+        self._lines = {}  # {metabolite_name: Line2D}
+        self._needs_full_redraw = True  # Flag for when we need to redraw everything
+
+        # User interaction tracking - when True, don't auto-scroll
+        self._user_panned = False
+
         self._init_ui()
-        
-        # Update timer
+
+        # Update timer - only used for file polling fallback
         self.timer = QTimer()
         self.timer.timeout.connect(self._on_timer_update)
         self.timer.start(UI.PLOT_UPDATE_INTERVAL_MS)
-        
-        logger.info(f"PlotWindow initialized, raw data will be saved to {self.raw_file_path}")
+
+        logger.info("PlotWindow initialized with optimized rendering")
+
+    def update_gains(self, gains: dict):
+        """Update gain values and refresh plot"""
+        self.gain_values.update(gains)
+        self._needs_full_redraw = True
+        self._update_plots()
+        logger.info(f"Plot gains updated: {self.gain_values}")
+
+    def set_sensor_file(self, file_path: str):
+        """Set the sensor data file to read from and reset reading state"""
+        self.data_file = file_path
+        self.last_file_position = 0
+        self.last_line_count = 0
+        self.header_lines_skipped = False
+        self.cached_data = pd.DataFrame()
+        self.full_data = pd.DataFrame()
+        self.loaded_file_path = None
+        self._clear_data_arrays()
+        logger.info(f"PlotWindow now reading from: {file_path}")
+
+    def add_reading(self, reading):
+        """
+        OPTIMIZED: Add a single reading directly from sensor callback.
+        This is more efficient than file polling.
+        Uses deque with maxlen - automatically discards old data, no memory growth!
+        """
+        self._using_callback = True  # Mark that we're using callback mode
+
+        # Add to internal deques (auto-trimmed by maxlen)
+        time_seconds = reading.time_minutes * 60
+        self._time_data.append(time_seconds)
+
+        for i, ch_val in enumerate(reading.channels[:6], start=1):
+            self._channel_data[i].append(ch_val)
+
+        # Temperature as channel 7
+        self._channel_data[7].append(reading.temperature)
+
+        # No manual trimming needed - deque maxlen handles it automatically!
+
+    def _clear_data_arrays(self):
+        """Clear internal data arrays (deques)"""
+        from collections import deque
+        self._time_data = deque(maxlen=self.MAX_POINTS)
+        self._channel_data = {i: deque(maxlen=self.MAX_POINTS) for i in range(1, 8)}
+        self._needs_full_redraw = True
+        # Don't reset _using_callback - sensor may still be running
     
     def _init_ui(self):
         """Initialize UI"""
@@ -197,7 +281,7 @@ class PlotWindow(QMainWindow):
         
         # Navigation toolbar for zoom/pan
         self.nav_toolbar = NavigationToolbar(self.canvas, self)
-        
+
         # Override the home button action to show full graph from 0
         # Find and disconnect the home action, then reconnect to our custom method
         for action in self.nav_toolbar.actions():
@@ -205,7 +289,11 @@ class PlotWindow(QMainWindow):
                 action.triggered.disconnect()
                 action.triggered.connect(self._on_home_clicked)
                 break
-        
+
+        # Connect to axes change events to detect user pan/zoom
+        self.ax_xlim_changed_cid = None
+        self.ax_ylim_changed_cid = None
+
         layout.addWidget(self.nav_toolbar)
         layout.addWidget(self.canvas)
         
@@ -215,27 +303,57 @@ class PlotWindow(QMainWindow):
         self.ax.set_xlabel("Time (min)")
         self.ax.set_ylabel("Concentration (mM)")
         self.ax.grid(True, alpha=0.3)
+
+        # OPTIMIZED: Pre-create line artists for each metabolite
+        # This avoids recreating them on every update
+        colors = {'Glutamate': 'b', 'Glutamine': 'g', 'Glucose': 'r', 'Lactate': 'c'}
+        for metabolite, color in colors.items():
+            line, = self.ax.plot([], [], color=color, linewidth=1, label=metabolite)
+            self._lines[metabolite] = line
+
         self.ax.legend()
-        
         self.figure.tight_layout()
+
+        # Connect to navigation toolbar events to detect user pan/zoom
+        # When user interacts, pause auto-scrolling
+        self.canvas.mpl_connect('button_release_event', self._on_mouse_release)
         
         # Control buttons
         button_layout = QHBoxLayout()
-        
+
+        self.auto_follow_btn = QPushButton("Auto-Follow")
+        self.auto_follow_btn.setToolTip("Resume auto-scrolling after pan/zoom")
+        self.auto_follow_btn.clicked.connect(self._on_auto_follow)
+        button_layout.addWidget(self.auto_follow_btn)
+
         self.clear_btn = QPushButton("Clear Data")
         self.clear_btn.clicked.connect(self._on_clear_data)
         button_layout.addWidget(self.clear_btn)
-        
+
         self.export_btn = QPushButton("Export CSV")
         self.export_btn.clicked.connect(self._on_export_data)
         button_layout.addWidget(self.export_btn)
-        
+
         layout.addLayout(button_layout)
+
+    def _on_auto_follow(self):
+        """Resume auto-scrolling to latest data"""
+        self._user_panned = False
+        self.show_full_graph = False  # Back to rolling window mode
+        self._update_plots()
     
     def _on_home_clicked(self):
-        """Custom home button handler - shows full graph from 0"""
+        """Custom home button handler - shows full graph from 0 and resumes auto-scroll"""
         self.show_full_graph = True
+        self._user_panned = False  # Resume auto-scrolling
         self._update_plots()
+
+    def _on_mouse_release(self, event):
+        """Detect when user finishes panning/zooming"""
+        # Check if pan or zoom mode is active in the toolbar
+        if self.nav_toolbar.mode in ('pan/zoom', 'zoom rect'):
+            self._user_panned = True
+            logger.debug("User panned - auto-scroll paused. Click 'Home' or 'Auto-Follow' to resume.")
     
     def _on_timer_update(self):
         """Timer callback for plot updates"""
@@ -244,241 +362,305 @@ class PlotWindow(QMainWindow):
         loop.create_task(self._update_plot_async())
     
     async def _update_plot_async(self):
-        """Async plot update with incremental file reading"""
+        """Async plot update - handles both callback mode and file polling fallback"""
+
+        # If using callback mode, just update the plot (data already in deques)
+        # No file polling needed - much more efficient and memory-safe!
+        if self._using_callback:
+            self._update_plots()
+            return
+
+        # FALLBACK: File polling mode (only used when callback not active)
+        if not self.data_file:
+            return
+
         try:
-            # Read new data incrementally
+            # Read new data incrementally from file
             new_data = await self._read_new_data()
-            
+
             if new_data is not None and not new_data.empty:
-                # Append to full data (keep ALL data for saving)
-                self.full_data = pd.concat([self.full_data, new_data], ignore_index=True)
-                
-                # Auto-save raw data
-                self._auto_save_raw_data(new_data)
-                
-                # Append to cached data for plotting
+                # NOTE: We do NOT accumulate full_data anymore!
+                # The sensor file already has complete data - no need to duplicate in memory.
+                # This prevents memory exhaustion during long sessions.
+
+                # Only keep cached_data for display (trimmed to rolling window)
                 self.cached_data = pd.concat([self.cached_data, new_data], ignore_index=True)
-                
-                # Trim cached data for display (keep only rolling window)
-                if not self.cached_data.empty:
+
+                # Trim to rolling window to prevent memory growth
+                if not self.cached_data.empty and not self.show_full_graph:
                     current_time = self.cached_data['Time'].max()
                     cutoff_time = current_time - (self.rolling_window_minutes * 60)
                     self.cached_data = self.cached_data[self.cached_data['Time'] >= cutoff_time]
-                
+
+                    # Also limit total rows as safety net
+                    if len(self.cached_data) > self.MAX_POINTS:
+                        self.cached_data = self.cached_data.tail(self.MAX_POINTS)
+
                 # Update plots
                 self._update_plots()
-        
+
         except Exception as e:
             logger.error(f"Error updating plot: {e}")
     
     def _auto_save_raw_data(self, new_data: pd.DataFrame):
-        """Auto-save new data to raw file in original tab-separated format"""
-        try:
-            with open(self.raw_file_path, 'a') as f:
-                if not self.raw_file_initialized:
-                    # Write header for new file
-                    now = datetime.now()
-                    f.write(f"Created: {now.strftime('%m/%d/%Y')}\t{now.strftime('%I:%M:%S %p')}\n")
-                    
-                    # Write column headers
-                    cols = ['counter', 't[min]']
-                    for ch in range(1, 8):
-                        cols.append(f'#1ch{ch}')
-                    f.write('\t'.join(cols) + '\n')
-                    
-                    f.write(f"Start: {now.strftime('%m/%d/%Y')}\t{now.strftime('%I:%M:%S %p')}\n")
-                    self.raw_file_initialized = True
-                
-                # Write new data rows
-                for idx, row in new_data.iterrows():
-                    counter = len(self.full_data) - len(new_data) + idx + 1
-                    time_min = row['Time'] / 60.0 if 'Time' in row else 0
-                    values = [str(int(counter)), f"{time_min:.4f}"]
-                    
-                    for ch in range(1, 8):
-                        col_name = f'Channel {ch}'
-                        if col_name in row:
-                            values.append(f"{row[col_name]:.2f}")
-                        else:
-                            values.append("0.00")
-                    
-                    f.write('\t'.join(values) + '\n')
-        except Exception as e:
-            logger.error(f"Error auto-saving raw data: {e}")
+        """No longer needed - sensor reader saves data directly"""
+        # The AsyncPotentiostatReader already saves data to the output file
+        # This method is kept for backwards compatibility but does nothing
+        pass
     
     async def _read_new_data(self) -> Optional[pd.DataFrame]:
         """
-        Read only new lines from file since last read.
-        
+        Read only new lines from sensor file since last read.
+
+        Expects tab-separated legacy format:
+        Line 1: Created: MM/DD/YYYY\tHH:MM:SS AM/PM
+        Line 2: counter\tt[min]\t#1ch1\t#1ch2\t...
+        Line 3: Start: MM/DD/YYYY\tHH:MM:SS AM/PM
+        Line 4+: Data rows (counter\ttime\tch1\tch2\t...)
+
         Returns:
             DataFrame with new data, or None if no new data
         """
+        if not self.data_file:
+            return None
+
         try:
             import aiofiles
-            
-            async with aiofiles.open(self.data_file, 'r') as f:
-                # Seek to last position
-                await f.seek(self.last_file_position)
-                
-                # Read new lines
-                new_lines = await f.readlines()
-                
-                # Update position
-                self.last_file_position = await f.tell()
-            
-            if not new_lines:
+            from pathlib import Path
+
+            # Check if file exists
+            if not Path(self.data_file).exists():
                 return None
-            
-            # Parse lines
+
+            async with aiofiles.open(self.data_file, 'r') as f:
+                # Read all lines
+                all_lines = await f.readlines()
+
+            # Skip header (first 3 lines) and get only new data lines
+            data_start_line = 3  # Lines 0, 1, 2 are header
+
+            # If no new lines since last read, return None
+            total_data_lines = len(all_lines) - data_start_line
+            if total_data_lines <= 0:
+                return None
+
+            # Check if we have new data
+            new_line_count = total_data_lines
+            if new_line_count <= self.last_line_count:
+                return None
+
+            # Get only new lines (from last_line_count to end)
+            new_lines = all_lines[data_start_line + self.last_line_count:]
+            self.last_line_count = new_line_count
+
+            # Parse tab-separated data lines
             data_rows = []
             for line in new_lines:
                 line = line.strip()
-                if not line or line.startswith('#'):
+                if not line:
                     continue
-                
-                parts = line.split(',')
-                if len(parts) >= 3:
-                    try:
-                        data_rows.append({
-                            'Time': float(parts[0]),
-                            'Channel': int(parts[1]),
-                            'Value': float(parts[2])
-                        })
-                    except ValueError:
-                        continue
-            
+
+                parts = line.split('\t')
+
+                # Need at least: counter, time, ch1-ch7
+                if len(parts) < 9:
+                    continue
+
+                try:
+                    # Parse counter and time
+                    counter = int(parts[0])
+                    time_min = float(parts[1])
+                    time_seconds = time_min * 60  # Convert to seconds for internal use
+
+                    # Parse channels 1-7 (indices 2-8)
+                    row_data = {'Time': time_seconds}
+                    for ch in range(1, 8):
+                        col_idx = ch + 1  # Channel 1 is at index 2
+                        if col_idx < len(parts):
+                            try:
+                                row_data[f'Channel {ch}'] = float(parts[col_idx])
+                            except ValueError:
+                                row_data[f'Channel {ch}'] = 0.0
+                        else:
+                            row_data[f'Channel {ch}'] = 0.0
+
+                    data_rows.append(row_data)
+
+                except (ValueError, IndexError) as e:
+                    logger.debug(f"Skipping invalid line: {e}")
+                    continue
+
             if data_rows:
+                logger.debug(f"Read {len(data_rows)} new data rows from sensor file")
                 return pd.DataFrame(data_rows)
-            
+
             return None
-        
+
         except FileNotFoundError:
-            # File doesn't exist yet
             return None
         except Exception as e:
-            logger.error(f"Error reading data file: {e}")
+            logger.error(f"Error reading sensor data file: {e}")
             return None
     
     def _update_plots(self):
-        """Update single plot with metabolite data"""
-        if self.cached_data.empty:
+        """
+        OPTIMIZED: Update plot using line.set_data() instead of clear/replot.
+        This is much faster for real-time updates.
+        """
+        import numpy as np
+
+        # Determine data source: internal arrays or cached DataFrame
+        if self._time_data:
+            # Use internal arrays (from direct callback)
+            time_arr = np.array(self._time_data)
+            channels = {i: np.array(self._channel_data[i]) for i in range(1, 7)}
+        elif not self.cached_data.empty and 'Channel 1' in self.cached_data.columns:
+            # Use cached DataFrame (from file polling)
+            time_arr = self.cached_data['Time'].values
+            channels = {i: self.cached_data[f'Channel {i}'].values for i in range(1, 7)}
+        else:
+            # No data
             return
-        
-        # Convert timestamp to relative minutes
-        start_time = self.cached_data['Time'].min()
-        self.cached_data['RelativeTime'] = (self.cached_data['Time'] - start_time) / 60
-        
-        # Clear and replot
-        self.ax.clear()
-        
-        # Colors for metabolites
-        colors = {'Glutamate': 'b', 'Glutamine': 'g', 'Glucose': 'r', 'Lactate': 'c'}
-        
-        # Check data format
-        if 'Channel 1' in self.cached_data.columns:
-            # Column-per-channel format (from loaded .txt or .csv files)
-            # Calculate metabolites from channels
-            metabolites = {}
-            if 'Channel 1' in self.cached_data.columns and 'Channel 2' in self.cached_data.columns:
-                metabolites['Glutamate'] = self.cached_data['Channel 1'] - self.cached_data['Channel 2']
-            if 'Channel 3' in self.cached_data.columns and 'Channel 1' in self.cached_data.columns:
-                metabolites['Glutamine'] = self.cached_data['Channel 3'] - self.cached_data['Channel 1']
-            if 'Channel 5' in self.cached_data.columns and 'Channel 4' in self.cached_data.columns:
-                metabolites['Glucose'] = self.cached_data['Channel 5'] - self.cached_data['Channel 4']
-            if 'Channel 6' in self.cached_data.columns and 'Channel 4' in self.cached_data.columns:
-                metabolites['Lactate'] = self.cached_data['Channel 6'] - self.cached_data['Channel 4']
-            
-            # Plot each metabolite with gain scaling
-            for metabolite, values in metabolites.items():
-                scaled_values = values * self.gain_values.get(metabolite, 1.0)
-                self.ax.plot(
-                    self.cached_data['RelativeTime'],
-                    scaled_values,
-                    color=colors.get(metabolite, 'k'),
-                    linewidth=1,
-                    label=metabolite
-                )
-        elif 'Channel' in self.cached_data.columns:
-            # Row-per-channel format (from real-time data) - needs different handling
-            for i in range(1, 7):
-                channel_data = self.cached_data[self.cached_data['Channel'] == i]
-                if not channel_data.empty:
-                    self.ax.plot(
-                        channel_data['RelativeTime'],
-                        channel_data['Value'],
-                        linewidth=1,
-                        label=f'Channel {i}'
-                    )
-        
-        # Set labels and title
-        self.ax.set_xlabel("Time (min)")
-        self.ax.set_ylabel("Concentration (mM)")
-        self.ax.set_title("Metabolite Concentrations")
-        self.ax.grid(True, alpha=0.3)
-        self.ax.legend()
-        self.ax.set_ylim(bottom=0)  # Start y-axis at 0
-        
-        # Set x-axis limits based on mode
-        if not self.cached_data.empty:
-            max_time = self.cached_data['RelativeTime'].max()
-            if self.show_full_graph:
-                # Show entire graph from 0 to max
-                self.ax.set_xlim(0, max(1, max_time))
+
+        if len(time_arr) == 0:
+            return
+
+        # Convert time to relative minutes
+        start_time = time_arr.min()
+        time_minutes = (time_arr - start_time) / 60.0
+
+        # Calculate metabolites from channel differences
+        metabolites = {}
+        if 1 in channels and 2 in channels:
+            metabolites['Glutamate'] = (channels[1] - channels[2]) * self.gain_values.get('Glutamate', 1.0)
+        if 3 in channels and 1 in channels:
+            metabolites['Glutamine'] = (channels[3] - channels[1]) * self.gain_values.get('Glutamine', 1.0)
+        if 5 in channels and 4 in channels:
+            metabolites['Glucose'] = (channels[5] - channels[4]) * self.gain_values.get('Glucose', 1.0)
+        if 6 in channels and 4 in channels:
+            metabolites['Lactate'] = (channels[6] - channels[4]) * self.gain_values.get('Lactate', 1.0)
+
+        # Apply rolling window filter to time
+        max_time = time_minutes.max() if len(time_minutes) > 0 else 0
+
+        if self.show_full_graph:
+            mask = np.ones(len(time_minutes), dtype=bool)
+            x_min, x_max = 0, max(1, max_time)
+        else:
+            if max_time > self.rolling_window_minutes:
+                cutoff = max_time - self.rolling_window_minutes
+                mask = time_minutes >= cutoff
+                x_min, x_max = cutoff, max_time
             else:
-                # Rolling window mode
-                if max_time > self.rolling_window_minutes:
-                    self.ax.set_xlim(max_time - self.rolling_window_minutes, max_time)
-                else:
-                    self.ax.set_xlim(0, max(self.rolling_window_minutes, max_time))
-        
-        self.canvas.draw()
+                mask = np.ones(len(time_minutes), dtype=bool)
+                x_min, x_max = 0, max(self.rolling_window_minutes, max_time)
+
+        # OPTIMIZED: Update line data without clearing
+        filtered_time = time_minutes[mask]
+
+        y_min, y_max = float('inf'), float('-inf')
+
+        for metabolite, line in self._lines.items():
+            if metabolite in metabolites:
+                filtered_values = metabolites[metabolite][mask]
+                line.set_data(filtered_time, filtered_values)
+
+                # Track y-range for autoscaling
+                if len(filtered_values) > 0:
+                    y_min = min(y_min, np.nanmin(filtered_values))
+                    y_max = max(y_max, np.nanmax(filtered_values))
+            else:
+                line.set_data([], [])
+
+        # Update axis limits ONLY if user hasn't manually panned
+        if not self._user_panned:
+            self.ax.set_xlim(x_min, x_max)
+
+            # Auto-scale Y axis with padding (allow negative values!)
+            if y_min != float('inf') and y_max != float('-inf'):
+                y_range = y_max - y_min
+                padding = max(0.1, y_range * 0.1)  # At least 0.1 padding
+                self.ax.set_ylim(y_min - padding, y_max + padding)
+
+        # Use draw_idle for deferred rendering (more efficient)
+        self.canvas.draw_idle()
     
     def _on_clear_data(self):
-        """Clear cached data and reset plots"""
+        """
+        Clear PLOT display only - does NOT affect the sensor log file.
+        The sensor continues recording to the same file in the background.
+        After clear, the plot shows only new data from this point onwards.
+        """
+        # Clear display-related caches (NOT the sensor file!)
         self.cached_data = pd.DataFrame()
         self.full_data = pd.DataFrame()
         self.last_file_position = 0
-        self.loaded_file_path = None  # Clear loaded file reference
-        self.show_full_graph = False  # Reset to rolling window mode
-        
-        # Start a new raw file for next data collection
-        self.raw_file_path = Path(FILES.OUTPUT_FILE_PATH).parent / f"raw_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-        self.raw_file_initialized = False
-        
-        self.ax.clear()
-        self.ax.set_title("Metabolite Concentrations")
-        self.ax.set_xlabel("Time (min)")
-        self.ax.set_ylabel("Concentration (mM)")
-        self.ax.grid(True, alpha=0.3)
-        self.ax.legend()
-        
-        self.canvas.draw()
-        logger.info("Plot data cleared, new raw file will be created")
+        self.last_line_count = 0
+        self.header_lines_skipped = False
+        self.loaded_file_path = None
+        self.show_full_graph = False
+        self._user_panned = False
+
+        # Clear internal plot arrays - sensor file continues unaffected
+        self._clear_data_arrays()
+
+        # Reset line data on plot
+        for line in self._lines.values():
+            line.set_data([], [])
+
+        self.ax.set_xlim(0, self.rolling_window_minutes)
+        self.ax.set_ylim(0, 1)
+
+        self.canvas.draw_idle()
+        logger.info("Plot display cleared (sensor file continues recording)")
     
     def _on_export_data(self):
-        """Export raw channel data to CSV"""
-        if self.cached_data.empty:
-            QMessageBox.warning(self, "No Data", "No data to export")
-            return
-        
-        # Export raw channel data with time and temperature
-        export_data = pd.DataFrame()
-        export_data['Time (min)'] = self.cached_data['RelativeTime'] if 'RelativeTime' in self.cached_data.columns else self.cached_data['Time'] / 60
-        
-        # Add individual channels (1-6)
-        for ch in range(1, 7):
-            col_name = f'Channel {ch}'
-            if col_name in self.cached_data.columns:
-                export_data[col_name] = self.cached_data[col_name]
-        
-        # Add temperature (Channel 7)
-        if 'Channel 7' in self.cached_data.columns:
-            export_data['Temperature'] = self.cached_data['Channel 7']
-        
+        """
+        Export what's currently shown on the plot to CSV.
+        This exports the internal arrays (post-clear data if cleared).
+        The full sensor log file is always preserved separately.
+        """
+        import numpy as np
+
+        # Check if we have data in internal arrays (from direct callback)
+        if not self._time_data:
+            # Fallback to cached_data if available
+            if self.cached_data.empty:
+                QMessageBox.warning(self, "No Data", "No data to export. The plot is empty.")
+                return
+            # Use cached data
+            export_data = pd.DataFrame()
+            export_data['Time (min)'] = self.cached_data['RelativeTime'] if 'RelativeTime' in self.cached_data.columns else self.cached_data['Time'] / 60
+            for ch in range(1, 7):
+                col_name = f'Channel {ch}'
+                if col_name in self.cached_data.columns:
+                    export_data[col_name] = self.cached_data[col_name]
+            if 'Channel 7' in self.cached_data.columns:
+                export_data['Temperature'] = self.cached_data['Channel 7']
+        else:
+            # Export from internal arrays (what's shown on plot)
+            time_arr = np.array(self._time_data)
+            start_time = time_arr.min() if len(time_arr) > 0 else 0
+            time_minutes = (time_arr - start_time) / 60.0
+
+            export_data = pd.DataFrame()
+            export_data['Time (min)'] = time_minutes
+
+            for ch in range(1, 7):
+                if ch in self._channel_data:
+                    export_data[f'Channel {ch}'] = self._channel_data[ch]
+
+            if 7 in self._channel_data:
+                export_data['Temperature'] = self._channel_data[7]
+
         filename = f"export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
         export_data.to_csv(filename, index=False)
-        QMessageBox.information(self, "Export Complete", f"Data exported to {filename}")
-        logger.info(f"Data exported to {filename}")
+        QMessageBox.information(
+            self, "Export Complete",
+            f"Plot data exported to {filename}\n\n"
+            f"Note: Full sensor log is always preserved in the Sensor_Readings folder."
+        )
+        logger.info(f"Plot data exported to {filename}")
     
     def _on_load_file(self):
         """Load data from a saved .txt or .csv file"""
@@ -497,9 +679,12 @@ class PlotWindow(QMainWindow):
                 # Load TXT file (original format)
                 self._load_txt_file(file_path)
             
-            # Track loaded file
+            # Track loaded file and stop auto-reading from sensor
             self.loaded_file_path = file_path
+            self.data_file = None  # Stop auto-reading from sensor file
             self.last_file_position = 0
+            self.last_line_count = 0
+            self.header_lines_skipped = False
             
             # Show full graph when loading a saved file
             self.show_full_graph = True
@@ -618,13 +803,13 @@ class PlotWindow(QMainWindow):
             return
         
         try:
-            # If we have a raw file being recorded, copy it
-            if self.raw_file_initialized and self.raw_file_path.exists():
-                with open(self.raw_file_path, "r", encoding='utf-8') as source_file:
+            # If we have a sensor file connected, copy it
+            if self.data_file and Path(self.data_file).exists():
+                with open(self.data_file, "r", encoding='utf-8') as source_file:
                     with open(file_path, "w", encoding='utf-8') as dest_file:
                         dest_file.write(source_file.read())
                 QMessageBox.information(self, "Success", f"Data successfully saved to {file_path}")
-                logger.info(f"Saved raw data to {file_path}")
+                logger.info(f"Saved sensor data to {file_path}")
             # If we loaded a file, save that
             elif self.loaded_file_path and Path(self.loaded_file_path).exists():
                 with open(self.loaded_file_path, "r", encoding='utf-8') as source_file:
@@ -683,52 +868,114 @@ class PlotWindow(QMainWindow):
 
 
 class SettingsDialog(QDialog):
-    """Settings dialog for timing parameters"""
-    
+    """Settings dialog for timing and temperature parameters"""
+
     def __init__(self, app_state: AppState, parent=None):
         super().__init__(parent)
         self.app_state = app_state
         self._init_ui()
-    
+
     def _init_ui(self):
         """Initialize UI"""
         self.setWindowTitle("Settings")
-        
-        layout = QFormLayout(self)
-        
-        # Buffer time
+        self.setMinimumWidth(350)
+
+        layout = QVBoxLayout(self)
+
+        # Timing section
+        layout.addWidget(QLabel("<b>Timing Settings</b>"))
+
+        timing_form = QFormLayout()
+
+        # Buffer time with validation
         buffer_layout = QHBoxLayout()
         self.buffer_spin = QSpinBox()
-        self.buffer_spin.setRange(0, 600)
+        self.buffer_spin.setRange(1, 3600)
         self.buffer_spin.setValue(self.app_state.t_buffer)
+        self.buffer_spin.setToolTip("Time to wait before moving to next well (1-3600 seconds)")
         buffer_layout.addWidget(self.buffer_spin)
         buffer_layout.addWidget(QLabel("seconds"))
         buffer_layout.addStretch()
-        layout.addRow("Buffer Time:", buffer_layout)
-        
-        # Sampling time
+        timing_form.addRow("Buffer Time:", buffer_layout)
+
+        # Sampling time with validation
         sampling_layout = QHBoxLayout()
         self.sampling_spin = QSpinBox()
-        self.sampling_spin.setRange(0, 600)
+        self.sampling_spin.setRange(1, 3600)
         self.sampling_spin.setValue(self.app_state.t_sampling)
+        self.sampling_spin.setToolTip("Time to spend at each well (1-3600 seconds)")
         sampling_layout.addWidget(self.sampling_spin)
         sampling_layout.addWidget(QLabel("seconds"))
         sampling_layout.addStretch()
-        layout.addRow("Sampling Time:", sampling_layout)
-        
+        timing_form.addRow("Sampling Time:", sampling_layout)
+
+        layout.addLayout(timing_form)
+
+        # Temperature section
+        layout.addWidget(QLabel("<b>Temperature Settings</b>"))
+
+        temp_form = QFormLayout()
+
+        # Temperature
+        temp_layout = QHBoxLayout()
+        self.temp_spin = QDoubleSpinBox()
+        self.temp_spin.setRange(0.0, 50.0)
+        self.temp_spin.setDecimals(1)
+        self.temp_spin.setSingleStep(0.5)
+        self.temp_spin.setValue(self.app_state.target_temperature)
+        self.temp_spin.setToolTip("Target temperature (0-50 C)")
+        temp_layout.addWidget(self.temp_spin)
+        temp_layout.addWidget(QLabel("C"))
+        temp_layout.addStretch()
+        temp_form.addRow("Target Temperature:", temp_layout)
+
+        # Heater checkbox
+        self.heater_checkbox = QCheckBox("Enable Heater")
+        self.heater_checkbox.setChecked(self.app_state.heater_enabled)
+        self.heater_checkbox.setToolTip("Turn on the heater to maintain temperature")
+        temp_form.addRow("", self.heater_checkbox)
+
+        layout.addLayout(temp_form)
+
+        # Validation message
+        self.validation_label = QLabel("")
+        self.validation_label.setStyleSheet("color: red;")
+        layout.addWidget(self.validation_label)
+
         # Buttons
         buttons = QDialogButtonBox(
             QDialogButtonBox.Ok | QDialogButtonBox.Cancel
         )
-        buttons.accepted.connect(self.accept)
+        buttons.accepted.connect(self._validate_and_accept)
         buttons.rejected.connect(self.reject)
-        layout.addRow(buttons)
-    
+        layout.addWidget(buttons)
+
+    def _validate_and_accept(self):
+        """Validate inputs before accepting"""
+        buffer = self.buffer_spin.value()
+        sampling = self.sampling_spin.value()
+        temp = self.temp_spin.value()
+
+        # Validation
+        if buffer < 1:
+            self.validation_label.setText("Buffer time must be at least 1 second")
+            return
+        if sampling < 1:
+            self.validation_label.setText("Sampling time must be at least 1 second")
+            return
+        if temp < 0 or temp > 50:
+            self.validation_label.setText("Temperature must be between 0 and 50 C")
+            return
+
+        self.accept()
+
     def get_values(self):
         """Get current values"""
         return {
             'buffer': self.buffer_spin.value(),
-            'sampling': self.sampling_spin.value()
+            'sampling': self.sampling_spin.value(),
+            'temperature': self.temp_spin.value(),
+            'heater_enabled': self.heater_checkbox.isChecked()
         }
 
 
@@ -811,59 +1058,105 @@ class SensorConnectDialog(QDialog):
 
 class CalibrationSettingsDialog(QDialog):
     """Dialog for adjusting calibration values for each metabolite"""
-    
+
     def __init__(self, app_state: AppState, parent=None):
         super().__init__(parent)
         self.app_state = app_state
         self._init_ui()
-    
+
     def _init_ui(self):
         """Initialize UI"""
         self.setWindowTitle("Calibration Settings")
         self.setMinimumWidth(400)
-        
+
         layout = QVBoxLayout(self)
-        
+
         # Gain values section
+        layout.addWidget(QLabel("<b>Gain Values (scaling factors):</b>"))
+
         gain_group = QFormLayout()
-        layout.addWidget(QLabel("Gain Values:"))
-        
         self.gain_inputs = {}
-        gains = SENSOR.DEFAULT_GAINS
-        for metabolite, default_value in gains.items():
+
+        # Use current gains from app_state
+        current_gains = self.app_state.calibration_gains
+
+        for metabolite in ["Glutamate", "Glutamine", "Glucose", "Lactate"]:
             spin = QDoubleSpinBox()
             spin.setRange(0.001, 100.0)
             spin.setDecimals(3)
-            spin.setValue(default_value)
+            spin.setValue(current_gains.get(metabolite, SENSOR.DEFAULT_GAINS.get(metabolite, 1.0)))
+            spin.setToolTip(f"Scaling factor for {metabolite} measurement")
             gain_group.addRow(f"{metabolite}:", spin)
             self.gain_inputs[metabolite] = spin
-        
+
         layout.addLayout(gain_group)
-        
+
         # Calibration values section
-        layout.addWidget(QLabel("\nExpected Concentration Values (mM):"))
-        
+        layout.addWidget(QLabel("<b>Expected Concentration Values (mM):</b>"))
+
         cal_group = QFormLayout()
         self.calibration_inputs = {}
-        calibrations = SENSOR.DEFAULT_CALIBRATIONS
-        for metabolite, default_value in calibrations.items():
+
+        # Use current calibration values from app_state
+        current_calibrations = self.app_state.calibration_values
+
+        for metabolite in ["Glutamate", "Glutamine", "Glucose", "Lactate"]:
             spin = QDoubleSpinBox()
             spin.setRange(0.001, 1000.0)
             spin.setDecimals(3)
-            spin.setValue(default_value)
+            spin.setValue(current_calibrations.get(metabolite, SENSOR.DEFAULT_CALIBRATIONS.get(metabolite, 1.0)))
+            spin.setToolTip(f"Expected concentration for {metabolite} calibration standard")
             cal_group.addRow(f"{metabolite}:", spin)
             self.calibration_inputs[metabolite] = spin
-        
+
         layout.addLayout(cal_group)
-        
+
+        # Validation message
+        self.validation_label = QLabel("")
+        self.validation_label.setStyleSheet("color: red;")
+        layout.addWidget(self.validation_label)
+
         # Buttons
+        button_layout = QHBoxLayout()
+
+        reset_btn = QPushButton("Reset to Defaults")
+        reset_btn.clicked.connect(self._reset_to_defaults)
+        button_layout.addWidget(reset_btn)
+
+        button_layout.addStretch()
+
         buttons = QDialogButtonBox(
             QDialogButtonBox.Ok | QDialogButtonBox.Cancel
         )
-        buttons.accepted.connect(self.accept)
+        buttons.accepted.connect(self._validate_and_accept)
         buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
-    
+        button_layout.addWidget(buttons)
+
+        layout.addLayout(button_layout)
+
+    def _reset_to_defaults(self):
+        """Reset all values to defaults"""
+        for metabolite, spin in self.gain_inputs.items():
+            spin.setValue(SENSOR.DEFAULT_GAINS.get(metabolite, 1.0))
+        for metabolite, spin in self.calibration_inputs.items():
+            spin.setValue(SENSOR.DEFAULT_CALIBRATIONS.get(metabolite, 1.0))
+
+    def _validate_and_accept(self):
+        """Validate inputs before accepting"""
+        # Check all gains are positive
+        for metabolite, spin in self.gain_inputs.items():
+            if spin.value() <= 0:
+                self.validation_label.setText(f"{metabolite} gain must be positive")
+                return
+
+        # Check all calibrations are positive
+        for metabolite, spin in self.calibration_inputs.items():
+            if spin.value() <= 0:
+                self.validation_label.setText(f"{metabolite} calibration must be positive")
+                return
+
+        self.accept()
+
     def get_values(self):
         """Get current calibration values"""
         return {
@@ -904,7 +1197,22 @@ class AsyncAMUZAGUI(QMainWindow):
         self.experiment_timer.timeout.connect(self._update_experiment_timer)
         self.experiment_remaining_seconds = 0
         self.experiment_total_seconds = 0
-        
+
+        # Stop/Resume state
+        self.is_paused = False
+        self.remaining_wells: List[str] = []  # Wells not yet completed when paused
+        self.current_sequence_wells: List[str] = []  # All wells in current sequence
+
+        # Timer calibration (measure actual well duration)
+        self.first_well_start_time: Optional[float] = None
+        self.measured_well_duration: Optional[float] = None  # Actual time per well
+        self.wells_completed_count = 0
+
+        # Well completion log (synchronized with sensor log)
+        self.sensor_log_start_time: Optional[datetime] = None  # When sensor started logging
+        self.well_log_file: Optional[Path] = None  # Path to well completion log
+        self.well_log_initialized = False  # Whether header has been written
+
         self._init_ui()
         
         logger.info("AsyncAMUZAGUI initialized")
@@ -938,41 +1246,45 @@ class AsyncAMUZAGUI(QMainWindow):
         left_col = QVBoxLayout()
         
         self.connect_btn = QPushButton("Connect to AMUZA")
-        self.connect_btn.clicked.connect(lambda: asyncio.create_task(self._on_connect()))
+        self.connect_btn.clicked.connect(self._on_connect)
         left_col.addWidget(self.connect_btn)
-        
+
         self.start_btn = QPushButton("Start Sampling")
-        self.start_btn.clicked.connect(lambda: asyncio.create_task(self._on_start()))
+        self.start_btn.clicked.connect(self._on_start)
         self.start_btn.setEnabled(False)
         left_col.addWidget(self.start_btn)
-        
+
         self.insert_btn = QPushButton("Insert")
         self.insert_btn.setEnabled(False)
-        self.insert_btn.clicked.connect(lambda: asyncio.create_task(self._on_insert()))
+        self.insert_btn.clicked.connect(self._on_insert)
         left_col.addWidget(self.insert_btn)
-        
+
         self.eject_btn = QPushButton("Eject")
         self.eject_btn.setEnabled(False)
-        self.eject_btn.clicked.connect(lambda: asyncio.create_task(self._on_eject()))
+        self.eject_btn.clicked.connect(self._on_eject)
         left_col.addWidget(self.eject_btn)
-        
+
         self.move_btn = QPushButton("Move (Ctrl wells)")
         self.move_btn.setEnabled(False)
-        self.move_btn.clicked.connect(lambda: asyncio.create_task(self._on_move_ctrl()))
+        self.move_btn.clicked.connect(self._on_move_ctrl)
         left_col.addWidget(self.move_btn)
-        
+
         self.stop_btn = QPushButton("STOP")
         self.stop_btn.setStyleSheet("QPushButton { background:#e53935; color:white; font-weight:700; } QPushButton:hover{ background:#d32f2f; }")
-        self.stop_btn.clicked.connect(lambda: asyncio.create_task(self._on_stop()))
+        self.stop_btn.clicked.connect(self._on_stop_resume)
         self.stop_btn.setEnabled(False)
         left_col.addWidget(self.stop_btn)
-        
+
         self.settings_btn = QPushButton("Settings")
         self.settings_btn.clicked.connect(self._on_settings)
         left_col.addWidget(self.settings_btn)
-        
+
+        self.calibration_btn = QPushButton("Calibration")
+        self.calibration_btn.clicked.connect(self._on_calibration)
+        left_col.addWidget(self.calibration_btn)
+
         self.sensor_btn = QPushButton("Connect Sensor")
-        self.sensor_btn.clicked.connect(lambda: asyncio.create_task(self._on_sensor_connect()))
+        self.sensor_btn.clicked.connect(self._on_sensor_connect)
         left_col.addWidget(self.sensor_btn)
         
         self.plot_btn = QPushButton("Show Plot")
@@ -1033,7 +1345,7 @@ class AsyncAMUZAGUI(QMainWindow):
         
         # Clear button directly below grid
         clear_btn = QPushButton("Clear Selection")
-        clear_btn.clicked.connect(lambda: asyncio.create_task(self._clear_selections()))
+        clear_btn.clicked.connect(self._clear_selections)
         center_col.addWidget(clear_btn)
         
         # Display log below clear button
@@ -1065,13 +1377,14 @@ class AsyncAMUZAGUI(QMainWindow):
         main_layout.addLayout(center_col, 5)
         main_layout.addLayout(right_col, 2)
     
+    @asyncSlot()
     async def _on_connect(self):
         """Handle connect button"""
         try:
             # Create connection
             self.connection = AsyncAmuzaConnection(
                 device_address=HARDWARE.BLUETOOTH_DEVICE_ADDRESS,
-                use_mock=True  # Use mock for testing
+                use_mock=False  # Use real Bluetooth
             )
             
             # Connect
@@ -1130,7 +1443,7 @@ class AsyncAMUZAGUI(QMainWindow):
         """Handle mouse move for drag selection"""
         if self.drag_active and (event.buttons() & Qt.LeftButton) and not (event.modifiers() & Qt.ControlModifier):
             # Find which well we're over
-            for well_id, label in self.well_labels.items():
+            for _, label in self.well_labels.items():
                 if label.geometry().contains(label.parent().mapFromGlobal(event.globalPos())):
                     self._apply_drag_selection(label.row, label.col)
                     break
@@ -1193,13 +1506,25 @@ class AsyncAMUZAGUI(QMainWindow):
             await self.app_state.add_selected_well(wid)
         logger.info(f"Selected wells: {sorted(selected)}")
     
+    @asyncSlot()
     async def _clear_selections(self):
-        """Clear all selections"""
+        """Clear all selections and completed wells. Only reset pause state if paused."""
         await self.app_state.clear_selections()
+        await self.app_state.clear_completed_wells()
         for lbl in self.well_labels.values():
             lbl.set_selected(False)
             lbl.set_ctrl_selected(False)
-        self.add_to_display("Selections cleared.")
+            lbl.set_completed(False)
+
+        # Only reset pause/resume state if currently paused
+        if self.is_paused:
+            self.remaining_wells = []
+            self.current_sequence_wells = []
+            self._reset_stop_button()
+            self._stop_experiment_timer()
+            self.add_to_display("Selections cleared. Paused sequence cancelled.")
+        else:
+            self.add_to_display("Selections cleared.")
     
     async def _toggle_ctrl_well(self, well_id: str):
         """Toggle control (MOVE) selection with green highlight"""
@@ -1262,85 +1587,311 @@ class AsyncAMUZAGUI(QMainWindow):
         self.experiment_remaining_seconds = 0
         self.timer_label.setText("Experiment Timer:\n--:--:--")
         self.timer_label.setStyleSheet("QLabel { font-size: 14px; font-weight: bold; color: #2c3e50; border: 2px solid #3498db; border-radius: 6px; padding: 8px; background-color: #ecf0f1; }")
-    
+
+    def _format_time(self, seconds: int) -> str:
+        """Format seconds as HH:MM:SS"""
+        hours = seconds // 3600
+        minutes = (seconds % 3600) // 60
+        secs = seconds % 60
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+    async def _start_resumed_sequence(self):
+        """Start a sequence from remaining wells (after resume)"""
+        if not self.remaining_wells:
+            self.add_to_display("No wells to resume.")
+            return
+
+        t_buffer, t_sampling = await self.app_state.get_timing_params()
+
+        # Create sequence from remaining wells only
+        sequence = Sequence("Resumed Sequence")
+        for well_id in self.remaining_wells:
+            method = Method(
+                pos=well_id,
+                wait=t_sampling,
+                buffer_time=t_buffer,
+                eject=False,
+                insert=False
+            )
+            sequence.add_method(method)
+
+        # Recalculate timer based on measured duration if available
+        if self.measured_well_duration:
+            new_remaining = int(self.measured_well_duration * len(self.remaining_wells))
+            self.experiment_remaining_seconds = new_remaining
+        else:
+            # Use estimate
+            self.experiment_remaining_seconds = (t_buffer + t_sampling) * len(self.remaining_wells)
+
+        # Reset first well timing for this segment
+        self.first_well_start_time = time.time()
+
+        self.start_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
+
+        # Run in background task
+        task = asyncio.create_task(self._execute_sequence(sequence))
+        self.task_manager.add_task(task, "sampling_sequence")
+
+    @asyncSlot()
     async def _on_start(self):
         """Handle start sampling"""
         try:
             wells = await self.app_state.get_selected_wells()
-            
+
             if not wells:
                 QMessageBox.warning(self, "No Wells", "Please select wells to sample")
                 return
-            
+
+            # Clear any previous stop state and ensure clean start
             await self.app_state.clear_stop()
-            
+            self._reset_stop_button()  # Reset button to STOP state
+
+            # Cancel any ACTUALLY RUNNING sampling tasks from previous runs
+            for task in self.task_manager.get_running_tasks():
+                if task.get_name() == "sampling_sequence":
+                    # Only cancel if task is not done
+                    if not task.done():
+                        logger.info("Cancelling previous running sampling task")
+                        task.cancel()
+                        try:
+                            await task
+                        except asyncio.CancelledError:
+                            pass
+                    else:
+                        logger.info("Previous sampling task already completed, skipping cancel")
+
+            # Track wells for pause/resume
+            wells_list = sorted(list(wells))
+            self.current_sequence_wells = wells_list.copy()
+            self.remaining_wells = wells_list.copy()
+            self.wells_completed_count = 0
+            self.first_well_start_time = time.time()  # Start timing
+            self.measured_well_duration = None  # Will be set after first well
+
             # Create sequence
             sequence = Sequence("Sampling Sequence")
-            
+
             t_buffer, t_sampling = await self.app_state.get_timing_params()
-            
-            # Start experiment timer
-            self._start_experiment_timer(len(wells), t_buffer, t_sampling)
-            
-            for well_id in wells:
+
+            # Start experiment timer with estimate (will be recalibrated after first well)
+            self._start_experiment_timer(len(wells_list), t_buffer, t_sampling)
+
+            for well_id in wells_list:
                 method = Method(
                     pos=well_id,
-                    wait=t_buffer + t_sampling,
-                    eject=True,
-                    insert=True
+                    wait=t_sampling,  # Sampling time at well
+                    buffer_time=t_buffer,  # Buffer time before move
+                    eject=False,
+                    insert=False
                 )
                 sequence.add_method(method)
-            
+
             # Execute sequence
             self.start_btn.setEnabled(False)
             self.stop_btn.setEnabled(True)
-            self.add_to_display(f"Running plate on wells: {', '.join(sorted(wells))}")
-            
+            self.add_to_display(f"Running plate on wells: {', '.join(wells_list)}")
+
             # Run in background task
             task = asyncio.create_task(self._execute_sequence(sequence))
             self.task_manager.add_task(task, "sampling_sequence")
-        
+
         except Exception as e:
             logger.error(f"Start error: {e}")
             QMessageBox.critical(self, "Error", f"Failed to start: {e}")
     
     async def _execute_sequence(self, sequence: Sequence):
-        """Execute sampling sequence"""
+        """Execute sampling sequence with real-time well completion updates"""
         try:
             if not self.connection:
                 logger.error("No connection")
                 return
-            
+
             # Get stop event from app state
             stop_event = self.app_state.stop_event
             stop_event.clear()
-            
-            # Execute
-            completed = await self.connection.execute_sequence(sequence, stop_event)
-            
+
+            # Clear previous completed wells (only on fresh start, not resume)
+            if not self.is_paused:
+                await self.app_state.clear_completed_wells()
+                for label in self.well_labels.values():
+                    label.set_completed(False)
+
+            # Check if plate is ejected and notify user
+            if hasattr(self.connection, 'status') and self.connection.status.state != 1:
+                self.add_to_display("Plate not ready. Automatically inserting plate...")
+
+            # Define callback for well completion updates
+            def on_well_completed(well_id: str, completed_wells: list):
+                """Callback to update GUI when each well is completed"""
+                # Update display
+                total_wells = len(self.current_sequence_wells)
+                progress = len(completed_wells)
+                self.add_to_display(f"Well {well_id} completed ({progress}/{total_wells})")
+
+                # Mark well as completed in app_state
+                asyncio.create_task(self.app_state.mark_well_completed(well_id))
+
+                # Update well label visual
+                if well_id in self.well_labels:
+                    self.well_labels[well_id].set_completed(True)
+
+                # Remove from remaining wells
+                if well_id in self.remaining_wells:
+                    self.remaining_wells.remove(well_id)
+
+                # Log well completion with sensor-synchronized timestamp
+                self._log_well_completion(well_id, sequence.name)
+
+                # Track completion count and calibrate timer after first well
+                self.wells_completed_count += 1
+                if self.wells_completed_count == 1 and self.first_well_start_time:
+                    # Measure actual duration of first well
+                    self.measured_well_duration = time.time() - self.first_well_start_time
+                    logger.info(f"First well took {self.measured_well_duration:.1f}s - recalibrating timer")
+
+                    # Recalibrate experiment timer based on actual measurement
+                    remaining_count = len(self.remaining_wells)
+                    if remaining_count > 0:
+                        new_remaining_time = int(self.measured_well_duration * remaining_count)
+                        self.experiment_remaining_seconds = new_remaining_time
+                        self.experiment_total_seconds = int(self.measured_well_duration * total_wells)
+                        self.add_to_display(f"Timer recalibrated: ~{self._format_time(new_remaining_time)} remaining")
+
+                # Update progress label
+                self._update_progress_display(progress, total_wells, completed_wells)
+
+            # Execute sequence with callback (connection will handle auto-insert)
+            completed = await self.connection.execute_sequence(
+                sequence,
+                stop_event,
+                well_completed_callback=on_well_completed
+            )
+
+            # Handle completion vs stopped
             if completed:
-                QMessageBox.information(self, "Complete", "Sampling sequence completed")
-                self.add_to_display("Sampling sequence completed.")
+                self.add_to_display(f"Sampling sequence completed successfully ({len(self.current_sequence_wells)} wells)")
+                self.remaining_wells = []  # Clear remaining
+                self._reset_stop_button()
+                logger.info("Sampling sequence completed")
             else:
-                QMessageBox.information(self, "Stopped", "Sampling sequence stopped")
-                self.add_to_display("Sampling sequence stopped.")
-                self._stop_experiment_timer()
-        
+                # Stopped by user - don't reset button (it's now RESUME)
+                logger.info(f"Sampling sequence stopped. {len(self.remaining_wells)} wells remaining.")
+
         except Exception as e:
             logger.error(f"Sequence error: {e}")
-            QMessageBox.critical(self, "Error", f"Sequence failed: {e}")
+            self.add_to_display(f"Sequence failed: {e}")
             self._stop_experiment_timer()
-        
+            self._reset_stop_button()
+
         finally:
             self.start_btn.setEnabled(True)
-            self.stop_btn.setEnabled(False)
+            # Only disable stop button if sequence fully completed (not paused)
+            if not self.is_paused:
+                self.stop_btn.setEnabled(False)
+
+    def _update_progress_display(self, completed: int, total: int, completed_wells: list):
+        """Update progress information in timer label"""
+        # Show progress in timer label subtitle
+        progress_pct = int((completed / total) * 100) if total > 0 else 0
+        wells_str = ", ".join(completed_wells[-3:])  # Show last 3 completed
+        if len(completed_wells) > 3:
+            wells_str = "..." + wells_str
+        logger.debug(f"Progress: {completed}/{total} ({progress_pct}%)")
     
-    async def _on_stop(self):
-        """Handle stop button"""
-        await self.app_state.request_stop()
-        logger.info("Stop requested")
-        self.add_to_display("Stop requested.")
-    
+    @asyncSlot()
+    async def _on_stop_resume(self):
+        """Handle stop/resume toggle button"""
+        if not self.is_paused:
+            # STOP: Request stop, will finish current well then pause
+            await self.app_state.request_stop()
+            self.is_paused = True
+
+            # Change button to RESUME
+            self.stop_btn.setText("RESUME")
+            self.stop_btn.setStyleSheet("QPushButton { background:#2e7d32; color:white; font-weight:700; } QPushButton:hover{ background:#1b5e20; }")
+
+            # Pause the experiment timer
+            self.experiment_timer.stop()
+
+            logger.info("Stop requested - will finish current well then pause")
+            self.add_to_display("STOPPED - Finishing current well, then pausing. Press RESUME to continue.")
+        else:
+            # RESUME: Continue from remaining wells
+            if not self.remaining_wells:
+                self.add_to_display("No wells remaining to resume.")
+                self._reset_stop_button()
+                return
+
+            # Clear stop flag
+            await self.app_state.clear_stop()
+            self.is_paused = False
+
+            # Change button back to STOP
+            self._reset_stop_button()
+
+            # Resume experiment timer
+            self.experiment_timer.start(1000)
+
+            logger.info(f"Resuming sequence with {len(self.remaining_wells)} wells remaining")
+            self.add_to_display(f"RESUMED - Continuing with {len(self.remaining_wells)} wells: {', '.join(self.remaining_wells[:5])}{'...' if len(self.remaining_wells) > 5 else ''}")
+
+            # Start the resumed sequence
+            await self._start_resumed_sequence()
+
+    def _reset_stop_button(self):
+        """Reset stop button to default STOP state"""
+        self.is_paused = False
+        self.stop_btn.setText("STOP")
+        self.stop_btn.setStyleSheet("QPushButton { background:#e53935; color:white; font-weight:700; } QPushButton:hover{ background:#d32f2f; }")
+
+    def _init_well_log(self):
+        """Initialize well completion log file with header (only when sensor is logging)"""
+        if not self.sensor_log_start_time:
+            return
+
+        # Create well log file with same timestamp pattern as sensor log
+        timestamp = self.sensor_log_start_time.strftime("%d_%m_%y_%H_%M")
+        self.well_log_file = Path(FILES.SENSOR_READINGS_FOLDER) / f"Well_Log_{timestamp}.csv"
+
+        # Ensure directory exists
+        self.well_log_file.parent.mkdir(parents=True, exist_ok=True)
+
+        # Write header
+        with open(self.well_log_file, 'w') as f:
+            f.write(f"# Well completion log - Sensor started: {self.sensor_log_start_time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write("well_id,completed_at,sensor_elapsed_min,sequence_name\n")
+
+        self.well_log_initialized = True
+        self.add_to_display(f"Well log started: {self.well_log_file.name}")
+        logger.info(f"Well log initialized: {self.well_log_file}")
+
+    def _log_well_completion(self, well_id: str, sequence_name: str):
+        """Log well completion with sensor-synchronized timestamp"""
+        # Only log if sensor is connected and logging
+        if not self.sensor_log_start_time or not self.well_log_file:
+            return
+
+        now = datetime.now()
+
+        # Calculate sensor-relative time (same time base as sensor log t[min] column)
+        sensor_elapsed_min = (now - self.sensor_log_start_time).total_seconds() / 60.0
+
+        # Append to log file
+        try:
+            with open(self.well_log_file, 'a') as f:
+                f.write(f"{well_id},{now.strftime('%Y-%m-%d %H:%M:%S')},{sensor_elapsed_min:.4f},{sequence_name}\n")
+            logger.debug(f"Logged well {well_id} at sensor_elapsed={sensor_elapsed_min:.4f} min")
+        except Exception as e:
+            logger.error(f"Failed to write well log: {e}")
+
+    def _reset_well_log(self):
+        """Reset well log tracking (called when sensor disconnects)"""
+        self.sensor_log_start_time = None
+        self.well_log_file = None
+        self.well_log_initialized = False
+
+    @asyncSlot()
     async def _on_insert(self):
         """Insert tray"""
         if not self.connection:
@@ -1348,7 +1899,8 @@ class AsyncAMUZAGUI(QMainWindow):
             return
         await self.connection.insert()
         self.add_to_display("Insert command sent.")
-    
+
+    @asyncSlot()
     async def _on_eject(self):
         """Eject tray"""
         if not self.connection:
@@ -1356,7 +1908,8 @@ class AsyncAMUZAGUI(QMainWindow):
             return
         await self.connection.eject()
         self.add_to_display("Eject command sent.")
-    
+
+    @asyncSlot()
     async def _on_move_ctrl(self):
         """Run MOVE sequence on ctrl-selected wells"""
         try:
@@ -1364,18 +1917,48 @@ class AsyncAMUZAGUI(QMainWindow):
             if not wells:
                 QMessageBox.warning(self, "No Ctrl Wells", "Ctrl+click wells to move.")
                 return
+
+            # Sort wells in alphabetical/numerical order (A1, A2, B1, B2...)
+            wells_list = sorted(list(wells))
+
+            # Clear any previous stop state and ensure clean start
             await self.app_state.clear_stop()
+            self._reset_stop_button()
+
+            # Cancel any ACTUALLY RUNNING move tasks from previous runs
+            for task in self.task_manager.get_running_tasks():
+                if task.get_name() == "move_sequence":
+                    # Only cancel if task is not done
+                    if not task.done():
+                        logger.info("Cancelling previous running move task")
+                        task.cancel()
+                        try:
+                            await task
+                        except asyncio.CancelledError:
+                            pass
+                    else:
+                        logger.info("Previous move task already completed, skipping cancel")
+
             sequence = Sequence("Move Sequence")
-            t_buffer, t_sampling = await self.app_state.get_timing_params()
-            
+            _, t_sampling = await self.app_state.get_timing_params()
+
             # Start experiment timer (for Move, only use sampling time, no buffer)
-            self._start_experiment_timer(len(wells), 0, t_sampling)
-            
-            for well_id in wells:
-                method = Method(pos=well_id, wait=t_sampling, eject=True, insert=True)
+            self._start_experiment_timer(len(wells_list), 0, t_sampling)
+
+            # Track wells for pause/resume
+            self.current_sequence_wells = wells_list.copy()
+            self.remaining_wells = wells_list.copy()
+            self.wells_completed_count = 0
+            self.first_well_start_time = time.time()
+            self.measured_well_duration = None
+
+            for well_id in wells_list:
+                method = Method(pos=well_id, wait=t_sampling, buffer_time=0, eject=False, insert=False)
                 sequence.add_method(method)
-            
-            self.add_to_display(f"Moving to wells: {', '.join(sorted(wells))}")
+
+            self.start_btn.setEnabled(False)
+            self.stop_btn.setEnabled(True)
+            self.add_to_display(f"Moving to wells: {', '.join(wells_list)}")
             task = asyncio.create_task(self._execute_sequence(sequence))
             self.task_manager.add_task(task, "move_sequence")
         except Exception as e:
@@ -1386,79 +1969,161 @@ class AsyncAMUZAGUI(QMainWindow):
         """Show plot window"""
         if not self.plot_window:
             self.plot_window = PlotWindow(self.app_state)
-        
+
+        # If sensor is already running, connect plot to the sensor's output file
+        if self.sensor_reader and self.sensor_reader.is_running:
+            sensor_output_file = self.sensor_reader.get_output_file()
+            self.plot_window.set_sensor_file(sensor_output_file)
+            self.add_to_display(f"Plot connected to: {Path(sensor_output_file).name}")
+
         self.plot_window.show()
         self.plot_window.raise_()
     
     def _on_settings(self):
         """Show settings dialog"""
         dialog = SettingsDialog(self.app_state, self)
-        
+
         if dialog.exec_() == QDialog.Accepted:
             values = dialog.get_values()
+
+            # Update timing params
             asyncio.create_task(
                 self.app_state.set_timing_params(values['buffer'], values['sampling'])
             )
+
+            # Update temperature settings
+            asyncio.create_task(
+                self.app_state.set_temperature_settings(values['temperature'], values['heater_enabled'])
+            )
+
+            # Apply temperature to AMUZA if connected
+            if self.connection and self.connection.is_connected:
+                asyncio.create_task(self._apply_temperature_settings(values['temperature'], values['heater_enabled']))
+
+            # Save settings to file
+            asyncio.create_task(self.app_state.save_settings())
+
             logger.info(f"Settings updated: {values}")
-    
+            self.add_to_display(f"Settings saved: Buffer={values['buffer']}s, Sampling={values['sampling']}s, Temp={values['temperature']}C")
+
+    async def _apply_temperature_settings(self, temperature: float, heater_on: bool):
+        """Apply temperature settings to AMUZA device"""
+        try:
+            if self.connection:
+                await self.connection.set_temperature(temperature)
+                await self.connection.set_heater(heater_on)
+                self.add_to_display(f"Temperature set to {temperature}C, Heater {'ON' if heater_on else 'OFF'}")
+        except Exception as e:
+            logger.error(f"Failed to apply temperature settings: {e}")
+
     def _on_calibration(self):
         """Show calibration settings dialog"""
         dialog = CalibrationSettingsDialog(self.app_state, self)
-        
+
         if dialog.exec_() == QDialog.Accepted:
             values = dialog.get_values()
-            # Store calibration values (could be added to app_state if needed)
+
+            # Update app_state with new gains and calibrations
+            asyncio.create_task(
+                self.app_state.set_calibration_gains(values['gains'])
+            )
+            asyncio.create_task(
+                self.app_state.set_calibration_values(values['calibrations'])
+            )
+
+            # Update plot window if it exists
+            if self.plot_window:
+                self.plot_window.update_gains(values['gains'])
+
+            # Save settings to file
+            asyncio.create_task(self.app_state.save_settings())
+
             logger.info(f"Calibration updated: {values}")
-            self.add_to_display("Calibration settings updated.")
+            self.add_to_display("Calibration settings updated and saved.")
     
-    async def _on_sensor_connect(self):
-        """Handle sensor connect/disconnect"""
+    def _on_sensor_connect(self):
+        """Handle sensor connect/disconnect - uses sync dialog then schedules async work"""
         # If already connected, disconnect
         if self.sensor_reader and self.sensor_reader.is_running:
-            await self.sensor_reader.stop()
-            await self.sensor_reader.disconnect()
-            self.sensor_reader = None
-            self.sensor_btn.setText("Connect Sensor")
-            self.sensor_status_label.setText("Sensor: Disconnected")
-            self.add_to_display("Sensor disconnected.")
+            asyncio.create_task(self._disconnect_sensor())
             return
-        
-        # Show connect dialog
+
+        # Show connect dialog (synchronous - safe with exec_())
         dialog = SensorConnectDialog(self)
-        
+
         if dialog.exec_() == QDialog.Accepted:
             port = dialog.get_selected_port()
             if not port:
                 return
-            
-            use_mock = (port == "MOCK")
-            
-            try:
-                # Create sensor reader
-                self.sensor_reader = AsyncPotentiostatReader(
-                    port=port if not use_mock else "COM1",
-                    use_mock=use_mock,
-                    output_file=FILES.OUTPUT_FILE_PATH
-                )
-                
-                # Connect
-                if await self.sensor_reader.connect():
-                    # Start reading in background
-                    task = asyncio.create_task(self.sensor_reader.start_reading())
-                    self.task_manager.add_task(task, "sensor_reading")
-                    
-                    self.sensor_btn.setText("Disconnect Sensor")
-                    self.sensor_status_label.setText(f"Sensor: {port}")
-                    self.add_to_display(f"Sensor connected on {port}")
-                    logger.info(f"Sensor connected on {port}")
-                else:
-                    QMessageBox.warning(self, "Connection Failed", "Could not connect to sensor")
-                    self.sensor_reader = None
-            
-            except Exception as e:
-                logger.error(f"Sensor connection error: {e}")
-                QMessageBox.critical(self, "Error", f"Sensor connection failed: {e}")
+
+            # Schedule async connection
+            asyncio.create_task(self._connect_sensor(port))
+
+    async def _disconnect_sensor(self):
+        """Async helper to disconnect sensor"""
+        try:
+            await self.sensor_reader.stop()
+            await self.sensor_reader.disconnect()
+            self.sensor_reader = None
+
+            # Reset well log tracking (log file remains, but new wells won't be logged)
+            if self.well_log_file:
+                self.add_to_display(f"Well log saved: {self.well_log_file.name}")
+            self._reset_well_log()
+
+            self.sensor_btn.setText("Connect Sensor")
+            self.sensor_status_label.setText("Sensor: Disconnected")
+            self.add_to_display("Sensor disconnected.")
+        except Exception as e:
+            logger.error(f"Sensor disconnect error: {e}")
+
+    async def _connect_sensor(self, port: str):
+        """Async helper to connect sensor"""
+        use_mock = (port == "MOCK")
+
+        try:
+            # OPTIMIZED: Set up data callback for direct plot updates
+            # This is more efficient than file polling
+            def on_sensor_data(reading):
+                if self.plot_window:
+                    self.plot_window.add_reading(reading)
+
+            # Create sensor reader with data callback
+            self.sensor_reader = AsyncPotentiostatReader(
+                port=port if not use_mock else "COM1",
+                use_mock=use_mock,
+                data_callback=on_sensor_data
+            )
+
+            # Connect
+            if await self.sensor_reader.connect():
+                # Start reading in background
+                task = asyncio.create_task(self.sensor_reader.start_reading())
+                self.task_manager.add_task(task, "sensor_reading")
+
+                # Initialize well completion log (synchronized with sensor start)
+                self.sensor_log_start_time = datetime.now()
+                self._init_well_log()
+
+                # Update PlotWindow with the sensor's output file path
+                sensor_output_file = self.sensor_reader.get_output_file()
+                if self.plot_window:
+                    self.plot_window.set_sensor_file(sensor_output_file)
+                    self.add_to_display(f"Plot connected to: {Path(sensor_output_file).name}")
+
+                self.sensor_btn.setText("Disconnect Sensor")
+                self.sensor_status_label.setText(f"Sensor: {port}")
+                self.add_to_display(f"Sensor connected on {port}")
+                self.add_to_display(f"Data file: {Path(sensor_output_file).name}")
+                logger.info(f"Sensor connected on {port}, output: {sensor_output_file}")
+            else:
+                QMessageBox.warning(self, "Connection Failed", "Could not connect to sensor")
                 self.sensor_reader = None
+
+        except Exception as e:
+            logger.error(f"Sensor connection error: {e}")
+            QMessageBox.critical(self, "Error", f"Sensor connection failed: {e}")
+            self.sensor_reader = None
     
     def resizeEvent(self, event):
         """Handle window resize to update size display"""
@@ -1471,22 +2136,38 @@ class AsyncAMUZAGUI(QMainWindow):
         height = self.height()
         self.size_label.setText(f"Window: {width} × {height}")
     
+    def closeEvent(self, event):
+        """Handle window close - ensure sensor stops saving"""
+        logger.info("Main window closing - stopping sensor")
+
+        # Stop sensor reader synchronously to ensure file is flushed
+        if self.sensor_reader and self.sensor_reader.is_running:
+            self.sensor_reader.stop_event.set()
+            self.add_to_display("Stopping sensor on application close...")
+
+        # Close plot window
+        if self.plot_window:
+            self.plot_window.close()
+
+        event.accept()
+
     async def cleanup(self):
         """Cleanup resources"""
         logger.info("Cleaning up GUI resources")
-        
+
         # Cancel all tasks
         await self.task_manager.cancel_all_tasks()
-        
+
         # Disconnect AMUZA
         if self.connection:
             await self.connection.disconnect()
-        
-        # Disconnect sensor
+
+        # Disconnect sensor - ensure final buffer flush
         if self.sensor_reader:
             await self.sensor_reader.stop()
             await self.sensor_reader.disconnect()
-        
+            logger.info("Sensor reader stopped and disconnected")
+
         # Close plot window
         if self.plot_window:
             self.plot_window.close()
@@ -1505,19 +2186,28 @@ async def async_main():
     """Async main function"""
     # Create app state
     app_state = AppState()
-    
+
+    # Load saved settings
+    await app_state.load_settings()
+
     # Create task manager
     task_manager = AsyncTaskManager()
-    
+
+    # Ensure Sensor_Readings directory exists
+    Path(FILES.SENSOR_READINGS_FOLDER).mkdir(parents=True, exist_ok=True)
+    Path(FILES.AMUZA_LOGS_FOLDER).mkdir(parents=True, exist_ok=True)
+
     # Create and show GUI
     gui = AsyncAMUZAGUI(app_state, task_manager)
     gui.show()
-    
+
     # Wait for window to close
     try:
         while gui.isVisible():
             await asyncio.sleep(0.1)
     finally:
+        # Save settings before closing
+        await app_state.save_settings()
         await gui.cleanup()
 
 
