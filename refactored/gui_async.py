@@ -887,18 +887,7 @@ class SettingsDialog(QDialog):
 
         timing_form = QFormLayout()
 
-        # Buffer time with validation
-        buffer_layout = QHBoxLayout()
-        self.buffer_spin = QSpinBox()
-        self.buffer_spin.setRange(1, 3600)
-        self.buffer_spin.setValue(self.app_state.t_buffer)
-        self.buffer_spin.setToolTip("Time to wait before moving to next well (1-3600 seconds)")
-        buffer_layout.addWidget(self.buffer_spin)
-        buffer_layout.addWidget(QLabel("seconds"))
-        buffer_layout.addStretch()
-        timing_form.addRow("Buffer Time:", buffer_layout)
-
-        # Sampling time with validation
+        # Sampling time first (time spent at each well)
         sampling_layout = QHBoxLayout()
         self.sampling_spin = QSpinBox()
         self.sampling_spin.setRange(1, 3600)
@@ -908,6 +897,17 @@ class SettingsDialog(QDialog):
         sampling_layout.addWidget(QLabel("seconds"))
         sampling_layout.addStretch()
         timing_form.addRow("Sampling Time:", sampling_layout)
+
+        # Buffer time second (time before moving to next well)
+        buffer_layout = QHBoxLayout()
+        self.buffer_spin = QSpinBox()
+        self.buffer_spin.setRange(1, 3600)
+        self.buffer_spin.setValue(self.app_state.t_buffer)
+        self.buffer_spin.setToolTip("Time to wait before moving to next well (1-3600 seconds)")
+        buffer_layout.addWidget(self.buffer_spin)
+        buffer_layout.addWidget(QLabel("seconds"))
+        buffer_layout.addStretch()
+        timing_form.addRow("Buffer Time:", buffer_layout)
 
         layout.addLayout(timing_form)
 
@@ -957,11 +957,11 @@ class SettingsDialog(QDialog):
         temp = self.temp_spin.value()
 
         # Validation
-        if buffer < 1:
-            self.validation_label.setText("Buffer time must be at least 1 second")
-            return
         if sampling < 1:
             self.validation_label.setText("Sampling time must be at least 1 second")
+            return
+        if buffer < 1:
+            self.validation_label.setText("Buffer time must be at least 1 second")
             return
         if temp < 0 or temp > 50:
             self.validation_label.setText("Temperature must be between 0 and 50 C")
@@ -1662,7 +1662,8 @@ class AsyncAMUZAGUI(QMainWindow):
                         logger.info("Previous sampling task already completed, skipping cancel")
 
             # Track wells for pause/resume
-            wells_list = sorted(list(wells))
+            # Sort wells naturally: A1, A2, ... A10, A11, A12, B1, B2, ... (not A1, A10, A11...)
+            wells_list = sorted(list(wells), key=lambda x: (x[0], int(x[1:])))
             self.current_sequence_wells = wells_list.copy()
             self.remaining_wells = wells_list.copy()
             self.wells_completed_count = 0
@@ -1918,8 +1919,8 @@ class AsyncAMUZAGUI(QMainWindow):
                 QMessageBox.warning(self, "No Ctrl Wells", "Ctrl+click wells to move.")
                 return
 
-            # Sort wells in alphabetical/numerical order (A1, A2, B1, B2...)
-            wells_list = sorted(list(wells))
+            # Sort wells naturally: A1, A2, ... A10, A11, A12, B1, B2, ... (not A1, A10, A11...)
+            wells_list = sorted(list(wells), key=lambda x: (x[0], int(x[1:])))
 
             # Clear any previous stop state and ensure clean start
             await self.app_state.clear_stop()
@@ -1940,10 +1941,10 @@ class AsyncAMUZAGUI(QMainWindow):
                         logger.info("Previous move task already completed, skipping cancel")
 
             sequence = Sequence("Move Sequence")
-            _, t_sampling = await self.app_state.get_timing_params()
+            t_buffer, t_sampling = await self.app_state.get_timing_params()
 
-            # Start experiment timer (for Move, only use sampling time, no buffer)
-            self._start_experiment_timer(len(wells_list), 0, t_sampling)
+            # Start experiment timer (includes buffer time for accurate estimation)
+            self._start_experiment_timer(len(wells_list), t_buffer, t_sampling)
 
             # Track wells for pause/resume
             self.current_sequence_wells = wells_list.copy()
@@ -1953,7 +1954,7 @@ class AsyncAMUZAGUI(QMainWindow):
             self.measured_well_duration = None
 
             for well_id in wells_list:
-                method = Method(pos=well_id, wait=t_sampling, buffer_time=0, eject=False, insert=False)
+                method = Method(pos=well_id, wait=t_sampling, buffer_time=t_buffer, eject=False, insert=False)
                 sequence.add_method(method)
 
             self.start_btn.setEnabled(False)
