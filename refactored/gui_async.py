@@ -2046,10 +2046,12 @@ class AsyncAMUZAGUI(QMainWindow):
 
         if dialog.exec_() == QDialog.Accepted:
             values = dialog.get_values()
+            new_buffer = values['buffer']
+            new_sampling = values['sampling']
 
             # Update timing params
             asyncio.create_task(
-                self.app_state.set_timing_params(values['buffer'], values['sampling'])
+                self.app_state.set_timing_params(new_buffer, new_sampling)
             )
 
             # Update temperature settings
@@ -2061,11 +2063,50 @@ class AsyncAMUZAGUI(QMainWindow):
             if self.connection and self.connection.is_connected:
                 asyncio.create_task(self._apply_temperature_settings(values['temperature'], values['heater_enabled']))
 
+            # RECALCULATE TIMER if experiment is running or paused with remaining wells
+            if self.remaining_wells:
+                self._recalculate_experiment_timer(new_buffer, new_sampling)
+
             # Save settings to file
             asyncio.create_task(self.app_state.save_settings())
 
             logger.info(f"Settings updated: {values}")
             self.add_to_display(f"Settings saved: Buffer={values['buffer']}s, Sampling={values['sampling']}s, Temp={values['temperature']}C")
+
+    def _recalculate_experiment_timer(self, t_buffer: int, t_sampling: int):
+        """Recalculate experiment timer when settings change mid-experiment"""
+        remaining_count = len(self.remaining_wells)
+        if remaining_count <= 0:
+            return
+
+        # Calculate new remaining time based on updated settings
+        time_per_well = t_buffer + t_sampling
+        new_remaining_seconds = time_per_well * remaining_count
+
+        old_remaining = self.experiment_remaining_seconds
+        self.experiment_remaining_seconds = new_remaining_seconds
+
+        # Update total for percentage calculations if needed
+        total_wells = len(self.current_sequence_wells) if self.current_sequence_wells else remaining_count
+        self.experiment_total_seconds = time_per_well * total_wells
+
+        # Log the change
+        old_time_str = self._format_time(old_remaining)
+        new_time_str = self._format_time(new_remaining_seconds)
+        self.add_to_display(f"Timer updated: {old_time_str} → {new_time_str} ({remaining_count} wells × {time_per_well}s)")
+        logger.info(f"Experiment timer recalculated: {old_remaining}s → {new_remaining_seconds}s")
+
+    def _format_time(self, seconds: int) -> str:
+        """Format seconds as HH:MM:SS or MM:SS"""
+        if seconds < 0:
+            seconds = 0
+        hours = seconds // 3600
+        minutes = (seconds % 3600) // 60
+        secs = seconds % 60
+        if hours > 0:
+            return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+        else:
+            return f"{minutes:02d}:{secs:02d}"
 
     async def _apply_temperature_settings(self, temperature: float, heater_on: bool):
         """Apply temperature settings to AMUZA device"""
