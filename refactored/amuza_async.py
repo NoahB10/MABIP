@@ -306,6 +306,9 @@ class AsyncAmuzaConnection:
         self.max_failures = 3
         self.connection_healthy = True
 
+        # Timeout callback for GUI notification
+        self._timeout_callback: Optional[callable] = None
+
         # Background tasks
         self.command_sender_task: Optional[asyncio.Task] = None
         self.query_task: Optional[asyncio.Task] = None
@@ -318,6 +321,20 @@ class AsyncAmuzaConnection:
         self._init_logging()
 
         logger.info(f"AsyncAmuzaConnection initialized (mock={use_mock}, address={self.device_address})")
+
+    def set_timeout_callback(self, callback: callable):
+        """Set callback to be called when commands timeout after all retries.
+        Callback signature: callback(command: str, attempts: int)
+        """
+        self._timeout_callback = callback
+
+    def _notify_timeout(self, command: str, attempts: int):
+        """Notify GUI of timeout error"""
+        if self._timeout_callback:
+            try:
+                self._timeout_callback(command, attempts)
+            except Exception as e:
+                logger.error(f"Timeout callback error: {e}")
 
     def _init_logging(self):
         """Initialize AMUZA command logging"""
@@ -549,12 +566,24 @@ class AsyncAmuzaConnection:
                 return True
 
             except asyncio.TimeoutError:
-                logger.warning(f"Timeout (attempt {attempt + 1}): {cmd.command.strip()}")
+                logger.warning(f"Timeout (attempt {attempt + 1}/{cmd.retry_count}): {cmd.command.strip()}")
+                self.consecutive_failures += 1
             except Exception as e:
-                logger.error(f"Error (attempt {attempt + 1}): {e}")
+                logger.error(f"Error (attempt {attempt + 1}/{cmd.retry_count}): {e}")
+                self.consecutive_failures += 1
 
             if attempt < cmd.retry_count - 1:
                 await asyncio.sleep(0.5)
+
+        # All retries failed - notify GUI
+        self._log_command("ERROR", f"Command failed after {cmd.retry_count} attempts: {cmd.command.strip()}")
+        self._notify_timeout(cmd.command.strip(), cmd.retry_count)
+
+        # Mark connection as unhealthy if too many consecutive failures
+        if self.consecutive_failures >= self.max_failures:
+            self.connection_healthy = False
+            self.is_connected = False
+            logger.error(f"Connection marked unhealthy after {self.consecutive_failures} consecutive failures")
 
         return False
 

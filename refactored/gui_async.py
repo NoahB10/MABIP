@@ -1379,34 +1379,94 @@ class AsyncAMUZAGUI(QMainWindow):
     
     @asyncSlot()
     async def _on_connect(self):
-        """Handle connect button"""
+        """Handle connect/disconnect/reconnect button"""
+        # If already connected, disconnect
+        if self.connection and self.connection.is_connected:
+            await self._disconnect_amuza()
+            return
+
+        # Connect (or reconnect)
+        await self._connect_amuza()
+
+    async def _connect_amuza(self):
+        """Connect to AMUZA device"""
         try:
+            self.connect_btn.setText("Connecting...")
+            self.connect_btn.setEnabled(False)
+            self.status_label.setText("AMUZA: Connecting...")
+            self.add_to_display("Connecting to AMUZA...")
+
             # Create connection
             self.connection = AsyncAmuzaConnection(
                 device_address=HARDWARE.BLUETOOTH_DEVICE_ADDRESS,
-                use_mock=False  # Use real Bluetooth
+                use_mock=False
             )
-            
+
+            # Set timeout callback to update GUI on errors
+            self.connection.set_timeout_callback(self._on_amuza_timeout)
+
             # Connect
             if await self.connection.connect():
                 await self.app_state.set_connection(self.connection)
-                
-                self.status_label.setText("Connected")
-                self.connect_btn.setEnabled(False)
+
+                self.status_label.setText("AMUZA: Connected")
+                self.connect_btn.setText("Disconnect")
+                self.connect_btn.setEnabled(True)
                 self.insert_btn.setEnabled(True)
                 self.eject_btn.setEnabled(True)
                 self.move_btn.setEnabled(True)
                 self.start_btn.setEnabled(True)
                 self.stop_btn.setEnabled(True)
                 self.add_to_display("Connected to AMUZA.")
-                
                 logger.info("Connected to AMUZA")
             else:
+                self.status_label.setText("AMUZA: Connection Failed")
+                self.connect_btn.setText("Reconnect")
+                self.connect_btn.setEnabled(True)
+                self.add_to_display("Failed to connect to AMUZA.")
                 QMessageBox.warning(self, "Connection Failed", "Could not connect to device")
-        
+
         except Exception as e:
             logger.error(f"Connection error: {e}")
+            self.status_label.setText("AMUZA: Error")
+            self.connect_btn.setText("Reconnect")
+            self.connect_btn.setEnabled(True)
+            self.add_to_display(f"Connection error: {e}")
             QMessageBox.critical(self, "Error", f"Connection failed: {e}")
+
+    async def _disconnect_amuza(self):
+        """Disconnect from AMUZA device"""
+        try:
+            self.add_to_display("Disconnecting from AMUZA...")
+
+            if self.connection:
+                await self.connection.disconnect()
+                self.connection = None
+
+            await self.app_state.set_connection(None)
+
+            self.status_label.setText("AMUZA: Disconnected")
+            self.connect_btn.setText("Connect to AMUZA")
+            self.connect_btn.setEnabled(True)
+            self.insert_btn.setEnabled(False)
+            self.eject_btn.setEnabled(False)
+            self.move_btn.setEnabled(False)
+            self.start_btn.setEnabled(False)
+            self.stop_btn.setEnabled(False)
+            self.add_to_display("Disconnected from AMUZA.")
+            logger.info("Disconnected from AMUZA")
+
+        except Exception as e:
+            logger.error(f"Disconnect error: {e}")
+            self.add_to_display(f"Disconnect error: {e}")
+
+    def _on_amuza_timeout(self, command: str, attempts: int):
+        """Called when AMUZA command times out after all retries"""
+        self.status_label.setText("AMUZA: Timeout Error")
+        self.connect_btn.setText("Reconnect")
+        self.connect_btn.setEnabled(True)
+        self.add_to_display(f"AMUZA timeout: {command} failed after {attempts} attempts")
+        logger.warning(f"AMUZA timeout callback: {command} failed after {attempts} attempts")
     
     def _on_well_clicked(self, well_id: str):
         """Handle well click"""
