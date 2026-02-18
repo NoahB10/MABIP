@@ -2041,7 +2041,8 @@ class AsyncAMUZAGUI(QMainWindow):
         if self.sensor_reader and self.sensor_reader.is_running:
             sensor_output_file = self.sensor_reader.get_output_file()
             self.plot_window.set_sensor_file(sensor_output_file)
-            self.add_to_display(f"Plot connected to: {Path(sensor_output_file).name}")
+            self.plot_window._using_callback = True  # Enable callback mode for live data
+            self.add_to_display(f"Plot connected to live sensor data")
 
         self.plot_window.show()
         self.plot_window.raise_()
@@ -2213,11 +2214,17 @@ class AsyncAMUZAGUI(QMainWindow):
                 self.sensor_log_start_time = datetime.now()
                 self._init_well_log()
 
+                # Auto-open plot window if not already open
+                if not self.plot_window:
+                    self.plot_window = PlotWindow(self.app_state)
+
                 # Update PlotWindow with the sensor's output file path
                 sensor_output_file = self.sensor_reader.get_output_file()
-                if self.plot_window:
-                    self.plot_window.set_sensor_file(sensor_output_file)
-                    self.add_to_display(f"Plot connected to: {Path(sensor_output_file).name}")
+                self.plot_window.set_sensor_file(sensor_output_file)
+                self.plot_window._using_callback = True  # Enable callback mode
+                self.plot_window.show()
+                self.plot_window.raise_()
+                self.add_to_display(f"Plot window opened - receiving data")
 
                 self.sensor_btn.setText("Disconnect Sensor")
                 self.sensor_status_label.setText(f"Sensor: {port}")
