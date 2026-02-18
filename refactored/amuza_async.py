@@ -1019,7 +1019,8 @@ class AsyncAmuzaConnection:
         sequence: Sequence,
         stop_event: asyncio.Event,
         well_completed_callback: Optional[Callable[[str, List[str]], None]] = None,
-        progress_callback: Optional[Callable[[str, int, int], None]] = None
+        progress_callback: Optional[Callable[[str, int, int], None]] = None,
+        timing_provider: Optional[Callable[[], tuple]] = None
     ) -> bool:
         """
         Execute a sequence of methods with stop support.
@@ -1029,6 +1030,8 @@ class AsyncAmuzaConnection:
             stop_event: Event to check for stop request
             well_completed_callback: Callback(well_id, completed_wells_list)
             progress_callback: Callback(status, current_well_idx, total_wells)
+            timing_provider: Optional callback returning (buffer_time, sampling_time)
+                            If provided, updates method timing before each well
         """
         logger.info(f"Starting sequence: {sequence}")
         completed_wells = []
@@ -1044,6 +1047,17 @@ class AsyncAmuzaConnection:
                     logger.info(f"Sequence stopped at well {i + 1}/{len(sequence)}")
                     await self.stop_movement()
                     return False
+
+                # Get latest timing settings if provider is available
+                if timing_provider:
+                    try:
+                        t_buffer, t_sampling = timing_provider()
+                        if method.buffer_time != t_buffer or method.wait != t_sampling:
+                            logger.info(f"Timing updated for {method.pos}: buffer={t_buffer}s, sampling={t_sampling}s")
+                            method.buffer_time = t_buffer
+                            method.wait = t_sampling
+                    except Exception as e:
+                        logger.warning(f"Could not get timing from provider: {e}")
 
                 logger.info(f"Well {i + 1}/{len(sequence)}: {method}")
 

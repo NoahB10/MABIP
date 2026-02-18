@@ -1822,11 +1822,17 @@ class AsyncAMUZAGUI(QMainWindow):
                 # Update progress label
                 self._update_progress_display(progress, total_wells, completed_wells)
 
+            # Timing provider - returns current settings for dynamic updates
+            def get_current_timing():
+                """Return current (buffer, sampling) times from app_state"""
+                return (self.app_state.t_buffer, self.app_state.t_sampling)
+
             # Execute sequence with callback (connection will handle auto-insert)
             completed = await self.connection.execute_sequence(
                 sequence,
                 stop_event,
-                well_completed_callback=on_well_completed
+                well_completed_callback=on_well_completed,
+                timing_provider=get_current_timing
             )
 
             # Handle completion vs stopped
