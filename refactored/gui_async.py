@@ -158,9 +158,10 @@ class PlotWindow(QMainWindow):
     # Maximum points to keep in memory for rolling display
     MAX_POINTS = 10000
 
-    def __init__(self, app_state: AppState):
+    def __init__(self, app_state: AppState, main_gui=None):
         super().__init__()
         self.app_state = app_state
+        self.main_gui = main_gui  # Reference to main GUI for sensor control
 
         # File reading state (for backward compatibility)
         self.data_file = None
@@ -260,15 +261,47 @@ class PlotWindow(QMainWindow):
         
         # File Menu
         file_menu = menu_bar.addMenu("File")
-        
+
         load_action = QAction("Load Saved", self)
         load_action.triggered.connect(self._on_load_file)
         file_menu.addAction(load_action)
-        
+
         save_action = QAction("Save As", self)
         save_action.triggered.connect(self._on_save_file)
         file_menu.addAction(save_action)
-        
+
+        file_menu.addSeparator()
+
+        hide_action = QAction("Hide Plot", self)
+        hide_action.setShortcut("Ctrl+H")
+        hide_action.triggered.connect(self.hide)
+        file_menu.addAction(hide_action)
+
+        # Sensor Menu
+        sensor_menu = menu_bar.addMenu("Sensor")
+
+        self.connect_sensor_action = QAction("Connect Sensor...", self)
+        self.connect_sensor_action.triggered.connect(self._on_connect_sensor)
+        sensor_menu.addAction(self.connect_sensor_action)
+
+        self.disconnect_sensor_action = QAction("Disconnect Sensor", self)
+        self.disconnect_sensor_action.triggered.connect(self._on_disconnect_sensor)
+        self.disconnect_sensor_action.setEnabled(False)
+        sensor_menu.addAction(self.disconnect_sensor_action)
+
+        sensor_menu.addSeparator()
+
+        self.sensor_status_action = QAction("Status: Not Connected", self)
+        self.sensor_status_action.setEnabled(False)
+        sensor_menu.addAction(self.sensor_status_action)
+
+        # Calibration Menu
+        calibration_menu = menu_bar.addMenu("Calibration")
+
+        calibration_action = QAction("Calibration Settings...", self)
+        calibration_action.triggered.connect(self._on_calibration)
+        calibration_menu.addAction(calibration_action)
+
         # Main widget
         main_widget = QWidget()
         self.setCentralWidget(main_widget)
@@ -861,8 +894,58 @@ class PlotWindow(QMainWindow):
                 
                 f.write('\t'.join(values) + '\n')
     
+    def _on_connect_sensor(self):
+        """Handle sensor connect from menu - delegates to main GUI"""
+        if self.main_gui:
+            self.main_gui._on_sensor_connect()
+        else:
+            QMessageBox.warning(self, "Error", "No main GUI reference available")
+
+    def _on_disconnect_sensor(self):
+        """Handle sensor disconnect from menu - delegates to main GUI"""
+        if self.main_gui:
+            asyncio.create_task(self.main_gui._disconnect_sensor())
+        else:
+            QMessageBox.warning(self, "Error", "No main GUI reference available")
+
+    def _on_calibration(self):
+        """Show calibration settings dialog"""
+        dialog = CalibrationSettingsDialog(self.app_state, self)
+
+        if dialog.exec_() == QDialog.Accepted:
+            values = dialog.get_values()
+            self.app_state.calibration_gains.update(values)
+
+            # Update local plot gains
+            self.update_gains(values)
+
+            # Save settings
+            asyncio.create_task(self.app_state.save_settings())
+
+            logger.info(f"Calibration updated from PlotWindow: {values}")
+
+    def update_sensor_status(self, connected: bool, port: str = None):
+        """Update sensor menu status"""
+        if connected:
+            self.sensor_status_action.setText(f"Status: Connected ({port})")
+            self.connect_sensor_action.setEnabled(False)
+            self.disconnect_sensor_action.setEnabled(True)
+        else:
+            self.sensor_status_action.setText("Status: Not Connected")
+            self.connect_sensor_action.setEnabled(True)
+            self.disconnect_sensor_action.setEnabled(False)
+
     def closeEvent(self, event):
-        """Handle window close"""
+        """Handle window close - hide instead of close if sensor is running"""
+        # Check if sensor is running via main_gui
+        if self.main_gui and self.main_gui.sensor_reader and self.main_gui.sensor_reader.is_running:
+            # Just hide the window, don't actually close
+            event.ignore()
+            self.hide()
+            if self.main_gui:
+                self.main_gui.add_to_display("Plot window hidden (sensor still recording)")
+            return
+
         self.timer.stop()
         event.accept()
 
@@ -937,6 +1020,21 @@ class SettingsDialog(QDialog):
 
         layout.addLayout(temp_form)
 
+        # AMUZA Machine section
+        layout.addWidget(QLabel("<b>AMUZA Machine</b>"))
+
+        machine_form = QFormLayout()
+        self.machine_combo = QComboBox()
+        for machine_name in HARDWARE.AMUZA_DEVICES.keys():
+            self.machine_combo.addItem(machine_name)
+        # Set current selection from app_state
+        current_machine = getattr(self.app_state, 'selected_machine', HARDWARE.DEFAULT_AMUZA_DEVICE)
+        self.machine_combo.setCurrentText(current_machine)
+        self.machine_combo.setToolTip("Select which AMUZA machine to connect to")
+        machine_form.addRow("Machine:", self.machine_combo)
+
+        layout.addLayout(machine_form)
+
         # Validation message
         self.validation_label = QLabel("")
         self.validation_label.setStyleSheet("color: red;")
@@ -975,7 +1073,8 @@ class SettingsDialog(QDialog):
             'buffer': self.buffer_spin.value(),
             'sampling': self.sampling_spin.value(),
             'temperature': self.temp_spin.value(),
-            'heater_enabled': self.heater_checkbox.isChecked()
+            'heater_enabled': self.heater_checkbox.isChecked(),
+            'machine': self.machine_combo.currentText()
         }
 
 
@@ -1244,7 +1343,7 @@ class AsyncAMUZAGUI(QMainWindow):
         
         # Left column: controls only
         left_col = QVBoxLayout()
-        
+
         self.connect_btn = QPushButton("Connect to AMUZA")
         self.connect_btn.clicked.connect(self._on_connect)
         left_col.addWidget(self.connect_btn)
@@ -1279,14 +1378,6 @@ class AsyncAMUZAGUI(QMainWindow):
         self.settings_btn.clicked.connect(self._on_settings)
         left_col.addWidget(self.settings_btn)
 
-        self.calibration_btn = QPushButton("Calibration")
-        self.calibration_btn.clicked.connect(self._on_calibration)
-        left_col.addWidget(self.calibration_btn)
-
-        self.sensor_btn = QPushButton("Connect Sensor")
-        self.sensor_btn.clicked.connect(self._on_sensor_connect)
-        left_col.addWidget(self.sensor_btn)
-        
         self.plot_btn = QPushButton("Show Plot")
         self.plot_btn.clicked.connect(self._on_show_plot)
         left_col.addWidget(self.plot_btn)
@@ -1391,14 +1482,18 @@ class AsyncAMUZAGUI(QMainWindow):
     async def _connect_amuza(self):
         """Connect to AMUZA device"""
         try:
+            # Get selected machine from app_state (configured in Settings)
+            selected_machine = self.app_state.selected_machine
+            device_name = HARDWARE.AMUZA_DEVICES.get(selected_machine, HARDWARE.BT_DEVICE_NAME)
+
             self.connect_btn.setText("Connecting...")
             self.connect_btn.setEnabled(False)
-            self.status_label.setText("AMUZA: Connecting...")
-            self.add_to_display("Connecting to AMUZA...")
+            self.status_label.setText(f"AMUZA: Connecting to {selected_machine}...")
+            self.add_to_display(f"Connecting to {selected_machine} ({device_name})...")
 
-            # Create connection
+            # Create connection with selected device name
             self.connection = AsyncAmuzaConnection(
-                device_address=HARDWARE.BLUETOOTH_DEVICE_ADDRESS,
+                device_name=device_name,
                 use_mock=False
             )
 
@@ -1409,7 +1504,7 @@ class AsyncAMUZAGUI(QMainWindow):
             if await self.connection.connect():
                 await self.app_state.set_connection(self.connection)
 
-                self.status_label.setText("AMUZA: Connected")
+                self.status_label.setText(f"AMUZA: {selected_machine}")
                 self.connect_btn.setText("Disconnect")
                 self.connect_btn.setEnabled(True)
                 self.insert_btn.setEnabled(True)
@@ -1417,14 +1512,14 @@ class AsyncAMUZAGUI(QMainWindow):
                 self.move_btn.setEnabled(True)
                 self.start_btn.setEnabled(True)
                 self.stop_btn.setEnabled(True)
-                self.add_to_display("Connected to AMUZA.")
-                logger.info("Connected to AMUZA")
+                self.add_to_display(f"Connected to {selected_machine}.")
+                logger.info(f"Connected to AMUZA ({selected_machine}, device={device_name})")
             else:
                 self.status_label.setText("AMUZA: Connection Failed")
                 self.connect_btn.setText("Reconnect")
                 self.connect_btn.setEnabled(True)
-                self.add_to_display("Failed to connect to AMUZA.")
-                QMessageBox.warning(self, "Connection Failed", "Could not connect to device")
+                self.add_to_display(f"Failed to connect to {selected_machine}. Check Settings to change machine.")
+                QMessageBox.warning(self, "Connection Failed", f"Could not connect to {selected_machine}")
 
         except Exception as e:
             logger.error(f"Connection error: {e}")
@@ -1641,6 +1736,24 @@ class AsyncAMUZAGUI(QMainWindow):
             self.timer_label.setText(f"Experiment Timer:\nCOMPLETE!")
             self.timer_label.setStyleSheet("QLabel { font-size: 14px; font-weight: bold; color: #27ae60; border: 2px solid #2ecc71; border-radius: 6px; padding: 8px; background-color: #d5f4e6; }")
     
+    def _refresh_timer_display(self):
+        """Refresh the timer display without decrementing (for immediate updates)"""
+        if self.experiment_remaining_seconds > 0:
+            hours = self.experiment_remaining_seconds // 3600
+            minutes = (self.experiment_remaining_seconds % 3600) // 60
+            seconds = self.experiment_remaining_seconds % 60
+
+            time_str = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+            self.timer_label.setText(f"Experiment Timer:\n{time_str}")
+
+            # Update color based on remaining time
+            if self.experiment_remaining_seconds < 60:
+                self.timer_label.setStyleSheet("QLabel { font-size: 14px; font-weight: bold; color: #c0392b; border: 2px solid #e74c3c; border-radius: 6px; padding: 8px; background-color: #fadbd8; }")
+            elif self.experiment_remaining_seconds < 300:
+                self.timer_label.setStyleSheet("QLabel { font-size: 14px; font-weight: bold; color: #d68910; border: 2px solid #f39c12; border-radius: 6px; padding: 8px; background-color: #fdebd0; }")
+            else:
+                self.timer_label.setStyleSheet("QLabel { font-size: 14px; font-weight: bold; color: #2c3e50; border: 2px solid #3498db; border-radius: 6px; padding: 8px; background-color: #ecf0f1; }")
+
     def _stop_experiment_timer(self):
         """Stop and reset the experiment timer"""
         self.experiment_timer.stop()
@@ -2035,14 +2148,17 @@ class AsyncAMUZAGUI(QMainWindow):
     def _on_show_plot(self):
         """Show plot window"""
         if not self.plot_window:
-            self.plot_window = PlotWindow(self.app_state)
+            self.plot_window = PlotWindow(self.app_state, main_gui=self)
 
         # If sensor is already running, connect plot to the sensor's output file
         if self.sensor_reader and self.sensor_reader.is_running:
             sensor_output_file = self.sensor_reader.get_output_file()
             self.plot_window.set_sensor_file(sensor_output_file)
             self.plot_window._using_callback = True  # Enable callback mode for live data
+            self.plot_window.update_sensor_status(True, self.sensor_reader.port)
             self.add_to_display(f"Plot connected to live sensor data")
+        else:
+            self.plot_window.update_sensor_status(False)
 
         self.plot_window.show()
         self.plot_window.raise_()
@@ -2065,6 +2181,9 @@ class AsyncAMUZAGUI(QMainWindow):
             asyncio.create_task(
                 self.app_state.set_temperature_settings(values['temperature'], values['heater_enabled'])
             )
+
+            # Update selected machine
+            self.app_state.selected_machine = values['machine']
 
             # Apply temperature to AMUZA if connected
             if self.connection and self.connection.is_connected:
@@ -2102,6 +2221,9 @@ class AsyncAMUZAGUI(QMainWindow):
         new_time_str = self._format_time(new_remaining_seconds)
         self.add_to_display(f"Timer updated: {old_time_str} → {new_time_str} ({remaining_count} wells × {time_per_well}s)")
         logger.info(f"Experiment timer recalculated: {old_remaining}s → {new_remaining_seconds}s")
+
+        # Force immediate display update (don't wait for next tick)
+        self._refresh_timer_display()
 
     def _format_time(self, seconds: int) -> str:
         """Format seconds as HH:MM:SS or MM:SS"""
@@ -2151,22 +2273,26 @@ class AsyncAMUZAGUI(QMainWindow):
             self.add_to_display("Calibration settings updated and saved.")
     
     def _on_sensor_connect(self):
-        """Handle sensor connect/disconnect - uses sync dialog then schedules async work"""
+        """Handle sensor connect/disconnect - auto-connects to first available port"""
         # If already connected, disconnect
         if self.sensor_reader and self.sensor_reader.is_running:
             asyncio.create_task(self._disconnect_sensor())
             return
 
-        # Show connect dialog (synchronous - safe with exec_())
-        dialog = SensorConnectDialog(self)
-
-        if dialog.exec_() == QDialog.Accepted:
-            port = dialog.get_selected_port()
-            if not port:
-                return
-
-            # Schedule async connection
-            asyncio.create_task(self._connect_sensor(port))
+        # Auto-connect: find the first available serial port
+        if SERIAL_PORTS_AVAILABLE:
+            ports = list(list_ports.comports())
+            if ports:
+                # Use the first available port
+                port = ports[0].device
+                self.add_to_display(f"Auto-connecting to sensor on {port}...")
+                asyncio.create_task(self._connect_sensor(port))
+            else:
+                QMessageBox.warning(self, "No Sensor Found",
+                    "No serial ports detected.\n\nPlease check that the sensor is connected via USB.")
+        else:
+            QMessageBox.warning(self, "Serial Not Available",
+                "Serial port functionality not available.\n\nPlease install pyserial.")
 
     async def _disconnect_sensor(self):
         """Async helper to disconnect sensor"""
@@ -2180,8 +2306,10 @@ class AsyncAMUZAGUI(QMainWindow):
                 self.add_to_display(f"Well log saved: {self.well_log_file.name}")
             self._reset_well_log()
 
-            self.sensor_btn.setText("Connect Sensor")
+            # Update UI status
             self.sensor_status_label.setText("Sensor: Disconnected")
+            if self.plot_window:
+                self.plot_window.update_sensor_status(False)
             self.add_to_display("Sensor disconnected.")
         except Exception as e:
             logger.error(f"Sensor disconnect error: {e}")
@@ -2216,17 +2344,18 @@ class AsyncAMUZAGUI(QMainWindow):
 
                 # Auto-open plot window if not already open
                 if not self.plot_window:
-                    self.plot_window = PlotWindow(self.app_state)
+                    self.plot_window = PlotWindow(self.app_state, main_gui=self)
 
                 # Update PlotWindow with the sensor's output file path
                 sensor_output_file = self.sensor_reader.get_output_file()
                 self.plot_window.set_sensor_file(sensor_output_file)
                 self.plot_window._using_callback = True  # Enable callback mode
+                self.plot_window.update_sensor_status(True, port)
                 self.plot_window.show()
                 self.plot_window.raise_()
                 self.add_to_display(f"Plot window opened - receiving data")
 
-                self.sensor_btn.setText("Disconnect Sensor")
+                # Update UI status
                 self.sensor_status_label.setText(f"Sensor: {port}")
                 self.add_to_display(f"Sensor connected on {port}")
                 self.add_to_display(f"Data file: {Path(sensor_output_file).name}")

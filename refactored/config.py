@@ -8,9 +8,21 @@ from typing import Dict
 @dataclass
 class HardwareConfig:
     """Hardware timing and connection settings."""
-    # Bluetooth identity
+    # Bluetooth identity - Multiple AMUZA devices
+    # Format: {display_name: bluetooth_device_name}
+    AMUZA_DEVICES: Dict[str, str] = None  # Set in __post_init__
+    DEFAULT_AMUZA_DEVICE: str = "Machine 1"
+
+    # Legacy single device (for backwards compatibility)
     BLUETOOTH_DEVICE_ADDRESS: str = "FC:90:00:34"
     BT_DEVICE_NAME: str = 'FC90-0034'
+
+    def __post_init__(self):
+        if self.AMUZA_DEVICES is None:
+            self.AMUZA_DEVICES = {
+                "Machine 1": "FC90-0034",   # First AMUZA device
+                "Machine 2": "FC90-XXXX",   # Second AMUZA device - UPDATE THIS
+            }
     
     # Serial communication
     SERIAL_BAUD_RATE: int = 9600
@@ -18,6 +30,7 @@ class HardwareConfig:
     SERIAL_PACKAGE_LENGTH: int = 25
     SERIAL_PORT: str = "COM3"
     SERIAL_READ_TIMEOUT_S: float = 1.0
+    SENSOR_AUTO_CONNECT: bool = True  # Auto-connect to first available sensor port
     
     # Bluetooth
     BT_SCAN_TIMEOUT: float = 10.0

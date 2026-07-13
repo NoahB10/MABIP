@@ -279,8 +279,10 @@ class AsyncAmuzaConnection:
         DeviceState.RUNNING: "Running Program"
     }
 
-    def __init__(self, device_address: str = None, use_mock: bool = False):
+    def __init__(self, device_address: str = None, device_name: str = None, use_mock: bool = False):
         self.device_address = device_address or HARDWARE.BLUETOOTH_DEVICE_ADDRESS
+        # Device name for Bluetooth scanning - can be set directly or looked up from config
+        self.device_name = device_name or HARDWARE.BT_DEVICE_NAME
         self.use_mock = use_mock
 
         # Socket and connection state
@@ -320,7 +322,7 @@ class AsyncAmuzaConnection:
         # Logging
         self._init_logging()
 
-        logger.info(f"AsyncAmuzaConnection initialized (mock={use_mock}, address={self.device_address})")
+        logger.info(f"AsyncAmuzaConnection initialized (mock={use_mock}, device_name={self.device_name})")
 
     def set_timeout_callback(self, callback: callable):
         """Set callback to be called when commands timeout after all retries.
@@ -422,19 +424,19 @@ class AsyncAmuzaConnection:
             )
             logger.info(f"Found {len(nearby_devices)} devices")
 
-            # Look for AMUZA device
+            # Look for AMUZA device by name
             device_address = None
-            device_name = HARDWARE.BT_DEVICE_NAME
+            target_device_name = self.device_name  # Use instance device_name
 
             for addr, name, device_class in nearby_devices:
                 logger.info(f"Found device: {name} at {addr}")
-                if name == device_name:
+                if name == target_device_name:
                     device_address = addr
-                    logger.info(f"Found AMUZA device at {addr}")
+                    logger.info(f"Found AMUZA device '{target_device_name}' at {addr}")
                     break
 
             if device_address is None:
-                logger.error(f"AMUZA device '{device_name}' not found")
+                logger.error(f"AMUZA device '{target_device_name}' not found")
                 return False
 
             # Connect

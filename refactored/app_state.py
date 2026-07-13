@@ -48,6 +48,9 @@ class AppState:
     heater_enabled: bool = False
     temperature_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
+    # AMUZA machine selection
+    selected_machine: str = "Machine 1"
+
     # Calibration gains
     calibration_gains: Dict[str, float] = field(default_factory=lambda: {
         "Glutamate": 3.394,
@@ -202,6 +205,7 @@ class AppState:
             "heater_enabled": self.heater_enabled,
             "calibration_gains": self.calibration_gains,
             "calibration_values": self.calibration_values,
+            "selected_machine": self.selected_machine,
         }
 
         try:
@@ -230,6 +234,8 @@ class AppState:
                     self.calibration_gains.update(settings["calibration_gains"])
                 if "calibration_values" in settings:
                     self.calibration_values.update(settings["calibration_values"])
+                if "selected_machine" in settings:
+                    self.selected_machine = settings["selected_machine"]
 
                 print(f"Settings loaded from {SETTINGS_FILE}")
         except Exception as e:
