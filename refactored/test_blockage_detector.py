@@ -152,6 +152,37 @@ def test_baseline_frozen_during_blockage():
     assert det.blocked, "long blockage self-cleared — baseline was not frozen"
 
 
+def test_resume_after_pause_does_not_realarm_on_idle_data():
+    """While paused in the buffer the signal is flat because nothing is stepping.
+    That data sits in the window; judging against it would re-alarm the instant we
+    resume, popping the dialog again on a line the user just cleared."""
+    det = _fresh()
+    _run(det, 30 * 60)                                  # healthy baseline
+
+    det.set_cycling(False)
+    _run(det, 10 * 60, start=30 * 60, stuck_at=0.42)    # parked: flat, ignored
+    assert not det.blocked
+
+    det.set_cycling(True)
+    # Resume healthy. The window still holds the flat pause data at first, so the
+    # detector must stay silent until a fresh window has filled.
+    events, _ = _run(det, 20 * 60, start=40 * 60)
+    assert [e for _, e in events if e.blocked] == [], \
+        "re-alarmed on its own idle data after resuming"
+
+
+def test_resume_still_detects_a_genuine_blockage():
+    """Re-arming must not blind it — a real clog after resuming still fires."""
+    det = _fresh()
+    _run(det, 30 * 60)
+    det.set_cycling(False)
+    _run(det, 5 * 60, start=30 * 60, stuck_at=0.42)
+    det.set_cycling(True)
+    _run(det, 15 * 60, start=35 * 60)                   # healthy, re-arms
+    _run(det, 15 * 60, start=50 * 60, stuck_at=0.42)    # genuinely stuck again
+    assert det.blocked
+
+
 def test_note_well_completed_learns_cycle():
     det = _fresh(cycle_s=60.0)            # deliberately wrong
     for k in range(6):

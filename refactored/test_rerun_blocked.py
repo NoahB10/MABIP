@@ -24,7 +24,8 @@ class FakeConn:
         self.runs = []          # list of [well_id, ...] per execute_sequence call
 
     async def execute_sequence(self, sequence, stop_event, well_completed_callback,
-                               progress_callback, timing_provider, move_callback):
+                               progress_callback, timing_provider, move_callback,
+                               pause_gate=None):
         wells = [m.pos for m in sequence.methods]
         self.runs.append(wells)
         # Wells are sampled after the pass marker was stamped, as on the rig.

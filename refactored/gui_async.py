@@ -1716,19 +1716,6 @@ class AsyncAMUZAGUI(QMainWindow):
                 except Exception:
                     pass
 
-    def _track_metabolite(self, reading):
-        """Keep a short history of the metabolite signal so a clog can be
-        corroborated: a stuck (unchanging) signal means no fresh fluid."""
-        if not hasattr(self, "_metab_hist"):
-            from collections import deque
-            self._metab_hist = deque(maxlen=3000)
-        try:
-            sig = sum(abs(c) for c in reading.channels[:6])
-        except Exception:
-            return
-        self._metab_hist.append((time.monotonic(), sig))
-        self._track_blockage(reading)
-
     def _track_blockage(self, reading):
         """Feed the metabolite channels to the flow-sensor-independent blockage
         detector and surface any state change in the display log."""
@@ -1779,24 +1766,6 @@ class AsyncAMUZAGUI(QMainWindow):
                if (since is None or w0 >= since) and self._span_blocked(w0, w1)}
         # Preserve the plate order the run used, not set order.
         return [w for w in self.current_sequence_wells if w in hit]
-
-    def metabolite_stuck(self):
-        """Is the metabolite signal stuck (no fresh fluid reaching the sensor)?
-        True  -> stuck (a real blockage),
-        False -> changing (fluid IS reaching the sensor; a low flow = air, not clog),
-        None  -> not enough data / sensor not recording / wells not stepping.
-
-        Delegates to BlockageDetector. The previous implementation compared the
-        raw channel sum over a 12 s window against a fixed 0.15 threshold, which
-        cannot work: one well cycle is ~177 s and a healthy signal sits flat at
-        plateau or baseline for 60-90 s of every cycle, so a 12 s window cannot
-        tell "flat because blocked" from "flat because mid-plateau". On the 14 Jul
-        run it called 4% of a known-healthy stretch stuck while catching only 17%
-        of the real blockage. See blockage_detector.py for what replaced it."""
-        det = getattr(self, "blockage_detector", None)
-        if det is None or len(det.last_usable) < det.cfg.min_channels:
-            return None
-        return det.blocked
 
     @asyncSlot()
     async def _on_connect(self):
@@ -2301,13 +2270,17 @@ class AsyncAMUZAGUI(QMainWindow):
             self._well_spans = []
             self._well_started = {}
 
+            async def pause_gate():
+                return await self._blockage_pause_gate(stop_event)
+
             completed = await self.connection.execute_sequence(
                 sequence,
                 stop_event,
                 well_completed_callback=on_well_completed,
                 progress_callback=on_seq_progress,
                 timing_provider=get_current_timing,
-                move_callback=on_seq_move
+                move_callback=on_seq_move,
+                pause_gate=pause_gate
             )
 
             # Wells sampled through a blockage returned stale fluid, so their
@@ -2317,7 +2290,7 @@ class AsyncAMUZAGUI(QMainWindow):
                 await self._settle_for_blockage_judgement(stop_event)
                 completed = await self._rerun_blocked_wells(
                     stop_event, on_well_completed, on_seq_progress,
-                    get_current_timing, on_seq_move)
+                    get_current_timing, on_seq_move, pause_gate)
 
             # Mark up the well log either way: a stopped run still wants its
             # spoiled readings flagged.
@@ -2347,6 +2320,75 @@ class AsyncAMUZAGUI(QMainWindow):
             if getattr(self, "flow_tab", None) is not None:
                 self.flow_tab.set_experiment_phase("idle", 0)
 
+    async def _blockage_pause_gate(self, stop_event) -> bool:
+        """Hold the plate in the buffer while the line is blocked.
+
+        Awaited by execute_method after the buffer wait and before the move, so
+        the needle stays parked in buffer instead of dropping into a well to
+        sample fluid that is not moving. Blockages can only be cleared by hand,
+        so this asks and waits.
+
+        Returns False if the user chose to stop the run."""
+        det = getattr(self, "blockage_detector", None)
+        if det is None or not det.blocked or stop_event.is_set():
+            return True
+
+        # Stop judging while parked: nothing is stepping, so the signal is
+        # *supposed* to go flat now and would otherwise look like a fresh
+        # blockage. Resuming re-arms the detector with a clean window.
+        det.set_cycling(False)
+        self.add_to_display(
+            "⚠ Blockage detected — holding in buffer. Sampling is paused so no "
+            "well is wasted. Clear the line, then confirm to continue.")
+        try:
+            proceed = await self._ask_blockage_cleared()
+        finally:
+            det.set_cycling(True)
+
+        if not proceed:
+            self.add_to_display("Run stopped while blocked.")
+            stop_event.set()
+            return False
+
+        self.add_to_display("Blockage reported cleared — resuming.")
+        return True
+
+    async def _ask_blockage_cleared(self) -> bool:
+        """Popup: has the blockage been cleared? True to continue, False to stop.
+
+        Shown non-modally and awaited via a future rather than exec_(), which
+        would spin a nested Qt loop and stall the asyncio loop the sensor reader
+        and pump live on — the sensor must keep sampling while we wait, or the
+        detector cannot tell that the line came back."""
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("Blockage detected")
+        box.setText("The metabolite signal has stopped changing — no fresh fluid "
+                    "is reaching the sensor.")
+        box.setInformativeText(
+            "The plate is holding in the buffer; no sampling time is being used.\n\n"
+            "Clear the blockage, then choose Continue. The run will resume from "
+            "the well it was about to sample.")
+        cont = box.addButton("Continue (blockage cleared)", QMessageBox.AcceptRole)
+        box.addButton("Stop run", QMessageBox.RejectRole)
+        box.setDefaultButton(cont)
+
+        loop = asyncio.get_event_loop()
+        fut = loop.create_future()
+
+        def _finished(_result):
+            if not fut.done():
+                fut.set_result(box.clickedButton() is cont)
+
+        box.finished.connect(_finished)
+        box.show()
+        box.raise_()
+        box.activateWindow()
+        try:
+            return await fut
+        finally:
+            box.deleteLater()
+
     async def _settle_for_blockage_judgement(self, stop_event):
         """Keep reading for one detector latency after the last well.
 
@@ -2372,7 +2414,8 @@ class AsyncAMUZAGUI(QMainWindow):
     blocked line wastes the plate instead of fetching the user."""
 
     async def _rerun_blocked_wells(self, stop_event, on_well_completed,
-                                   on_seq_progress, get_current_timing, on_seq_move):
+                                   on_seq_progress, get_current_timing, on_seq_move,
+                                   pause_gate=None):
         """Re-sample any wells whose sampling overlapped a blockage.
 
         Returns True if the run finished (nothing left to retry, or retries
@@ -2387,9 +2430,11 @@ class AsyncAMUZAGUI(QMainWindow):
             if not wells:
                 return True
 
-            # A line that is still blocked will spoil the retry exactly as it
-            # spoiled the original. Stop and say so rather than burn the plate.
-            if det.blocked:
+            # With a gate the retry can simply hold in the buffer and ask for the
+            # line to be cleared, so a still-blocked line is no reason not to
+            # start. Without one, re-running would spoil the retry exactly as it
+            # spoiled the original, so say so instead of burning the plate.
+            if det.blocked and pause_gate is None:
                 self.add_to_display(
                     f"⚠ Line still blocked — not re-running {len(wells)} spoiled "
                     f"well(s): {', '.join(wells)}. Clear the line and re-run them.")
@@ -2421,7 +2466,8 @@ class AsyncAMUZAGUI(QMainWindow):
                 well_completed_callback=on_well_completed,
                 progress_callback=on_seq_progress,
                 timing_provider=get_current_timing,
-                move_callback=on_seq_move)
+                move_callback=on_seq_move,
+                pause_gate=pause_gate)
             if not completed:
                 return False
 
@@ -2880,7 +2926,7 @@ class AsyncAMUZAGUI(QMainWindow):
             def on_sensor_data(reading):
                 if self.plot_window:
                     self.plot_window.add_reading(reading)
-                self._track_metabolite(reading)
+                self._track_blockage(reading)
 
             # Fresh detector per connection: the healthy-amplitude baseline is
             # specific to this run's electrodes and timing. Seed the cycle from

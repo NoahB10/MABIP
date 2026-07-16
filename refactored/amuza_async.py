@@ -22,7 +22,7 @@ import json
 from pathlib import Path
 from enum import IntEnum
 from dataclasses import dataclass
-from typing import Optional, Callable, List, Dict
+from typing import Awaitable, Optional, Callable, List, Dict
 from datetime import datetime
 
 # Try to import bluetooth, fall back to mock if unavailable
@@ -958,7 +958,8 @@ class AsyncAmuzaConnection:
         method: Method,
         stop_event: asyncio.Event,
         on_progress: Optional[Callable[[str, int, int], None]] = None,
-        on_move: Optional[Callable[[str], None]] = None
+        on_move: Optional[Callable[[str], None]] = None,
+        pause_gate: Optional[Callable[[], Awaitable[bool]]] = None
     ) -> bool:
         """
         Execute a single method with interruptible waits.
@@ -969,6 +970,12 @@ class AsyncAmuzaConnection:
             method: Method to execute
             stop_event: Event to check for stop request
             on_progress: Callback(status_message, current_second, total_seconds)
+            pause_gate: Optional async callback awaited after the buffer wait and
+                        before the move. Returns False to abandon the sequence.
+                        Held here because this is the one point in the cycle where
+                        waiting is free: the needle is parked in buffer rather
+                        than sitting in a well, so no sampling time is spent on
+                        fluid that will not arrive.
         """
         total_time = method.buffer_time + method.wait + 10  # +10 for movement
         current_second = 0
@@ -984,6 +991,13 @@ class AsyncAmuzaConnection:
                 current_second = (i + 1) // 2
                 if on_progress:
                     on_progress(f"Buffer: {current_second}/{method.buffer_time}s", current_second, total_time)
+
+        # Hold in the buffer while the line is blocked, so we do not spend this
+        # well's sampling time drawing fluid that is not moving.
+        if pause_gate is not None:
+            if not await pause_gate():
+                logger.info("Sequence abandoned while paused in buffer")
+                return False
 
         # Check stop before move
         if stop_event.is_set():
@@ -1067,7 +1081,8 @@ class AsyncAmuzaConnection:
         well_completed_callback: Optional[Callable[[str, List[str]], None]] = None,
         progress_callback: Optional[Callable[[str, int, int], None]] = None,
         timing_provider: Optional[Callable[[], tuple]] = None,
-        move_callback: Optional[Callable[[str], None]] = None
+        move_callback: Optional[Callable[[str], None]] = None,
+        pause_gate: Optional[Callable[[], Awaitable[bool]]] = None
     ) -> bool:
         """
         Execute a sequence of methods with stop support.
@@ -1079,6 +1094,8 @@ class AsyncAmuzaConnection:
             progress_callback: Callback(status, current_well_idx, total_wells)
             timing_provider: Optional callback returning (buffer_time, sampling_time)
                             If provided, updates method timing before each well
+            pause_gate: Optional async callback awaited in the buffer before each
+                        move; returns False to abandon the sequence.
         """
         logger.info(f"Starting sequence: {sequence}")
         completed_wells = []
@@ -1113,7 +1130,8 @@ class AsyncAmuzaConnection:
 
                 completed = await self.execute_method(method, stop_event,
                                                       on_progress=progress_callback,
-                                                      on_move=move_callback)
+                                                      on_move=move_callback,
+                                                      pause_gate=pause_gate)
 
                 if not completed:
                     logger.info(f"Method not completed, stopping sequence")

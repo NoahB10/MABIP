@@ -2,14 +2,16 @@
 
 Why this exists
 ---------------
-`AsyncAMUZAGUI.metabolite_stuck()` answers a *different* question: "the flow sensor
-already says clog — is the metabolite signal flat too?". It uses a 12 s window,
-which is far shorter than one well cycle (~177 s). Because a healthy signal sits
-flat at baseline or at plateau for 60-90 s of every cycle, a 12 s window cannot
-tell "flat because blocked" from "flat because we're mid-plateau". Measured on
-Sensor_readings_14_07_26_15_00.txt it fires on 4% of a known-healthy stretch
-while catching only 17% of the real blockage. Fine as a corroborator, useless
-standalone.
+The rig used to infer a clog from the Fluigent flow sensor, corroborated by a
+`metabolite_stuck()` helper that asked whether the raw channel sum had moved over
+a 12 s window. Both were unreliable. On the 14 Jul run the flow sensor itself
+dropped out for the last third of the experiment (flat ~0.1 uL/min while the
+channels kept cycling normally), and it reads ~0 between bursts anyway, so
+"no flow" never meant "blocked". The 12 s window was worse: one well cycle is
+~177 s and a healthy signal sits flat at baseline or plateau for 60-90 s of every
+cycle, so it could not tell "flat because blocked" from "flat because mid-plateau"
+— it called 4% of a known-healthy stretch stuck while catching only 17% of the
+real blockage. Both are gone; this replaced them.
 
 The idea
 --------
@@ -169,6 +171,7 @@ class BlockageDetector:
         self._prev = [None] * n
         self._base = [deque() for _ in range(n)]     # (t, range) healthy history
         self._t0: Optional[float] = None
+        self._armed_since: Optional[float] = None   # window refilling since
         self._t: Optional[float] = None
         self._flat_since: Optional[float] = None
         self._wells = deque(maxlen=12)               # recent well-completion times
@@ -185,11 +188,21 @@ class BlockageDetector:
         to be producing a cycle. Parked on one well, or between sequences, flat is
         correct behaviour — so we stop judging and reset the sustain timer rather
         than accumulate a false alarm."""
-        if cycling != self._cycling:
-            self._cycling = cycling
-            self._flat_since = None
-            if not cycling and self.blocked:
-                self.blocked = False
+        if cycling == self._cycling:
+            return
+        self._cycling = cycling
+        self._flat_since = None
+        if not cycling and self.blocked:
+            self.blocked = False
+        if cycling:
+            # While idle the signal was flat *because* nothing was stepping. That
+            # data is still sitting in the window, and judging against it would
+            # re-alarm the instant we resume. Drop it and re-arm once a fresh
+            # window has filled. Baselines survive — the healthy amplitude did not
+            # change just because we paused.
+            for b in self._buf:
+                b.clear()
+            self._armed_since = self._t
 
     def set_cycle_s(self, cycle_s: float) -> None:
         """Update the expected well period (e.g. user changed timing mid-run)."""
@@ -235,6 +248,7 @@ class BlockageDetector:
         cfg = self.cfg
         if self._t0 is None:
             self._t0 = t
+            self._armed_since = t
         self._t = t
         win = self.window_s
 
@@ -263,8 +277,9 @@ class BlockageDetector:
         if self._wells and (t - self._wells[-1]) > 2.5 * cfg.cycle_s:
             self.set_cycling(False)
 
-        # Need a full window and enough history to know healthy amplitude.
-        if t - self._t0 < win:
+        # Need a full window of *judgeable* data. After a pause this restarts,
+        # so idle-flat samples can never be mistaken for a blockage.
+        if self._armed_since is None or t - self._armed_since < win:
             return None
 
         ratios, usable, flat_votes = {}, [], 0
