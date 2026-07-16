@@ -198,6 +198,37 @@ def test_finalize_is_idempotent(tmp_path):
     assert out1 == out2
 
 
+def test_finalize_never_destroys_the_log_if_the_write_fails(tmp_path, monkeypatch):
+    """The well log is hours of work and cannot be recreated. A failed rewrite
+    must leave the original intact rather than a truncated stub."""
+    import pathlib
+
+    g = FakeGUI(WELLS)
+    g._well_spans = list(SPANS)
+    g._blockage_spans = [[110, 190]]
+    g.well_log_file = tmp_path / "Well_Log_test.csv"
+    original = HEADER + _row("A1", 1.0) + _row("A2", 2.0) + _row("A3", 3.0)
+    g.well_log_file.write_text(original)
+
+    real_write = pathlib.Path.write_text
+
+    def boom(self, *a, **k):
+        if self.suffix == ".tmp":
+            raise OSError("disk full")
+        return real_write(self, *a, **k)
+
+    monkeypatch.setattr(pathlib.Path, "write_text", boom)
+    g._finalize_well_log()          # must not raise
+
+    assert g.well_log_file.read_text() == original, "original log was clobbered"
+
+
+def test_finalize_leaves_no_temp_file_behind(tmp_path):
+    g, _ = _finalized(tmp_path, SPANS, [[110, 190]],
+                      [_row("A1", 1.0), _row("A2", 2.0), _row("A3", 3.0)])
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
 def test_finalize_without_log_file_is_a_noop():
     g = FakeGUI(WELLS)
     g._finalize_well_log()          # must not raise

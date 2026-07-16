@@ -14,6 +14,7 @@ vhttps://claude.com/cai/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-8
 
 import asyncio
 import logging
+import os
 import sys
 import time
 from pathlib import Path
@@ -2642,8 +2643,14 @@ class AsyncAMUZAGUI(QMainWindow):
             p[5] = "1" if good.get(p[0]) == i else "0"
             out[i] = ",".join(p)
 
+        # Write via a temp file and rename. A plain write truncates first, so a
+        # crash or power cut mid-write would destroy the run's only record of
+        # which well is which — the log is hours of work and cannot be recreated.
+        # os.replace is atomic: the old file stands until the new one is complete.
         try:
-            self.well_log_file.write_text("\n".join(out) + "\n")
+            tmp = self.well_log_file.with_suffix(self.well_log_file.suffix + ".tmp")
+            tmp.write_text("\n".join(out) + "\n")
+            os.replace(tmp, self.well_log_file)
         except Exception as e:
             logger.error(f"Failed to finalize well log: {e}")
             return
