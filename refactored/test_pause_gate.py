@@ -17,24 +17,63 @@ from gui_async import AsyncAMUZAGUI
 
 class FakeGUI:
     _blockage_pause_gate = AsyncAMUZAGUI._blockage_pause_gate
+    _wait_for_clearance = AsyncAMUZAGUI._wait_for_clearance
+    _attempt_clearance = AsyncAMUZAGUI._attempt_clearance
 
-    def __init__(self, blocked=False, answer=True):
+    def __init__(self, blocked=False, answer=True, clears_after=None,
+                 decidable=False):
         self.blockage_detector = BlockageDetector(cycle_s=60.0)
         self.blockage_detector.blocked = blocked
         self.displayed = []
         self.asked = 0
         self._answer = answer
+        self._closed = 0
+        self.attempts = 0
+
+        # Stub the detector's hold mode: `decidable` says whether the stuck level
+        # leaves room to fall; `clears_after` is how many polls until it does.
+        det = self.blockage_detector
+        det.begin_hold = lambda: None
+        det.end_hold = lambda: None
+        type(det).hold_is_decidable = property(lambda _s: decidable)
+        self._polls = 0
+
+        def hold_cleared():
+            if not decidable:
+                return None
+            self._polls += 1
+            if clears_after is None:
+                return False
+            return self._polls >= clears_after
+
+        det.hold_cleared = hold_cleared
 
     def add_to_display(self, msg):
         self.displayed.append(msg)
 
+    def _close_blockage_dialog(self):
+        self._closed += 1
+
     async def _ask_blockage_cleared(self):
         self.asked += 1
+        if self._answer is None:
+            # Nobody is at the bench: the signal must decide. A bare future,
+            # not a sleep -- the nosleep fixture would collapse a sleep and this
+            # stub would answer after all.
+            await asyncio.get_event_loop().create_future()
         return self._answer
 
 
 def _gate(g, stop_event=None):
     return asyncio.run(g._blockage_pause_gate(stop_event or asyncio.Event()))
+
+
+@pytest.fixture
+def nosleep(monkeypatch):
+    """Make the poll loop spin instantly. Bind the real sleep first -- patching
+    asyncio.sleep with a lambda that calls asyncio.sleep recurses forever."""
+    real = asyncio.sleep
+    monkeypatch.setattr(asyncio, "sleep", lambda *a, **k: real(0))
 
 
 def test_unblocked_line_passes_straight_through():
@@ -72,6 +111,57 @@ def test_gate_stops_judging_while_parked_then_rearms():
     _gate(g)
     assert seen == [False], "detector must be idled while waiting"
     assert g.blockage_detector._cycling is True, "must re-arm after resuming"
+
+
+# ---- auto-resume: the signal proves the line came back ----------------------
+
+def test_resumes_on_its_own_when_the_signal_starts_moving(nosleep):
+    """The goal: stuck high, burst clears it, signal falls, run resumes -- with
+    nobody at the bench and no flow sensor in line."""
+    g = FakeGUI(blocked=True, answer=None, decidable=True, clears_after=3)
+    assert _gate(g) is True
+    assert any("line cleared" in m for m in g.displayed)
+    assert g._closed == 1, "the dialog must be taken down once the signal decides"
+
+
+def test_stuck_at_baseline_falls_back_to_the_dialog():
+    """Nothing to fall to, so the signal can never prove clearance. Ask."""
+    g = FakeGUI(blocked=True, answer=True, decidable=False)
+    assert _gate(g) is True
+    assert g.asked == 1
+    assert any("confirm by hand" in m for m in g.displayed)
+
+
+def test_user_can_still_answer_first_while_watching(nosleep):
+    """Auto-watching must not lock the user out of deciding."""
+    g = FakeGUI(blocked=True, answer=False, decidable=True, clears_after=None)
+    assert _gate(g) is False
+
+
+def test_clearance_hook_is_called_while_waiting(nosleep):
+    """The seam the burst will occupy must actually be driven during the hold."""
+    g = FakeGUI(blocked=True, answer=None, decidable=True, clears_after=3)
+
+    async def counting():
+        g.attempts += 1
+
+    g._attempt_clearance = counting
+    _gate(g)
+    assert g.attempts >= 1, "burst hook never ran"
+
+
+def test_stop_event_breaks_the_wait(nosleep):
+    """A stop must not leave the run parked forever waiting on the signal."""
+    stop = asyncio.Event()
+    g = FakeGUI(blocked=True, answer=None, decidable=True, clears_after=None)
+
+    async def stop_soon():
+        g.attempts += 1
+        if g.attempts >= 3:
+            stop.set()
+
+    g._attempt_clearance = stop_soon
+    assert asyncio.run(g._blockage_pause_gate(stop)) is False
 
 
 def test_gate_rearms_even_if_the_popup_raises():

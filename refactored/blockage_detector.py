@@ -146,6 +146,16 @@ class DetectorConfig:
     """Warm-up before the detector will call anything. Below this there are too
     few cycles to know what healthy amplitude looks like."""
 
+    hold_move_frac: float = 0.15
+    """While parked, how far the signal must move off its stuck level (as a
+    fraction of the channel's healthy swing) to count as fresh fluid arriving.
+    Small, because the plate is not stepping: nothing but flow can move it."""
+
+    hold_confirm_s: float = 15.0
+    """How long that movement must persist before calling the line clear. Short —
+    unlike blockage detection there is no cycle to wait out, so clearance is seen
+    in seconds rather than minutes."""
+
     n_channels: int = 6
 
 
@@ -175,6 +185,8 @@ class BlockageDetector:
         self._t: Optional[float] = None
         self._flat_since: Optional[float] = None
         self._wells = deque(maxlen=12)               # recent well-completion times
+        self._hold_level: dict = {}                  # i -> (stuck level, threshold)
+        self._hold_since: Optional[float] = None
         self._cycling = True
         self.blocked = False
         self.last_ratios: dict = {}
@@ -224,6 +236,86 @@ class BlockageDetector:
             if gaps:
                 self.set_cycle_s(_median(gaps))
         self.set_cycling(True)
+
+    # ---- baseline helpers -------------------------------------------------
+    def _baseline_range(self, i) -> float:
+        return _median([r for _, r, _ in self._base[i]]) if self._base[i] else 0.0
+
+    def _baseline_low(self, i) -> float:
+        """Where the channel sits when fresh buffer is reaching the sensor."""
+        return _median([lo for _, _, lo in self._base[i]]) if self._base[i] else 0.0
+
+    def _departure_threshold(self, i) -> float:
+        """How far the signal must move to count as "fluid arrived".
+
+        Whichever is larger: comfortably above this channel's own sample noise,
+        or a slice of its healthy swing. The noise term stops a quiet channel
+        firing on jitter; the amplitude term stops a noisy one needing an
+        implausibly large move."""
+        noise = _median(list(self._noise[i])) if self._noise[i] else 0.0
+        return max(8.0 * noise, self.cfg.hold_move_frac * self._baseline_range(i))
+
+    # ---- hold mode --------------------------------------------------------
+    def begin_hold(self) -> None:
+        """Enter clearance-watching mode — call when the plate parks in buffer.
+
+        Judging flips around here. While the plate is cycling, a blockage is the
+        *absence* of movement. While parked, nothing is stepping, so the signal
+        has no reason to move at all — which means any movement is proof that
+        fresh fluid arrived, i.e. the line cleared. That works with no flow
+        sensor and no well cycle, which is the point: during a burst the flow
+        is not in line to be measured.
+
+        Caveat, and it is a real one: this only works if the signal is stuck
+        *above* its buffer baseline, so it has somewhere to fall to. Stuck at
+        baseline already, clearing brings more buffer and nothing moves — see
+        hold_cleared(), which reports that case as unknowable rather than
+        guessing."""
+        self._hold_level = {}
+        for i in range(self.cfg.n_channels):
+            b = self._buf[i]
+            if len(b) < 5 or not self._base[i]:
+                continue
+            level = _median([v for _, v in b])
+            thr = self._departure_threshold(i)
+            # Only channels with somewhere to fall can prove clearance.
+            if thr > 0 and (level - self._baseline_low(i)) > thr:
+                self._hold_level[i] = (level, thr)
+        self._hold_since = self._t
+
+    def end_hold(self) -> None:
+        self._hold_level = {}
+        self._hold_since = None
+
+    @property
+    def hold_is_decidable(self) -> bool:
+        """Can clearance be seen at all from where the signal is stuck?"""
+        return bool(self._hold_level)
+
+    def hold_cleared(self) -> Optional[bool]:
+        """During a hold: has fresh fluid reached the sensor?
+
+        True  -> the signal moved off its stuck level; the line is flowing again.
+        False -> still sitting where it stopped.
+        None  -> cannot be known from the signal: it is stuck at buffer baseline,
+                 so clearing it would look exactly like staying blocked. The
+                 caller must ask a human or probe a well."""
+        if not self._hold_level:
+            return None
+        t = self._t
+        for i, (level, thr) in self._hold_level.items():
+            b = self._buf[i]
+            recent = [v for (tt, v) in b if t - tt <= self.cfg.hold_confirm_s]
+            if len(recent) < 5:
+                continue
+            # The sustain requirement is carried by the data, not by a timer:
+            # `recent` spans hold_confirm_s, so its *median* can only have moved
+            # if the signal spent most of that window away from the stuck level.
+            # One spike cannot shift it, and the answer does not depend on how
+            # often the caller happens to poll.
+            if abs(_median(recent) - level) > thr:
+                return True
+        return False
 
     @property
     def window_s(self) -> float:
@@ -288,19 +380,20 @@ class BlockageDetector:
             if len(b) < 10:
                 continue
             vals = sorted(v for _, v in b)
-            rng = _quantile(vals, 0.95) - _quantile(vals, 0.05)
+            lo = _quantile(vals, 0.05)
+            rng = _quantile(vals, 0.95) - lo
 
-            base_hist = [r for _, r in self._base[i]]
-            base = _median(base_hist) if base_hist else 0.0
+            base = self._baseline_range(i)
 
             # Grow the baseline only from healthy samples. Frozen while blocked
-            # so a long blockage cannot redefine "normal" and self-clear.
+            # so a long blockage cannot redefine "normal" and self-clear. The low
+            # is kept alongside the range: clearance-watching needs to know where
+            # the signal sits when fresh buffer is arriving.
             if not self.blocked and (base == 0.0 or rng >= base * cfg.clear_frac):
-                self._base[i].append((t, rng))
+                self._base[i].append((t, rng, lo))
                 while self._base[i] and t - self._base[i][0][0] > cfg.baseline_s:
                     self._base[i].popleft()
-                base_hist = [r for _, r in self._base[i]]
-                base = _median(base_hist) if base_hist else 0.0
+                base = self._baseline_range(i)
 
             if base <= 0.0 or t - self._t0 < cfg.min_baseline_s:
                 continue

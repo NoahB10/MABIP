@@ -1344,6 +1344,7 @@ class AsyncAMUZAGUI(QMainWindow):
         self._well_spans: List[tuple] = []         # (well_id, start_t, end_t)
         self._well_started: Dict[str, float] = {}  # well_id -> move-command time
         self._active_seq_name: str = "Sampling Sequence"
+        self._blockage_box = None                  # live blockage dialog, if any
         
         # Wells
         self.well_labels: Dict[str, WellLabel] = {}
@@ -2338,21 +2339,66 @@ class AsyncAMUZAGUI(QMainWindow):
         # *supposed* to go flat now and would otherwise look like a fresh
         # blockage. Resuming re-arms the detector with a clean window.
         det.set_cycling(False)
-        self.add_to_display(
-            "⚠ Blockage detected — holding in buffer. Sampling is paused so no "
-            "well is wasted. Clear the line, then confirm to continue.")
+        det.begin_hold()
+
+        if det.hold_is_decidable:
+            self.add_to_display(
+                "⚠ Blockage detected — holding in buffer. The signal is stuck "
+                "above baseline, so it will fall on its own once the line clears; "
+                "the run will resume by itself when it does.")
+        else:
+            self.add_to_display(
+                "⚠ Blockage detected — holding in buffer. The signal is stuck at "
+                "buffer baseline, so clearing it would look identical to staying "
+                "blocked — confirm by hand once cleared.")
         try:
-            proceed = await self._ask_blockage_cleared()
+            proceed = await self._wait_for_clearance(det, stop_event)
         finally:
+            det.end_hold()
             det.set_cycling(True)
 
         if not proceed:
             self.add_to_display("Run stopped while blocked.")
             stop_event.set()
             return False
-
-        self.add_to_display("Blockage reported cleared — resuming.")
         return True
+
+    async def _wait_for_clearance(self, det, stop_event) -> bool:
+        """Wait until the line is flowing again. True to resume, False to stop.
+
+        Two ways out. If the signal is stuck above baseline it will move the
+        moment fresh fluid arrives, and that movement is proof enough to resume
+        on its own — no flow sensor needed, which matters because during a burst
+        the flow is not in line to be measured. Otherwise, or if the user answers
+        first, the dialog decides."""
+        dialog = asyncio.ensure_future(self._ask_blockage_cleared())
+        try:
+            while True:
+                if dialog.done():
+                    return dialog.result()
+                if stop_event.is_set():
+                    return False
+                await self._attempt_clearance()
+                if det.hold_cleared() is True:
+                    self.add_to_display(
+                        "Signal is moving again — line cleared, resuming.")
+                    return True
+                await asyncio.sleep(1.0)
+        finally:
+            if not dialog.done():
+                dialog.cancel()
+                self._close_blockage_dialog()
+
+    async def _attempt_clearance(self):
+        """Hook for automatically clearing the clog while parked in buffer.
+
+        The intended occupant is a pump burst: fire while held, and the metabolite
+        signal falling off its stuck level tells you it worked. Everything that
+        needs is already here — the plate holds in buffer, the detector watches
+        for the signal to move, and _wait_for_clearance resumes the moment it
+        does. Deliberately empty until the burst hardware is in place; nothing
+        else needs to change when it is."""
+        return None
 
     async def _ask_blockage_cleared(self) -> bool:
         """Popup: has the blockage been cleared? True to continue, False to stop.
@@ -2385,10 +2431,19 @@ class AsyncAMUZAGUI(QMainWindow):
         box.show()
         box.raise_()
         box.activateWindow()
+        # Held so the signal can dismiss it if the line clears on its own.
+        self._blockage_box = box
         try:
             return await fut
         finally:
+            self._blockage_box = None
             box.deleteLater()
+
+    def _close_blockage_dialog(self):
+        """Take the dialog down when the signal answered before the user did."""
+        box = getattr(self, "_blockage_box", None)
+        if box is not None:
+            box.done(0)
 
     async def _settle_for_blockage_judgement(self, stop_event):
         """Keep reading for one detector latency after the last well.

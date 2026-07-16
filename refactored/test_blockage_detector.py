@@ -183,6 +183,77 @@ def test_resume_still_detects_a_genuine_blockage():
     assert det.blocked
 
 
+# ---- hold mode: proving the line came back, with no flow sensor -------------
+
+def _hold(det, level, duration_s, start):
+    """Feed a parked (non-cycling) signal pinned at `level` * amplitude."""
+    return _run(det, duration_s, start=start, stuck_at=level)
+
+
+def test_hold_sees_the_signal_fall_when_the_line_clears():
+    """The case that matters: stuck high, then flow returns and it decays toward
+    buffer baseline. That fall is the proof — no flow sensor involved."""
+    det = _fresh()
+    _run(det, 30 * 60)                                   # healthy baseline
+    _hold(det, 0.42, 8 * 60, start=30 * 60)              # stuck mid-scale
+    det.set_cycling(False)
+    det.begin_hold()
+    assert det.hold_is_decidable, "stuck above baseline: a fall should be visible"
+    assert det.hold_cleared() is False, "nothing has moved yet"
+
+    # Line clears: fresh buffer arrives, signal decays to baseline.
+    _hold(det, 0.0, 60, start=38 * 60)
+    assert det.hold_cleared() is True
+
+
+def test_hold_reports_unknowable_when_stuck_at_baseline():
+    """Stuck at baseline, clearing brings more buffer and nothing moves. Two of
+    the three real blockages on the 14 Jul run were like this. Say so rather than
+    quietly claim the line is still blocked."""
+    det = _fresh()
+    _run(det, 30 * 60)
+    _hold(det, 0.0, 8 * 60, start=30 * 60)               # stuck at baseline
+    det.set_cycling(False)
+    det.begin_hold()
+    assert not det.hold_is_decidable
+    assert det.hold_cleared() is None
+
+
+def test_hold_does_not_clear_while_still_stuck():
+    det = _fresh()
+    _run(det, 30 * 60)
+    _hold(det, 0.42, 8 * 60, start=30 * 60)
+    det.set_cycling(False)
+    det.begin_hold()
+    _hold(det, 0.42, 5 * 60, start=38 * 60)              # still stuck
+    assert det.hold_cleared() is False
+
+
+def test_hold_ignores_a_momentary_spike():
+    """A single spike is not flow — movement must persist."""
+    det = _fresh()
+    _run(det, 30 * 60)
+    _hold(det, 0.42, 8 * 60, start=30 * 60)
+    det.set_cycling(False)
+    det.begin_hold()
+    t, i = 38 * 60, int(38 * 60 / DT)
+    ch = _channels(t, i, stuck_at=0.42)
+    ch[5] = 40.0                                          # one wild sample
+    det.update(t, ch)
+    assert det.hold_cleared() is not True
+
+
+def test_end_hold_resets_clearance_watching():
+    det = _fresh()
+    _run(det, 30 * 60)
+    _hold(det, 0.42, 8 * 60, start=30 * 60)
+    det.set_cycling(False)
+    det.begin_hold()
+    det.end_hold()
+    assert not det.hold_is_decidable
+    assert det.hold_cleared() is None
+
+
 def test_note_well_completed_learns_cycle():
     det = _fresh(cycle_s=60.0)            # deliberately wrong
     for k in range(6):
