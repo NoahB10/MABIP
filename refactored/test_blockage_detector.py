@@ -169,6 +169,27 @@ def test_well_completions_stopping_idles_detector():
     assert not det.blocked
 
 
+@pytest.mark.parametrize("window_factor", [1.2, 1.3, 1.5, 1.8])
+def test_auto_idle_never_beats_the_verdict_it_is_waiting_for(window_factor):
+    """Callers wait latency_s after the last well for a verdict on it. If the
+    auto-idle grace (2.5 cycles) were shorter than that, the detector would idle
+    and drop the verdict mid-wait, and the last wells of every run would be
+    silently marked clean."""
+    det = _fresh(window_factor=window_factor)
+    assert det.latency_s < 2.5 * det.cfg.cycle_s
+
+
+def test_idle_grace_outlasts_latency_in_practice():
+    """The last well must still be judgeable while the plate sits idle."""
+    det = _fresh()
+    _run(det, 30 * 60)
+    det.note_well_completed(30 * 60)
+    # Stuck from the moment the last well ends; the alarm must land within
+    # latency_s, i.e. before the auto-idle grace expires.
+    events, _ = _run(det, int(det.latency_s) + 30, start=30 * 60, stuck_at=0.42)
+    assert any(e.blocked for _, e in events), "verdict lost to auto-idle"
+
+
 def test_emits_edges_only():
     """Events fire on state change, not once per sample."""
     det = _fresh()

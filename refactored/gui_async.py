@@ -1339,6 +1339,10 @@ class AsyncAMUZAGUI(QMainWindow):
         # Created once and reset per sensor connection so each run learns its own
         # healthy amplitude baseline.
         self.blockage_detector: Optional[BlockageDetector] = None
+        self._blockage_spans: List[list] = []      # [onset_t, clear_t or None]
+        self._well_spans: List[tuple] = []         # (well_id, start_t, end_t)
+        self._well_started: Dict[str, float] = {}  # well_id -> move-command time
+        self._active_seq_name: str = "Sampling Sequence"
         
         # Wells
         self.well_labels: Dict[str, WellLabel] = {}
@@ -1738,6 +1742,16 @@ class AsyncAMUZAGUI(QMainWindow):
             return
         if event is None:
             return
+
+        # Record the span so we can work out which wells it spoiled. Back-date
+        # the onset by the detector's latency: the alarm can only fire about a
+        # cycle after the fluid actually stopped, so the well that was ruined is
+        # the one being sampled *then*, not the one being sampled now.
+        if event.blocked:
+            self._blockage_spans.append([event.t - det.latency_s, None])
+        elif self._blockage_spans and self._blockage_spans[-1][1] is None:
+            self._blockage_spans[-1][1] = event.t
+
         self.add_to_display(("⚠ " if event.blocked else "") + event.message)
         logger.warning(event.message) if event.blocked else logger.info(event.message)
         try:
@@ -1745,20 +1759,44 @@ class AsyncAMUZAGUI(QMainWindow):
         except Exception:
             pass
 
-    def metabolite_stuck(self, window_s=12.0, threshold=0.15):
-        """Is the metabolite signal stuck (flat) over the last `window_s`?
-        True  -> flat (stuck; corroborates a real clog),
+    def _span_blocked(self, w0, w1):
+        """Did this sampling window overlap any blockage?
+
+        Overlap (rather than, say, the well's midpoint) is deliberate: re-running
+        a well that was actually fine costs one cycle, keeping a well whose
+        reading was stale costs the experiment. An unclosed blockage runs to
+        infinity — it never cleared, so everything after its onset is suspect."""
+        return any(w0 < (b if b is not None else float("inf")) and a < w1
+                   for a, b in self._blockage_spans)
+
+    def _blocked_wells(self, since=None):
+        """Wells whose sampling overlapped a blockage, in plate order.
+
+        `since` restricts to wells sampled after that time, so a retry pass is
+        judged only on its own blockages — otherwise the wells that triggered the
+        retry would re-queue forever."""
+        hit = {w for w, w0, w1, _ in self._well_spans
+               if (since is None or w0 >= since) and self._span_blocked(w0, w1)}
+        # Preserve the plate order the run used, not set order.
+        return [w for w in self.current_sequence_wells if w in hit]
+
+    def metabolite_stuck(self):
+        """Is the metabolite signal stuck (no fresh fluid reaching the sensor)?
+        True  -> stuck (a real blockage),
         False -> changing (fluid IS reaching the sensor; a low flow = air, not clog),
-        None  -> not enough data / sensor not recording.
-        `threshold` is in raw channel-sum units and needs tuning to your sensor."""
-        hist = getattr(self, "_metab_hist", None)
-        if not hist:
+        None  -> not enough data / sensor not recording / wells not stepping.
+
+        Delegates to BlockageDetector. The previous implementation compared the
+        raw channel sum over a 12 s window against a fixed 0.15 threshold, which
+        cannot work: one well cycle is ~177 s and a healthy signal sits flat at
+        plateau or baseline for 60-90 s of every cycle, so a 12 s window cannot
+        tell "flat because blocked" from "flat because mid-plateau". On the 14 Jul
+        run it called 4% of a known-healthy stretch stuck while catching only 17%
+        of the real blockage. See blockage_detector.py for what replaced it."""
+        det = getattr(self, "blockage_detector", None)
+        if det is None or len(det.last_usable) < det.cfg.min_channels:
             return None
-        now = time.monotonic()
-        vals = [s for (t, s) in hist if now - t <= window_s]
-        if len(vals) < 5:
-            return None
-        return (max(vals) - min(vals)) < threshold
+        return det.blocked
 
     @asyncSlot()
     async def _on_connect(self):
@@ -2207,7 +2245,14 @@ class AsyncAMUZAGUI(QMainWindow):
                     self.remaining_wells.remove(well_id)
 
                 # Log well completion with sensor-synchronized timestamp
-                self._log_well_completion(well_id, sequence.name)
+                elapsed = self._log_well_completion(well_id, self._active_seq_name)
+
+                # Remember when this well was sampled so a blockage can be
+                # attributed to it later, and carry the log row's key so
+                # _finalize_well_log() can mark that exact row up.
+                now_m = time.monotonic()
+                self._well_spans.append(
+                    (well_id, self._well_started.get(well_id, now_m), now_m, elapsed))
 
                 # Track completion count and calibrate timer after first well
                 self.wells_completed_count += 1
@@ -2246,9 +2291,15 @@ class AsyncAMUZAGUI(QMainWindow):
 
             def on_seq_move(well_id):
                 # Fired the instant a move command is sent -> feed-forward pump
+                self._well_started[well_id] = time.monotonic()
                 tab = getattr(self, "flow_tab", None)
                 if tab is not None:
                     tab.on_move_command(well_id)
+
+            self._active_seq_name = sequence.name
+            self._blockage_spans = []
+            self._well_spans = []
+            self._well_started = {}
 
             completed = await self.connection.execute_sequence(
                 sequence,
@@ -2258,6 +2309,19 @@ class AsyncAMUZAGUI(QMainWindow):
                 timing_provider=get_current_timing,
                 move_callback=on_seq_move
             )
+
+            # Wells sampled through a blockage returned stale fluid, so their
+            # readings are worthless. Re-run them now, while the plate is still
+            # loaded, rather than discovering the holes after the run.
+            if completed:
+                await self._settle_for_blockage_judgement(stop_event)
+                completed = await self._rerun_blocked_wells(
+                    stop_event, on_well_completed, on_seq_progress,
+                    get_current_timing, on_seq_move)
+
+            # Mark up the well log either way: a stopped run still wants its
+            # spoiled readings flagged.
+            self._finalize_well_log()
 
             # Handle completion vs stopped
             if completed:
@@ -2282,6 +2346,92 @@ class AsyncAMUZAGUI(QMainWindow):
                 self.stop_btn.setEnabled(False)
             if getattr(self, "flow_tab", None) is not None:
                 self.flow_tab.set_experiment_phase("idle", 0)
+
+    async def _settle_for_blockage_judgement(self, stop_event):
+        """Keep reading for one detector latency after the last well.
+
+        The detector can only call a blockage about a cycle after the fluid
+        stopped, so the moment the last well finishes its verdict is still
+        outstanding. Without this pause the final wells of every pass could never
+        be judged — they would be marked clean by default and never re-run, which
+        is exactly the silent data loss this whole feature exists to prevent.
+        The plate is already loaded; a few idle minutes is cheap next to a
+        wasted well."""
+        det = getattr(self, "blockage_detector", None)
+        if det is None or self.sensor_reader is None:
+            return
+        wait = det.latency_s
+        self.add_to_display(
+            f"Settling {wait/60:.1f} min so the last wells can be checked for "
+            "blockage...")
+        await interruptible_sleep(wait, stop_event)
+
+    MAX_BLOCKAGE_RETRY_PASSES = 2
+    """How many extra passes to re-sample spoiled wells. Bounded because a line
+    that is still clogged will spoil the retry too, and looping forever on a
+    blocked line wastes the plate instead of fetching the user."""
+
+    async def _rerun_blocked_wells(self, stop_event, on_well_completed,
+                                   on_seq_progress, get_current_timing, on_seq_move):
+        """Re-sample any wells whose sampling overlapped a blockage.
+
+        Returns True if the run finished (nothing left to retry, or retries
+        exhausted), False if the user stopped it."""
+        det = getattr(self, "blockage_detector", None)
+        if det is None:
+            return True
+
+        since = None
+        for attempt in range(1, self.MAX_BLOCKAGE_RETRY_PASSES + 1):
+            wells = self._blocked_wells(since=since)
+            if not wells:
+                return True
+
+            # A line that is still blocked will spoil the retry exactly as it
+            # spoiled the original. Stop and say so rather than burn the plate.
+            if det.blocked:
+                self.add_to_display(
+                    f"⚠ Line still blocked — not re-running {len(wells)} spoiled "
+                    f"well(s): {', '.join(wells)}. Clear the line and re-run them.")
+                return True
+
+            self.add_to_display(
+                f"Re-running {len(wells)} well(s) sampled through a blockage "
+                f"(pass {attempt}/{self.MAX_BLOCKAGE_RETRY_PASSES}): {', '.join(wells)}")
+
+            # Judge this pass only on wells sampled from here on, so the wells
+            # that triggered the retry do not re-queue forever. History is kept
+            # rather than cleared — the well log needs every attempt.
+            since = time.monotonic()
+
+            t_buffer, t_sampling = await self.app_state.get_timing_params()
+            sequence = Sequence(f"Blockage Retry {attempt}")
+            for well_id in wells:
+                sequence.add_method(Method(pos=well_id, wait=t_sampling,
+                                           buffer_time=t_buffer,
+                                           eject=False, insert=False))
+            self._active_seq_name = sequence.name
+            self.remaining_wells = list(wells)
+            for w in wells:
+                if w in self.well_labels:
+                    self.well_labels[w].set_completed(False)
+
+            completed = await self.connection.execute_sequence(
+                sequence, stop_event,
+                well_completed_callback=on_well_completed,
+                progress_callback=on_seq_progress,
+                timing_provider=get_current_timing,
+                move_callback=on_seq_move)
+            if not completed:
+                return False
+
+        still = self._blocked_wells(since=since)
+        if still:
+            self.add_to_display(
+                f"⚠ {len(still)} well(s) still hit a blockage after "
+                f"{self.MAX_BLOCKAGE_RETRY_PASSES} retries: {', '.join(still)}. "
+                "Their readings are unreliable.")
+        return True
 
     def _update_progress_display(self, completed: int, total: int, completed_wells: list):
         """Update progress information in timer label"""
@@ -2353,35 +2503,115 @@ class AsyncAMUZAGUI(QMainWindow):
         # Write header
         with open(self.well_log_file, 'w') as f:
             f.write(f"# Well completion log - Sensor started: {self.sensor_log_start_time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write("well_id,completed_at,sensor_elapsed_min,sequence_name\n")
+            f.write("# blocked=1: sampled through a blockage, reading is stale - discard.\n")
+            f.write("# use=1: the reading to take for this well (its last un-blocked attempt).\n")
+            f.write("# A well may appear twice: the spoiled attempt, then its re-run.\n")
+            f.write("well_id,completed_at,sensor_elapsed_min,sequence_name,blocked,use\n")
 
         self.well_log_initialized = True
         self.add_to_display(f"Well log started: {self.well_log_file.name}")
         logger.info(f"Well log initialized: {self.well_log_file}")
 
     def _log_well_completion(self, well_id: str, sequence_name: str):
-        """Log well completion with sensor-synchronized timestamp"""
+        """Log well completion with sensor-synchronized timestamp.
+
+        Returns the sensor-relative time written, which identifies this row
+        uniquely so _finalize_well_log() can mark it up afterwards. None if
+        nothing was logged."""
         # Only log if sensor is connected and logging
         if not self.sensor_log_start_time or not self.well_log_file:
-            return
+            return None
 
         now = datetime.now()
 
         # Calculate sensor-relative time (same time base as sensor log t[min] column)
         sensor_elapsed_min = (now - self.sensor_log_start_time).total_seconds() / 60.0
 
-        # Append to log file
+        # `blocked`/`use` are unknowable now: the detector needs ~a cycle more
+        # data to judge this well. _finalize_well_log() resolves them at the end.
         try:
             with open(self.well_log_file, 'a') as f:
-                f.write(f"{well_id},{now.strftime('%Y-%m-%d %H:%M:%S')},{sensor_elapsed_min:.4f},{sequence_name}\n")
+                f.write(f"{well_id},{now.strftime('%Y-%m-%d %H:%M:%S')},"
+                        f"{sensor_elapsed_min:.4f},{sequence_name},pending,pending\n")
             logger.debug(f"Logged well {well_id} at sensor_elapsed={sensor_elapsed_min:.4f} min")
         except Exception as e:
             logger.error(f"Failed to write well log: {e}")
+            return None
+
+        return sensor_elapsed_min
 
         # Wells are stepping: re-arm the blockage detector and let it re-learn
         # the cycle period from the real completion cadence.
         if getattr(self, "blockage_detector", None) is not None:
             self.blockage_detector.note_well_completed(time.monotonic())
+
+    def _finalize_well_log(self):
+        """Resolve the pending `blocked`/`use` columns once the run is over.
+
+        Cannot be done as wells complete: the detector needs roughly another
+        cycle of data before it can judge the well that just finished. So rows
+        are written `pending` and marked up here.
+
+        `use` lands on each well's last un-blocked attempt — the re-run, when
+        there was one. A well whose every attempt was blocked gets no use=1 row
+        at all; there is no good reading to point at, and saying so is better
+        than nominating a stale one."""
+        if not self.well_log_file or not self.well_log_file.exists():
+            return
+        # Rows are keyed by (well_id, sensor_elapsed_min) — unique per row, and
+        # written into the CSV, so this survives the log starting mid-run.
+        blocked_by_row = {(w, round(elapsed, 4)): self._span_blocked(w0, w1)
+                          for w, w0, w1, elapsed in self._well_spans
+                          if elapsed is not None}
+        try:
+            lines = self.well_log_file.read_text().splitlines()
+        except Exception as e:
+            logger.error(f"Failed to read well log for finalizing: {e}")
+            return
+
+        rows, out = [], []
+        for ln in lines:
+            if ln.startswith("#") or ln.startswith("well_id") or not ln.strip():
+                out.append(ln)
+                continue
+            p = ln.split(",")
+            if len(p) < 6:
+                out.append(ln)
+                continue
+            try:
+                key = (p[0], round(float(p[2]), 4))
+            except ValueError:
+                out.append(ln)
+                continue
+            p[4] = "1" if blocked_by_row.get(key, False) else "0"
+            rows.append((len(out), p))
+            out.append(None)          # placeholder, filled below
+
+        # use=1 on the last un-blocked attempt for each well.
+        good = {}
+        for i, p in rows:
+            if p[4] == "0":
+                good[p[0]] = i
+        for i, p in rows:
+            p[5] = "1" if good.get(p[0]) == i else "0"
+            out[i] = ",".join(p)
+
+        try:
+            self.well_log_file.write_text("\n".join(out) + "\n")
+        except Exception as e:
+            logger.error(f"Failed to finalize well log: {e}")
+            return
+
+        spoiled = sum(1 for _, p in rows if p[4] == "1")
+        unusable = sorted({p[0] for _, p in rows} - set(good))
+        if spoiled:
+            self.add_to_display(
+                f"Well log finalized: {spoiled} spoiled reading(s) marked blocked=1; "
+                "take each well's use=1 row.")
+        if unusable:
+            self.add_to_display(
+                f"⚠ No clean reading for: {', '.join(unusable)} — every attempt "
+                "hit a blockage.")
 
     def _reset_well_log(self):
         """Reset well log tracking (called when sensor disconnects)"""

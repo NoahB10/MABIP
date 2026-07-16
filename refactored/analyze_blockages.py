@@ -63,8 +63,12 @@ def well_cycle_s(sensor_path: Path):
     wl = sensor_path.with_name(f"Well_Log_{m.group(1)}.csv")
     if not wl.exists():
         return None
+    # Skip comment lines and the column header; the number of comment lines has
+    # grown over time, so match on content rather than a fixed offset.
     mins = []
-    for ln in open(wl).readlines()[2:]:
+    for ln in open(wl):
+        if ln.startswith("#") or ln.startswith("well_id"):
+            continue
         p = ln.split(",")
         if len(p) >= 3:
             try:

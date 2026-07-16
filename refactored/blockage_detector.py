@@ -216,6 +216,17 @@ class BlockageDetector:
     def window_s(self) -> float:
         return self.cfg.cycle_s * self.cfg.window_factor
 
+    @property
+    def latency_s(self) -> float:
+        """How long after fluid actually stops that `update()` can raise the alarm.
+
+        The range only collapses once the window sits wholly inside the flat
+        stretch (window_s), and then it must persist (confirm_s). Callers that
+        need to know *which* well was affected must back-date the alarm by this
+        much — otherwise they blame a well that was fine, and miss the one that
+        was not."""
+        return self.window_s + self.cfg.confirm_s
+
     # ---- main -------------------------------------------------------------
     def update(self, t: float, channels: Sequence[float]) -> Optional[BlockageEvent]:
         """Feed one reading. `t` is seconds (monotonic or elapsed).
@@ -244,6 +255,11 @@ class BlockageDetector:
         # the plate is not stepping and a flat signal proves nothing. Safe during
         # a real blockage: the AMUZA keeps stepping on schedule while blocked —
         # it is the fluid that is stuck, not the robot — so completions continue.
+        #
+        # The 2.5 must stay above window_factor + confirm_s/cycle_s (i.e. above
+        # latency_s/cycle_s, ~1.75 by default). Callers wait latency_s after the
+        # last well for a verdict on it; idling sooner than that would discard the
+        # verdict they are waiting for.
         if self._wells and (t - self._wells[-1]) > 2.5 * cfg.cycle_s:
             self.set_cycling(False)
 
