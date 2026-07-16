@@ -1,0 +1,9 @@
+# MABIP experiment — BASELINE (pump keeps running during transit)
+# Load this in the Flow Control tab (📂 Load experiment…), then press Start Sampling.
+# times in seconds, flow rate in µL/min (combined line — auto ÷ #syringes)
+wells: A1, A2, A3, A4, A5
+sample_time: 110
+buffer_time: 60
+flow_rate: 80
+direction: withdraw
+pause_on_move: no

@@ -1,0 +1,10 @@
+# Run A — pause pump on move, STEP resume, rate 80
+wells: A1, A2, A3, A4, A5
+sample_time: 110
+buffer_time: 60
+flow_rate: 80
+direction: withdraw
+pause_on_move: yes
+pause_after: 0.45
+resume_after: 10
+resume_ramp: 0

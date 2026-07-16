@@ -1,0 +1,11 @@
+# Run C — pause on move, ramped resume (4 s), rate 50 (stays on-scale)
+wells: A1, A2, A3, A4, A5
+sample_time: 110
+buffer_time: 60
+flow_rate: 50
+direction: withdraw
+pause_on_move: yes
+pause_after: 0.45
+resume_after: 10
+resume_ramp: 4
+# Run D = this file + a fresh wet-prime beforehand (Prime button); no file change needed.

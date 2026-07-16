@@ -4,6 +4,8 @@ Async version of AMUZA GUI using qasync for PyQt5 async integration.
 Key improvements:
 - Uses qasync for proper async/await in PyQt5
 - @asyncSlot decorators for signal handlers
+vhttps://claude.com/cai/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e&response_type=code&redirect_uri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback&scope=org%3Acreate_api_key+user%3Aprofile+user%3Ainference+user%3Asessions%3Aclaude_code+user%3Amcp_servers+user%3Afile_upload&code_challenge=ya6zPauyukxKFxmr4wtS_8aFIGfFDmY-k9wqC-nqdY0&code_challenge_method=S256&state=nnIadu0uUMBwxBd0WHNqOyjt98GwfBH1w_xu_zvQxTk
+
 - AppState for thread-safe state management
 - AsyncTaskManager for background task tracking
 - Incremental file reading for plot updates
@@ -22,7 +24,7 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QGridLayout, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QLineEdit, QComboBox, QMessageBox, QDialog,
     QDialogButtonBox, QFormLayout, QSpinBox, QDoubleSpinBox, QCheckBox,
-    QTextEdit, QSizePolicy, QFileDialog, QListWidget, QAction, QMenuBar
+    QTextEdit, QSizePolicy, QFileDialog, QListWidget, QAction, QMenuBar, QTabWidget
 )
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QPalette, QColor
@@ -344,7 +346,17 @@ class PlotWindow(QMainWindow):
             line, = self.ax.plot([], [], color=color, linewidth=1, label=metabolite)
             self._lines[metabolite] = line
 
-        self.ax.legend()
+        self.ax.legend(loc="upper left")
+
+        # Right-hand axis: overlay the Fluigent flow rate as one extra line.
+        self.ax_flow = self.ax.twinx()
+        self.ax_flow.set_ylabel("Flow (µL/min)", color="#b0651a")
+        self.ax_flow.tick_params(axis="y", labelcolor="#b0651a")
+        (self._flow_line,) = self.ax_flow.plot([], [], color="#b0651a",
+                                               linewidth=1.2, label="Flow")
+        from collections import deque as _deque
+        self._flow_time = _deque(maxlen=self.MAX_POINTS)
+        self._flow_vals = _deque(maxlen=self.MAX_POINTS)
         self.figure.tight_layout()
 
         # Connect to navigation toolbar events to detect user pan/zoom
@@ -615,9 +627,34 @@ class PlotWindow(QMainWindow):
                 padding = max(0.1, y_range * 0.1)  # At least 0.1 padding
                 self.ax.set_ylim(y_min - padding, y_max + padding)
 
+        # --- overlay the live flow rate on the right axis --------------------
+        # Keep the FULL flow history (don't trim to the window) so pressing Home /
+        # showing the whole timeline displays all of it, exactly like the
+        # metabolites. The shared x-axis limits clip it to the visible window.
+        flow_val = None
+        if getattr(self, "main_gui", None) is not None:
+            try:
+                flow_val, _c = self.main_gui.flow_reading()
+            except Exception:
+                flow_val = None
+        if flow_val is not None and len(filtered_time) > 0:
+            self._flow_time.append(float(filtered_time[-1]))
+            self._flow_vals.append(float(flow_val))
+        if len(self._flow_time) > 0:
+            ft = np.array(self._flow_time); fv = np.array(self._flow_vals)
+            self._flow_line.set_data(ft, fv)
+            # scale the right axis to the flow that is actually visible right now
+            visible = fv[ft >= x_min]
+            ref = visible if len(visible) else fv
+            lo, hi = float(np.nanmin(ref)), float(np.nanmax(ref))
+            pad = max(1.0, (hi - lo) * 0.15)
+            self.ax_flow.set_ylim(lo - pad, hi + pad)
+        else:
+            self._flow_line.set_data([], [])
+
         # Use draw_idle for deferred rendering (more efficient)
         self.canvas.draw_idle()
-    
+
     def _on_clear_data(self):
         """
         Clear PLOT display only - does NOT affect the sensor log file.
@@ -640,6 +677,10 @@ class PlotWindow(QMainWindow):
         # Reset line data on plot
         for line in self._lines.values():
             line.set_data([], [])
+        # Clear the flow overlay history too, so it matches the metabolites
+        if hasattr(self, "_flow_time"):
+            self._flow_time.clear(); self._flow_vals.clear()
+            self._flow_line.set_data([], [])
 
         self.ax.set_xlim(0, self.rolling_window_minutes)
         self.ax.set_ylim(0, 1)
@@ -1125,11 +1166,20 @@ class SensorConnectDialog(QDialog):
     def _refresh_ports(self):
         """Refresh the list of available serial ports"""
         self.port_list.clear()
-        
+
         if SERIAL_PORTS_AVAILABLE:
             ports = list_ports.comports()
-            for port in ports:
+            six_row = None
+            for i, port in enumerate(ports):
                 self.port_list.addItem(f"{port.device} - {port.description}")
+                # The SIX metabolite transmitter uses a Silicon Labs CP210x
+                # adapter; pre-select it so a ttyUSB0/1 swap can't misdirect you
+                # to the FTDI (that one is the Chemyx pump).
+                desc = f"{port.description} {port.device}".lower()
+                if "cp210" in desc or "cp2102" in desc or "silicon" in desc:
+                    six_row = i
+            if six_row is not None:
+                self.port_list.setCurrentRow(six_row)
         else:
             self.port_list.addItem("COM1 (serial.tools not available)")
             self.port_list.addItem("COM2 (serial.tools not available)")
@@ -1335,10 +1385,8 @@ class AsyncAMUZAGUI(QMainWindow):
             QTextEdit { background: #ffffff; border: 1px solid #d0d7de; }
         """)
         
-        # Central widget
+        # Sampling page (added as a tab at the end of this method)
         central_widget = QWidget()
-        self.setCentralWidget(central_widget)
-        
         main_layout = QHBoxLayout(central_widget)
         
         # Left column: controls only
@@ -1467,7 +1515,222 @@ class AsyncAMUZAGUI(QMainWindow):
         main_layout.addLayout(left_col, 2)
         main_layout.addLayout(center_col, 5)
         main_layout.addLayout(right_col, 2)
-    
+
+        # --- Tabs: Sampling + Flow Control -----------------------------------
+        self.tabs = QTabWidget()
+        self.tabs.addTab(central_widget, "Sampling")
+        self.flow_tab = None
+        try:
+            from flow_control_tab import FlowControlTab
+            self.flow_tab = FlowControlTab(main_gui=self)
+            self.flow_tab.clog_changed.connect(self._on_flow_clog)
+            self.tabs.addTab(self.flow_tab, "Flow Control")
+        except Exception as e:
+            logger.error(f"Flow Control tab unavailable: {e}")
+        self.setCentralWidget(self.tabs)
+
+    def _on_flow_clog(self, clogged: bool):
+        """Surface a flow-line clog in the main display log."""
+        if clogged:
+            self.add_to_display("⚠ CLOG detected on flow line (flow below expected).")
+        else:
+            self.add_to_display("Flow clog cleared.")
+
+    def flow_reading(self):
+        """(flow_uL_min, clog) from the Flow Control tab, or (None, 0)."""
+        tab = getattr(self, "flow_tab", None)
+        if tab is not None and getattr(tab, "latest_flow", None) is not None:
+            return tab.latest_flow, (1 if tab.is_clogged else 0)
+        return None, 0
+
+    def load_experiment_setup(self, wells, sampling, buffer):
+        """Select `wells` and set sampling/buffer times from a loaded experiment
+        file (called by the Flow Control tab's Load experiment button)."""
+        if sampling and int(sampling) > 0:
+            self.app_state.t_sampling = int(sampling)
+        if buffer and int(buffer) > 0:
+            self.app_state.t_buffer = int(buffer)
+        wells = [w.upper() for w in wells]
+        for wid, lbl in self.well_labels.items():        # update the plate visuals
+            lbl.set_selected(wid in wells)
+            lbl.set_completed(False)
+
+        async def _sel():
+            await self.app_state.clear_selections()
+            for w in wells:
+                if w in self.well_labels:
+                    await self.app_state.add_selected_well(w)
+        try:
+            asyncio.create_task(_sel())
+        except RuntimeError:
+            pass
+        self.add_to_display(f"Experiment loaded: {len(wells)} wells, "
+                            f"sample {sampling}s, buffer {buffer}s. Press Start Sampling.")
+
+    def run_experiment_runs(self, runs):
+        """Run every run in `runs` back-to-back over the selected wells, tagging the
+        data per-run (called by the Flow Control tab's Run experiment button)."""
+        if not (self.connection and self.connection.is_connected):
+            QMessageBox.warning(self, "Not connected", "Connect to the AMUZA robot first.")
+            return
+        for task in self.task_manager.get_running_tasks():
+            if task.get_name() in ("sampling_sequence", "experiment_runs") and not task.done():
+                QMessageBox.warning(self, "Busy", "A sampling run is already in progress.")
+                return
+        task = asyncio.create_task(self._run_experiment_runs_task(runs))
+        self.task_manager.add_task(task, "experiment_runs")
+
+    async def _settle_flow_to(self, target_line, label=""):
+        """Command the pump to `target_line` µL/min and wait until the SENSOR actually
+        reads it (raising the pump if the measured flow is low) before returning True.
+        Returns False if STOP was pressed. No-ops (True) if disabled / no pump."""
+        tab = getattr(self, "flow_tab", None)
+        if tab is None or tab.line is None or target_line <= 0:
+            return True
+        cfg = tab.cfg
+        if not cfg.get("exp_settle", True):
+            return True
+
+        def _f(k, d):
+            try:
+                return float(cfg.get(k, d))
+            except (ValueError, TypeError):
+                return d
+        tol = _f("exp_settle_tol", 10.0) / 100.0
+        hold_s = _f("exp_settle_hold", 5.0)
+        timeout_s = _f("exp_settle_timeout", 120.0)
+        bump = _f("exp_settle_bump", 5.0) / 100.0
+        cap = target_line * _f("exp_settle_max", 2.0)
+        n = tab._nsyr()
+        direction = cfg.get("direction", "withdraw")
+        commanded = target_line
+        low = target_line * (1.0 - tol)
+        try:
+            tab.line.start_flow_single(commanded / n, direction=direction)
+        except Exception as e:
+            self.add_to_display(f"settle: flow start error {e}")
+        self.add_to_display(f"Settling flow to {target_line:g} µL/min before {label}…")
+        t0 = time.time(); stable_since = None; last_bump = t0
+        while True:
+            if self.app_state.stop_event.is_set():
+                return False
+            await asyncio.sleep(0.5)
+            now = time.time()
+            m = tab.latest_flow
+            if m is None:                                   # no sensor → can't verify
+                if now - t0 >= max(hold_s, 8.0):
+                    self.add_to_display("settle: no sensor reading — starting without flow verification.")
+                    return True
+                continue
+            mval = abs(m)
+            if mval >= low:
+                if stable_since is None:
+                    stable_since = now
+                if now - stable_since >= hold_s:
+                    self.add_to_display(f"✓ Flow at {mval:.1f} µL/min (target {target_line:g}) — starting {label}.")
+                    return True
+            else:
+                stable_since = None
+                if now - last_bump >= 4.0 and commanded < cap:   # measured low → raise the pump
+                    commanded = min(cap, commanded + target_line * bump)
+                    try:
+                        tab.line.start_flow_single(commanded / n, direction=direction)
+                    except Exception:
+                        pass
+                    last_bump = now
+                    self.add_to_display(f"settle: {mval:.1f} < {target_line:g} → raising pump to "
+                                        f"{commanded:.1f} µL/min (line)")
+            if now - t0 >= timeout_s:
+                self.add_to_display(f"⚠ settle timeout ({timeout_s:g}s): measured {mval:.1f} vs "
+                                    f"target {target_line:g} — starting {label} anyway.")
+                return True
+
+    async def _run_experiment_runs_task(self, runs):
+        """Loop the runs: apply each run's flow settings, then run the well sequence."""
+        tab = getattr(self, "flow_tab", None)
+        try:
+            wells = await self.app_state.get_selected_wells()
+            if not wells:
+                self.add_to_display("Experiment: no wells selected — load the experiment file first.")
+                return
+            wells_list = sorted(list(wells), key=lambda x: (x[0], int(x[1:])))
+            for i, run in enumerate(runs, 1):
+                if self.app_state.stop_event.is_set():
+                    self.add_to_display("Experiment stopped before run %d." % i)
+                    break
+                name = run.get("name", f"run{i}")
+                self.add_to_display(f"════════ RUN {i}/{len(runs)}: {name} ════════")
+                await self.app_state.clear_stop()
+                if tab is not None:
+                    tab.apply_run(run)                       # settings + start flow + tag log
+
+                # closed-loop: only start once the sensor reads the specified rate
+                try:
+                    target_line = float(run.get("flow_rate", 0) or 0)
+                except (ValueError, TypeError):
+                    target_line = 0.0
+                if target_line > 0:
+                    if not await self._settle_flow_to(target_line, f"run {name}"):
+                        self.add_to_display(f"Experiment stopped while settling ({name}).")
+                        break
+
+                # per-run sequence setup (mirrors _on_start)
+                self.current_sequence_wells = wells_list.copy()
+                self.remaining_wells = wells_list.copy()
+                self.wells_completed_count = 0
+                self.first_well_start_time = time.time()
+                self.measured_well_duration = None
+                t_buffer, t_sampling = await self.app_state.get_timing_params()
+                self._start_experiment_timer(len(wells_list), t_buffer, t_sampling)
+                sequence = Sequence(f"Run {name}")
+                for wid in wells_list:
+                    sequence.add_method(Method(pos=wid, wait=t_sampling, buffer_time=t_buffer,
+                                               eject=False, insert=False))
+                self.add_to_display(f"Run {name} on wells: {', '.join(wells_list)}")
+                await self._execute_sequence(sequence)
+                if self.app_state.stop_event.is_set():
+                    self.add_to_display(f"Experiment stopped during run {name}.")
+                    break
+            else:
+                self.add_to_display("✓ Experiment complete — all runs done and tagged per-run in the flow log.")
+        except Exception as e:
+            logger.error(f"Experiment runs error: {e}")
+            self.add_to_display(f"Experiment failed: {e}")
+        finally:
+            if tab is not None:
+                tab.clear_run_tag()
+                try:
+                    tab.line and tab.line.stop()
+                except Exception:
+                    pass
+
+    def _track_metabolite(self, reading):
+        """Keep a short history of the metabolite signal so a clog can be
+        corroborated: a stuck (unchanging) signal means no fresh fluid."""
+        if not hasattr(self, "_metab_hist"):
+            from collections import deque
+            self._metab_hist = deque(maxlen=3000)
+        try:
+            sig = sum(abs(c) for c in reading.channels[:6])
+        except Exception:
+            return
+        self._metab_hist.append((time.monotonic(), sig))
+
+    def metabolite_stuck(self, window_s=12.0, threshold=0.15):
+        """Is the metabolite signal stuck (flat) over the last `window_s`?
+        True  -> flat (stuck; corroborates a real clog),
+        False -> changing (fluid IS reaching the sensor; a low flow = air, not clog),
+        None  -> not enough data / sensor not recording.
+        `threshold` is in raw channel-sum units and needs tuning to your sensor."""
+        hist = getattr(self, "_metab_hist", None)
+        if not hist:
+            return None
+        now = time.monotonic()
+        vals = [s for (t, s) in hist if now - t <= window_s]
+        if len(vals) < 5:
+            return None
+        return (max(vals) - min(vals)) < threshold
+
     @asyncSlot()
     async def _on_connect(self):
         """Handle connect/disconnect/reconnect button"""
@@ -1941,11 +2204,30 @@ class AsyncAMUZAGUI(QMainWindow):
                 return (self.app_state.t_buffer, self.app_state.t_sampling)
 
             # Execute sequence with callback (connection will handle auto-insert)
+            def on_seq_progress(msg, cur, total):
+                # Drive the Flow Control tab's phase so burst only fires in buffer
+                tab = getattr(self, "flow_tab", None)
+                if tab is None:
+                    return
+                nwells = len(self.remaining_wells)
+                if msg.startswith("Buffer:"):
+                    tab.set_experiment_phase("buffer", nwells)
+                elif msg.startswith("Sampling:"):
+                    tab.set_experiment_phase("well", nwells)
+
+            def on_seq_move(well_id):
+                # Fired the instant a move command is sent -> feed-forward pump
+                tab = getattr(self, "flow_tab", None)
+                if tab is not None:
+                    tab.on_move_command(well_id)
+
             completed = await self.connection.execute_sequence(
                 sequence,
                 stop_event,
                 well_completed_callback=on_well_completed,
-                timing_provider=get_current_timing
+                progress_callback=on_seq_progress,
+                timing_provider=get_current_timing,
+                move_callback=on_seq_move
             )
 
             # Handle completion vs stopped
@@ -1969,6 +2251,8 @@ class AsyncAMUZAGUI(QMainWindow):
             # Only disable stop button if sequence fully completed (not paused)
             if not self.is_paused:
                 self.stop_btn.setEnabled(False)
+            if getattr(self, "flow_tab", None) is not None:
+                self.flow_tab.set_experiment_phase("idle", 0)
 
     def _update_progress_display(self, completed: int, total: int, completed_wells: list):
         """Update progress information in timer label"""
@@ -2279,13 +2563,21 @@ class AsyncAMUZAGUI(QMainWindow):
             asyncio.create_task(self._disconnect_sensor())
             return
 
-        # Auto-connect: find the first available serial port
+        # Auto-connect: target the SIX transmitter (Silicon Labs CP210x), NOT
+        # the FTDI (that's the Chemyx pump — grabbing it gives "multiple access
+        # on port" and no data). Robust to ttyUSB0/1 swapping.
         if SERIAL_PORTS_AVAILABLE:
             ports = list(list_ports.comports())
             if ports:
-                # Use the first available port
-                port = ports[0].device
-                self.add_to_display(f"Auto-connecting to sensor on {port}...")
+                six = None
+                for p in ports:
+                    desc = f"{p.description} {p.device} {getattr(p, 'manufacturer', '') or ''}".lower()
+                    if "cp210" in desc or "cp2102" in desc or "silicon" in desc:
+                        six = p.device
+                        break
+                port = six or ports[0].device
+                self.add_to_display(f"Auto-connecting to sensor on {port}"
+                                    f"{' (SIX/CP2102)' if six else ''}...")
                 asyncio.create_task(self._connect_sensor(port))
             else:
                 QMessageBox.warning(self, "No Sensor Found",
@@ -2324,6 +2616,7 @@ class AsyncAMUZAGUI(QMainWindow):
             def on_sensor_data(reading):
                 if self.plot_window:
                     self.plot_window.add_reading(reading)
+                self._track_metabolite(reading)
 
             # Create sensor reader with data callback
             self.sensor_reader = AsyncPotentiostatReader(
@@ -2331,6 +2624,8 @@ class AsyncAMUZAGUI(QMainWindow):
                 use_mock=use_mock,
                 data_callback=on_sensor_data
             )
+            # Log the Fluigent flow rate next to each sensor sample (high res)
+            self.sensor_reader.set_flow_provider(self.flow_reading)
 
             # Connect
             if await self.sensor_reader.connect():

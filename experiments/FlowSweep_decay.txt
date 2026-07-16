@@ -1,0 +1,13 @@
+# Flow-rate DECAY sweep (no wells / no robot).
+# For each rate: ramp/step up, HOLD, then STOP the pump and log how the flow decays.
+# All rates land in ONE flow log, tagged per rate (segment column: r10_hold, r10_decay, ...).
+# Connect BOTH pump and sensor first, then 📂 Load experiment → ▶ Run sweep.
+experiment: flow_sweep
+
+# rates in µL/min — list them, or use start..stop..step
+rates: 10..50..10           # = 10, 20, 30, 40, 50
+
+hold_s: 30                  # hold at each rate before shutting off
+decay_s: 60                 # pump OFF, watch it decay (seconds)
+ramp_s: 0                   # 0 = step up; >0 = ramp up over N s
+direction: withdraw

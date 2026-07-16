@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Data & logs (not source)
+Sensor_Readings/
+Amuza_Logs/
+refactored/Sensor_Readings/
+refactored/Amuza_Logs/
+*.csv
+Flow_Log_*.csv
+
+# Raw measurement text dumps at the repo root
+/*.txt
+
+# Keep experiment definition files
+!experiments/
+!experiments/*.txt

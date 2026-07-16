@@ -49,14 +49,37 @@ class DeviceState(IntEnum):
 
 
 class CommandTiming:
-    """Timing constants for each command type (in seconds)"""
+    """Timing constants for each command type (in seconds).
+
+    MOVE_MIN/MAX and the water-line primitives below were MEASURED, not guessed,
+    via timing_calibration.py on 2026-07-15 (15 clean legs, spacebar-marked
+    water crossings vs is_moving/countdown edges). Move-arrival time depends on
+    the DESTINATION's distance from A1 (what calculate_move_time already keys
+    off): arriving at/near A1 ≈ 6.1 s, arriving at the far corner H12 ≈ 9.2 s,
+    saturating by mid-plate. LIFT_OUT and PUMP_RESUME_AFTER_MOVE drive the pump
+    feed-forward (pause on lift-out, resume once the tip is back in liquid).
+    """
     EJECT = 5.0
     INSERT = 7.5
     STOP = 0.5
     QUERY = 0.1
-    MOVE_MIN = 7.0   # Move to A1 (closest)
-    MOVE_MAX = 12.0  # Move to H12 (farthest)
+    MOVE_MIN = 6.1   # measured: arrival at A1/nearest (was a guessed 7.0)
+    MOVE_MAX = 9.2   # measured: arrival plateau at mid-plate..H12 (was a guessed 12.0)
     COMMAND_RESPONSE = 0.15  # Typical response time
+
+    # Measured move-arrival time (s) vs the destination's Euclidean distance from
+    # A1. Piecewise-linear through these anchors, FLAT beyond the last (arrival
+    # saturates by mid-plate — it is NOT linear to the far corner). From the
+    # 2026-07-15 calibration: dist 0→6.1 s, 1→6.4 s, 7→9.2 s, then ~9.2 s out to
+    # H12 (dist ≈13). calculate_move_time() interpolates this table.
+    MOVE_TIME_TABLE = ((0.0, 6.1), (1.0, 6.4), (7.0, 9.2))
+
+    # --- water-line crossing primitives (measured; relative to a move command) ---
+    LIFT_OUT_DELAY = 0.45     # tip LEAVES liquid ~0.43 s after the command (sd 0.09) → PAUSE pump
+    PUMP_RESUME_AFTER_MOVE = 10.0  # tip ENTERS destination by ≤9.3 s worst case → RESUME pump.
+                                   # Flat 10 s covers every well with margin; arrival saturates
+                                   # ~9.2 s by mid-plate, so a distance model buys almost nothing
+                                   # and risks resuming into air — keep it flat.
 
 
 class CommandPriority(IntEnum):
@@ -362,21 +385,31 @@ class AsyncAmuzaConnection:
 
     @staticmethod
     def calculate_move_time(well_id: str) -> float:
-        """Calculate move time based on well position using Euclidean distance"""
+        """Measured move-arrival time (s) for a destination well.
+
+        Looks up CommandTiming.MOVE_TIME_TABLE (measured, not a formula) by the
+        destination's Euclidean distance from A1: piecewise-linear between anchors
+        and FLAT beyond the last, because arrival saturates ~9.2 s by mid-plate
+        rather than growing linearly to the far corner. Used for timeout/pacing
+        sizing; for the pump-resume trigger use CommandTiming.PUMP_RESUME_AFTER_MOVE.
+        """
         try:
-            row_letter = well_id[0].upper()
-            col_number = int(well_id[1:])
-            row = ord(row_letter) - ord('A')
-            col = col_number - 1
+            row = ord(well_id[0].upper()) - ord('A')
+            col = int(well_id[1:]) - 1
             distance = math.sqrt(row**2 + col**2)
-            max_distance = math.sqrt(7**2 + 11**2)
-            if distance == 0:
-                return CommandTiming.MOVE_MIN
-            time_range = CommandTiming.MOVE_MAX - CommandTiming.MOVE_MIN
-            return CommandTiming.MOVE_MIN + (distance / max_distance) * time_range
         except Exception as e:
             logger.warning(f"Could not calculate move time for {well_id}: {e}")
             return CommandTiming.MOVE_MAX
+
+        tbl = CommandTiming.MOVE_TIME_TABLE
+        if distance <= tbl[0][0]:
+            return tbl[0][1]
+        if distance >= tbl[-1][0]:
+            return tbl[-1][1]                      # plateau — arrival saturates
+        for (d0, t0), (d1, t1) in zip(tbl, tbl[1:]):
+            if d0 <= distance <= d1:
+                return t0 + (t1 - t0) * (distance - d0) / (d1 - d0)
+        return CommandTiming.MOVE_MAX
 
     async def connect(self) -> bool:
         """Connect to the AMUZA device via Bluetooth"""
@@ -924,10 +957,13 @@ class AsyncAmuzaConnection:
         self,
         method: Method,
         stop_event: asyncio.Event,
-        on_progress: Optional[Callable[[str, int, int], None]] = None
+        on_progress: Optional[Callable[[str, int, int], None]] = None,
+        on_move: Optional[Callable[[str], None]] = None
     ) -> bool:
         """
         Execute a single method with interruptible waits.
+        on_move(well_id) fires the instant the move command is sent (the anchor
+        for feed-forward pump pause/resume).
 
         Args:
             method: Method to execute
@@ -969,6 +1005,14 @@ class AsyncAmuzaConnection:
 
         logger.info(f"Moving to {method.pos} (port {port}), sampling for {method.wait}s")
         logger.info(f"Command: {repr(command)}")
+
+        # Feed-forward anchor: fire at the instant the move command goes out, so
+        # the pump can pause on lift-out (+0.45 s) and resume on entry (+10 s).
+        if on_move:
+            try:
+                on_move(str(method.pos))
+            except Exception as e:
+                logger.error(f"on_move callback error: {e}")
 
         await self.send_command(
             command,
@@ -1022,7 +1066,8 @@ class AsyncAmuzaConnection:
         stop_event: asyncio.Event,
         well_completed_callback: Optional[Callable[[str, List[str]], None]] = None,
         progress_callback: Optional[Callable[[str, int, int], None]] = None,
-        timing_provider: Optional[Callable[[], tuple]] = None
+        timing_provider: Optional[Callable[[], tuple]] = None,
+        move_callback: Optional[Callable[[str], None]] = None
     ) -> bool:
         """
         Execute a sequence of methods with stop support.
@@ -1066,7 +1111,9 @@ class AsyncAmuzaConnection:
                 if progress_callback:
                     progress_callback(f"Processing well {method.pos}", i, len(sequence))
 
-                completed = await self.execute_method(method, stop_event)
+                completed = await self.execute_method(method, stop_event,
+                                                      on_progress=progress_callback,
+                                                      on_move=move_callback)
 
                 if not completed:
                     logger.info(f"Method not completed, stopping sequence")

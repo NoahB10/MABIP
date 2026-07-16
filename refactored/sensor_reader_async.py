@@ -127,6 +127,7 @@ class AsyncPotentiostatReader:
         self.baudrate = baudrate
         self.use_mock = use_mock
         self.data_callback = data_callback  # Optional callback for real-time GUI updates
+        self.flow_provider = None  # Optional callable -> (flow_uL_min, clog)
 
         # Generate output file path with timestamp
         if output_file:
@@ -168,6 +169,26 @@ class AsyncPotentiostatReader:
     def set_data_callback(self, callback: Callable[[SensorReading], None]):
         """Set callback for real-time data updates (more efficient than file polling)"""
         self.data_callback = callback
+
+    def set_flow_provider(self, provider):
+        """Set a callable returning (flow_uL_min, clog) so the Fluigent flow rate
+        is logged next to each sensor sample (high time resolution)."""
+        self.flow_provider = provider
+
+    def _flow_field(self) -> str:
+        """Current flow as a string for the trailing log column ('' if unavailable)."""
+        if self.flow_provider is None:
+            return ""
+        try:
+            flow, _clog = self.flow_provider()
+            return "" if flow is None else f"{flow:.3f}"
+        except Exception:
+            return ""
+
+    def _line_with_flow(self, reading) -> str:
+        """Legacy row (386 cols: counter, t, 64 channels, 320 fit) + a trailing
+        flow_uL_min value, so it aligns with the flow_uL_min header at the end."""
+        return reading.to_legacy_line().rstrip("\n") + "\t" + self._flow_field() + "\n"
 
     async def connect(self) -> bool:
         """Connect to the serial port"""
@@ -273,6 +294,10 @@ class AsyncPotentiostatReader:
             header_cols += [f"X(Fit{k})" for k in range(1, 65)]
             # Add Fit coefficient columns
             header_cols += [f"Fit{k}a{i}" for k in range(1, 65) for i in range(1, 5)]
+            # Fluigent flow rate — TRAILING column. Rows already carry the 320 fit
+            # values, so this aligns with the value appended by _line_with_flow and
+            # leaves every existing column exactly where downstream parsers expect.
+            header_cols += ["flow_uL_min"]
             await f.write("\t".join(header_cols) + "\n")
 
             # Start timestamp
@@ -320,7 +345,7 @@ class AsyncPotentiostatReader:
                         reading = self._process_packet_buffer()
                         if reading:
                             # Buffer the line for batched writing
-                            self.write_buffer.append(reading.to_legacy_line())
+                            self.write_buffer.append(self._line_with_flow(reading))
 
                             # Call data callback if set (for direct GUI updates)
                             if self.data_callback:
@@ -362,7 +387,7 @@ class AsyncPotentiostatReader:
                         reading = self._process_packet_buffer()
                         if reading:
                             # Buffer the line for batched writing
-                            self.write_buffer.append(reading.to_legacy_line())
+                            self.write_buffer.append(self._line_with_flow(reading))
 
                             # Call data callback if set
                             if self.data_callback:

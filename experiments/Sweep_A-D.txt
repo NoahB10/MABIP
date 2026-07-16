@@ -1,0 +1,31 @@
+# COMPLETE A–D experiment — all runs in ONE file, run back-to-back automatically.
+# 📂 Load experiment → ▶ Run experiment. Keep "Flow follows wells" OFF.
+# Data from every run lands in one flow log, tagged run_Baseline / run_A / ...
+# ---- shared (every run inherits these) ----
+wells: A1, A2, A3, A4, A5
+sample_time: 110
+buffer_time: 60
+direction: withdraw
+pause_after: 0.45
+resume_after: 10
+
+# ---- the runs (order = execution order) ----
+[run] Baseline
+pause_on_move: no
+flow_rate: 80
+
+[run] A
+pause_on_move: yes
+flow_rate: 80
+resume_ramp: 0
+
+[run] B
+pause_on_move: yes
+flow_rate: 80
+resume_ramp: 4
+
+[run] C
+pause_on_move: yes
+flow_rate: 50
+resume_ramp: 4
+# Run D = load this, do a fresh wet-prime (Prime button) first, then run C only.
