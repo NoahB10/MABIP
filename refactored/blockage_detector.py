@@ -37,6 +37,25 @@ Four things make that robust:
    Only channels with enough SNR get a vote (ch1/ch2/ch4 measured SNR ~16 never
    fall below ~29% of baseline even when genuinely stuck, so they cannot vote).
 
+Latency — the unavoidable cost
+------------------------------
+A blockage cannot be called faster than roughly one well cycle, because one cycle
+is exactly the timescale on which a *healthy* signal is allowed to be flat. The
+alarm therefore lands ~window_s + confirm_s (~5 min at default settings) after
+the fluid actually stops — about two wells' worth of data. Measured on the 14 Jul
+run, trading that latency away costs false positives:
+
+    window_factor  confirm_s   false-positive rate    latency
+        1.2          30 s          0.95%              ~1.9 min
+        1.3          45 s          0.14%              ~2.5 min
+        1.5          45 s          0.00%              ~3.0 min   <- default
+        1.8          45 s          0.00%              misses real events
+
+The defaults buy a clean zero-false-positive run at ~3 min. If you would rather
+hear about a clog sooner and tolerate the odd spurious alarm, drop window_factor
+to 1.3. Do not go below ~1.2: at window_factor <= 1.0 the window no longer spans
+a full cycle and the detector degenerates into the 12 s detector's failure mode.
+
 Usage (streaming, one call per sensor reading):
 
     det = BlockageDetector(cycle_s=177.0)
@@ -90,7 +109,9 @@ class DetectorConfig:
     window_factor: float = 1.5
     """Analysis window as a multiple of cycle_s. Must exceed 1.0 so every healthy
     window contains a full rise+fall. 1.5 gave clean separation: healthy p5 range
-    13.0 vs blocked <3.0 on ch6."""
+    13.0 vs blocked <3.0 on ch6, at 0% false positives. Lower it to ~1.3 to alarm
+    ~0.5 min sooner at ~0.14% false positives; see the latency table in the module
+    docstring."""
 
     flat_frac: float = 0.25
     """Flat if range < this fraction of the channel's healthy baseline. Healthy
@@ -111,7 +132,9 @@ class DetectorConfig:
     so this admits ch3/ch5/ch6 and rejects the three that cannot discriminate."""
 
     confirm_s: float = 45.0
-    """Sustain time before alarming. Suppresses momentary dips; costs latency."""
+    """Sustain time before alarming. Deliberately suppresses brief flat spells:
+    the 14 Jul run has two ~0.5 min ones that are momentary, not clogs worth
+    interrupting a run for. Anything shorter than this is not reported."""
 
     baseline_s: float = 3600.0
     """Trailing span for the healthy-amplitude baseline. Long enough to average
