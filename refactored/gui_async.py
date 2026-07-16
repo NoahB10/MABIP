@@ -63,6 +63,7 @@ from app_state import AppState
 from async_utils import AsyncTaskManager, interruptible_sleep
 from amuza_async import AsyncAmuzaConnection, Method, Sequence
 from sensor_reader_async import AsyncPotentiostatReader
+from blockage_detector import BlockageDetector
 
 
 logger = logging.getLogger(__name__)
@@ -1320,17 +1321,24 @@ class AsyncAMUZAGUI(QMainWindow):
     
     Uses qasync for proper async/await integration with PyQt5.
     """
-    
+
+    blockage_changed = pyqtSignal(bool)   # True = blocked, False = cleared
+
     def __init__(self, app_state: AppState, task_manager: AsyncTaskManager):
         super().__init__()
-        
+
         self.app_state = app_state
         self.task_manager = task_manager
         self.cell_size = 42
-        
+
         # Connection
         self.connection: Optional[AsyncAmuzaConnection] = None
         self.sensor_reader: Optional[AsyncPotentiostatReader] = None
+
+        # Blockage detection from the metabolite signal alone (no flow sensor).
+        # Created once and reset per sensor connection so each run learns its own
+        # healthy amplitude baseline.
+        self.blockage_detector: Optional[BlockageDetector] = None
         
         # Wells
         self.well_labels: Dict[str, WellLabel] = {}
@@ -1715,6 +1723,27 @@ class AsyncAMUZAGUI(QMainWindow):
         except Exception:
             return
         self._metab_hist.append((time.monotonic(), sig))
+        self._track_blockage(reading)
+
+    def _track_blockage(self, reading):
+        """Feed the metabolite channels to the flow-sensor-independent blockage
+        detector and surface any state change in the display log."""
+        det = getattr(self, "blockage_detector", None)
+        if det is None:
+            return
+        try:
+            event = det.update(time.monotonic(), reading.channels[:6])
+        except Exception as e:
+            logger.debug(f"Blockage detector error: {e}")
+            return
+        if event is None:
+            return
+        self.add_to_display(("⚠ " if event.blocked else "") + event.message)
+        logger.warning(event.message) if event.blocked else logger.info(event.message)
+        try:
+            self.blockage_changed.emit(event.blocked)
+        except Exception:
+            pass
 
     def metabolite_stuck(self, window_s=12.0, threshold=0.15):
         """Is the metabolite signal stuck (flat) over the last `window_s`?
@@ -2349,6 +2378,11 @@ class AsyncAMUZAGUI(QMainWindow):
         except Exception as e:
             logger.error(f"Failed to write well log: {e}")
 
+        # Wells are stepping: re-arm the blockage detector and let it re-learn
+        # the cycle period from the real completion cadence.
+        if getattr(self, "blockage_detector", None) is not None:
+            self.blockage_detector.note_well_completed(time.monotonic())
+
     def _reset_well_log(self):
         """Reset well log tracking (called when sensor disconnects)"""
         self.sensor_log_start_time = None
@@ -2617,6 +2651,16 @@ class AsyncAMUZAGUI(QMainWindow):
                 if self.plot_window:
                     self.plot_window.add_reading(reading)
                 self._track_metabolite(reading)
+
+            # Fresh detector per connection: the healthy-amplitude baseline is
+            # specific to this run's electrodes and timing. Seed the cycle from
+            # the configured sampling+buffer time; note_well_completed() will
+            # refine it from the actual cadence once wells start finishing.
+            t_buffer, t_sampling = await self.app_state.get_timing_params()
+            move_overhead = (HARDWARE.MOVE_COMPLETION_DELAY + HARDWARE.MOVE_FINAL_DELAY)
+            self.blockage_detector = BlockageDetector(
+                cycle_s=float(t_buffer + t_sampling + move_overhead)
+            )
 
             # Create sensor reader with data callback
             self.sensor_reader = AsyncPotentiostatReader(
