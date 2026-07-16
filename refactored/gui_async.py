@@ -2406,7 +2406,16 @@ class AsyncAMUZAGUI(QMainWindow):
         Shown non-modally and awaited via a future rather than exec_(), which
         would spin a nested Qt loop and stall the asyncio loop the sensor reader
         and pump live on — the sensor must keep sampling while we wait, or the
-        detector cannot tell that the line came back."""
+        detector cannot tell that the line came back.
+
+        NOT YET VERIFIED ON THE RIG. Everything around it is tested — the gate's
+        decisions, the before-the-move ordering, the auto-resume race — but this
+        function has only ever run headless with the dialog stubbed out, so the
+        QMessageBox actually appearing, returning, and being dismissed by
+        _close_blockage_dialog() when the signal clears first are all unproven.
+        If a run ever parks in buffer and nothing appears, or the dialog appears
+        and answering it does nothing, start here. Exercise it on a babysat plate
+        before trusting it to an unattended run."""
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Warning)
         box.setWindowTitle("Blockage detected")
