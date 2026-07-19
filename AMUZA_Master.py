@@ -173,7 +173,7 @@ class AmuzaConnection:
                     logging.info(f"  Address: {addr}")
                     logging.info(f"  Name: {name}")
                     logging.info(f"  Class: {device_class}")
-                if(name=='FC90-0034'):
+                if(name=='FC90-0037'):
                     address=addr
             if(address==""):
                 if logs:

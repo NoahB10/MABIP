@@ -22,13 +22,13 @@ class HardwareConfig:
     DEFAULT_AMUZA_DEVICE: str = "Machine 1"
 
     # Legacy single device (for backwards compatibility)
-    BLUETOOTH_DEVICE_ADDRESS: str = "FC:90:00:34"
-    BT_DEVICE_NAME: str = 'FC90-0034'
+    BLUETOOTH_DEVICE_ADDRESS: str = "FC:90:00:37"
+    BT_DEVICE_NAME: str = 'FC90-0037'
 
     def __post_init__(self):
         if self.AMUZA_DEVICES is None:
             self.AMUZA_DEVICES = {
-                "Machine 1": "FC90-0034",   # First AMUZA device
+                "Machine 1": "FC90-0037",   # This Pi's AMUZA device
                 "Machine 2": "FC90-XXXX",   # Second AMUZA device - UPDATE THIS
             }
     
