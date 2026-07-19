@@ -1,0 +1,31 @@
+# DEFINITIVE TEST — bubble trap + kick/model/trim controller. 1 syringe, 80 µL/min.
+# Run headless: python headless_rig.py wells ../experiments/Trap_KMT_80.txt
+#
+# PRE-CONDITIONS: bubble trap installed before the sensor · fresh prime ·
+# syringe reset (needs ~450 µL) · A1/A2 topped up.
+#
+# Two runs isolate the two changes:
+#   pause_step : same control as before → compares against the PRE-trap control
+#                (well flow 51±36, 7% in-band) = what the TRAP alone bought.
+#   kick_trim  : kick (calibrated overdrive until sensor moves) + model
+#                (command = target × live ratio estimate) + fast 1 s trim loop
+#                = what the CONTROLLER adds on top.
+#
+# PASS BAR (decided in advance): kick_trim holds ≥70% of well time inside 80±8.
+# Pass → this becomes the well protocol. Fail → remaining problem is hardware
+# (air ingress), and we stop iterating software.
+
+wells: A1, A2
+sample_time: 40
+buffer_time: 30
+flow_rate: 80
+direction: withdraw
+pause_on_move: yes
+pause_after: 0.45
+resume_after: 10
+
+[run] pause_step
+resume_ramp: 0
+
+[run] kick_trim
+resume_kick_servo: yes

@@ -1,0 +1,44 @@
+# BURST experiment — one file, 4 runs back-to-back, 80 µL/min baseline.
+# 📂 Load experiment → ▶ Run experiment. Needs PUMP + SENSOR + AMUZA robot.
+#
+# Run 1 is the no-burst CONTROL; runs 2-4 auto-fire ONE burst per buffer entry
+# at 120 / 140 / 160 µL/min. Only the highest burst adds a 5 s BACKFLOW pulse to
+# bleed the overshoot so flow is back at baseline before the next well (all inside
+# the 60 s buffer). Every flow rate is tested on the SAME 3 wells (A1-A3) so the
+# conditions are compared on identical wells. Data is tagged per-run and
+# per-burst-phase in the flow log (run_burst_160_burst_high / _backflow / _settle).
+#
+# Note: the 3 wells are revisited once per run (4x total), so later runs sample
+# an already-drawn well — keep that in mind vs the fresh-well version.
+# Keep "Flow follows wells" OFF (constant 80 µL/min per run).
+
+# ---- shared (every run inherits these) ----
+wells: A1, A2, A3      # same 3 wells for every run
+sample_time: 110       # s recording at each well
+buffer_time: 60        # s in buffer between wells — the window a burst must fit
+flow_rate: 80          # combined line baseline (µL/min)
+direction: withdraw
+b_high_s: 10           # max boost time (also the timed duration with no sensor)
+b_stop_s: 8            # stop-to-level time after the boost
+
+# ---- Run 1 — CONTROL, no burst ----
+[run] baseline_noburst
+auto_burst: no
+
+# ---- Run 2 — burst 1.5× = 120 µL/min, NO backflow ----
+[run] burst_120
+auto_burst: yes
+b_mult: 1.5
+b_backflow_s: 0
+
+# ---- Run 3 — burst 1.75× = 140 µL/min, NO backflow ----
+[run] burst_140
+auto_burst: yes
+b_mult: 1.75
+b_backflow_s: 0
+
+# ---- Run 4 — burst 2.0× = 160 µL/min, WITH 5 s backflow before re-entering wells ----
+[run] burst_160
+auto_burst: yes
+b_mult: 2.0
+b_backflow_s: 5

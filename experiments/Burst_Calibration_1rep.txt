@@ -1,0 +1,26 @@
+# BURST TIMING CALIBRATION — pump + SENSOR only (no wells / no robot).
+# 📂 Load experiment → ▶ Run experiment. Connect PUMP + FLOW SENSOR first.
+#
+# Builds two calibration curves at a 40 µL/min baseline:
+#   • RISE  — time to jump from 40 up to the 115 ceiling, across up rates 4×–8×.
+#   • FALL  — time to drive back from 115 to 40 by REVERSING (fast push), across
+#             reverse rates 4×–8×, without overshooting below 40 (undershoot logged).
+# Ceiling is 115 (just under the sensor's 120 rail) so every measured point stays
+# in range. Escalation: if an up rate doesn't reach 115 within rise_timeout_s, the
+# rate is bumped ×1.5 until it does (capped at max_rate).
+#
+# Output (Sensor_Readings/): Burst_Calib_<ts>.csv (hi-res trace, ~50 Hz) and
+# Burst_Calib_<ts>_summary.csv (rise/fall time + peak/undershoot per trial).
+
+experiment: burst_calibration
+baseline: 40            # µL/min combined line
+ceiling: 115            # sensor target, just below the ±120 rail
+direction: withdraw     # baseline/up direction; reverse = infuse (push)
+
+high_mults: 4,5,6,7,8   # up rates as × baseline → 160/200/240/280/320 µL/min
+rev_mults: 4,5,6,7,8    # reverse rates as × baseline → time 115→40
+
+repeats: 1              # trials per rate (average out drift)
+settle_s: 15            # settle at baseline between trials
+rise_timeout_s: 20      # if 115 not reached in this, bump the rate ×1.5
+max_rate: 400           # never command above this (pump safety)
