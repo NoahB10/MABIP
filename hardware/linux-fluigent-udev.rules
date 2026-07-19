@@ -1,0 +1,5 @@
+# Fluigent flow sensors / instruments — grant HID access without root.
+# Fluigent USB-HID interfaces enumerate under Microchip (04d8) and ST (0483) VIDs.
+# Members of the plugdev group can then read /dev/hidraw* for the Fluigent SDK.
+KERNEL=="hidraw*", ATTRS{idVendor}=="04d8", MODE="0660", GROUP="plugdev"
+KERNEL=="hidraw*", ATTRS{idVendor}=="0483", MODE="0660", GROUP="plugdev"
