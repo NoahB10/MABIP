@@ -1345,6 +1345,7 @@ class AsyncAMUZAGUI(QMainWindow):
         self._well_started: Dict[str, float] = {}  # well_id -> move-command time
         self._active_seq_name: str = "Sampling Sequence"
         self._blockage_box = None                  # live blockage dialog, if any
+        self._last_burst_attempt: float = 0.0      # cooldown clock for clear bursts
         
         # Wells
         self.well_labels: Dict[str, WellLabel] = {}
@@ -2340,6 +2341,7 @@ class AsyncAMUZAGUI(QMainWindow):
         # blockage. Resuming re-arms the detector with a clean window.
         det.set_cycling(False)
         det.begin_hold()
+        self._last_burst_attempt = 0.0        # let the first burst fire at once
 
         if det.hold_is_decidable:
             self.add_to_display(
@@ -2389,16 +2391,37 @@ class AsyncAMUZAGUI(QMainWindow):
                 dialog.cancel()
                 self._close_blockage_dialog()
 
-    async def _attempt_clearance(self):
-        """Hook for automatically clearing the clog while parked in buffer.
+    BLOCKAGE_BURST_COOLDOWN_S = 8.0
+    """Minimum gap between clog-clearing burst attempts. A burst normally runs far
+    longer than this and blocks its own re-fire via `_bursting`; the cooldown only
+    matters if a burst declines instantly (no rate set, guard tripped), so the
+    hold loop cannot spin firing every second."""
 
-        The intended occupant is a pump burst: fire while held, and the metabolite
-        signal falling off its stuck level tells you it worked. Everything that
-        needs is already here — the plate holds in buffer, the detector watches
-        for the signal to move, and _wait_for_clearance resumes the moment it
-        does. Deliberately empty until the burst hardware is in place; nothing
-        else needs to change when it is."""
-        return None
+    async def _attempt_clearance(self):
+        """Try to clear the clog with a pump burst while parked in the buffer.
+
+        Fires the Flow Control tab's burst — the same boost the buffer auto-burst
+        uses — and lets the hold loop watch for the metabolite signal to move in
+        response. If it moves, the line came back and the run resumes on its own.
+
+        Only does anything with a syringe pump connected; a plain no-op otherwise,
+        so a rig without a pump still waits for a manual clear. The burst fires
+        ONLY in the buffer — try_clear_burst enforces the phase — never mid-well,
+        and never while one is already running, so bursts cannot stack."""
+        tab = getattr(self, "flow_tab", None)
+        if tab is None or not hasattr(tab, "try_clear_burst"):
+            return
+        now = time.monotonic()
+        if now - self._last_burst_attempt < self.BLOCKAGE_BURST_COOLDOWN_S:
+            return
+        try:
+            fired = tab.try_clear_burst()
+        except Exception as e:
+            logger.debug(f"Clog-clearing burst failed: {e}")
+            return
+        if fired:
+            self._last_burst_attempt = now
+            self.add_to_display("Bursting in the buffer to try to clear the line…")
 
     async def _ask_blockage_cleared(self) -> bool:
         """Popup: has the blockage been cleared? True to continue, False to stop.

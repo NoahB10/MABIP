@@ -1162,6 +1162,26 @@ class FlowControlTab(QWidget):
             return
         self._trigger_burst(auto=False)
 
+    def try_clear_burst(self) -> bool:
+        """Fire one clog-clearing burst, but ONLY while parked in the buffer.
+
+        Driven by the blockage hold loop, which calls this repeatedly while the
+        plate is held. Refuses unless we are in the buffer phase — a burst mid-well
+        would ruin that well's reading, and the whole point of holding is that the
+        needle is parked in buffer, not in a well. Also refuses while a burst is
+        already running (``_bursting`` is set synchronously by ``_trigger_burst``,
+        so the loop cannot stack them) and if no line rate is set to boost from.
+
+        Returns True if a burst was actually started, False if declined."""
+        if self.line is None or self._busy or self._bursting:
+            return False
+        if self._phase != "buffer":            # buffer only — never mid-well
+            return False
+        if self._num(self.f_rate, 0.0) <= 0:   # nothing to boost from
+            return False
+        self._trigger_burst(auto=True)
+        return True
+
     def _trigger_burst(self, auto=False):
         if self.line is None or self._busy:
             return
