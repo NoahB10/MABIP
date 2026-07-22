@@ -2,8 +2,16 @@
 Configuration constants for MABIP system.
 Centralizes all magic numbers and settings.
 """
+import os
 from dataclasses import dataclass
 from typing import Dict
+
+# Directory the app code lives in (refactored/). Log/output folders are anchored
+# to this, NOT to the current working directory, so runs always write to ONE
+# place no matter where the app is launched from. Previously these were relative
+# to cwd, which scattered logs between MABIP/Sensor_Readings (launched from the
+# repo root) and refactored/Sensor_Readings (launched from refactored/).
+_APP_DIR = os.path.dirname(os.path.abspath(__file__))
 
 @dataclass
 class HardwareConfig:
@@ -128,10 +136,12 @@ class SensorConfig:
 @dataclass
 class FileConfig:
     """File I/O and logging settings."""
-    # Folders
-    SENSOR_READINGS_FOLDER: str = "Sensor_Readings"
-    AMUZA_LOGS_FOLDER: str = "Amuza_Logs"
-    OUTPUT_FILE_PATH: str = "Sensor_Readings/output.csv"
+    # Folders — anchored to the app directory (see _APP_DIR) so every run's logs
+    # land in ONE consistent place (refactored/Sensor_Readings), regardless of
+    # the working directory the app happens to be launched from.
+    SENSOR_READINGS_FOLDER: str = os.path.join(_APP_DIR, "Sensor_Readings")
+    AMUZA_LOGS_FOLDER: str = os.path.join(_APP_DIR, "Amuza_Logs")
+    OUTPUT_FILE_PATH: str = os.path.join(_APP_DIR, "Sensor_Readings", "output.csv")
     SETTINGS_FOLDER: str = ".mabip"  # In user home directory
 
     # File formats
