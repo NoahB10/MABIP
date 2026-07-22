@@ -1,0 +1,34 @@
+# RESUME/MOVE CALIBRATION v2 — 1 syringe, 80 µL/min baseline.
+# Run headless: python headless_rig.py wells ../experiments/Resume_Calibration_80.txt
+#
+# Iteration 2 after the 40 µL/min pass (all open-loop strategies failed to hold
+# a steady flow in the wells; the closed-loop servo was the only reliable
+# controller). Hypotheses tested here:
+#   • a higher baseline (80) rides through air events better (stiffer signal)
+#   • closed-loop servo through the WHOLE well beats any open-loop resume
+#
+#   pause_step  : classic feed-forward, step resume — control at 80
+#   pause_boost : feed-forward + bang-bang resume (240 for 2s, then 80)
+#   pause_servo : feed-forward + closed-loop servo holding 80 through each well
+#
+# All runs pause the pump during moves (0.45s after move cmd, resume at 10s).
+# ~650 µL total at 80 µL/min — needs a fresh syringe reset.
+
+wells: A1, A2
+sample_time: 40
+buffer_time: 30
+flow_rate: 80
+direction: withdraw
+pause_after: 0.45
+resume_after: 10
+pause_on_move: yes
+
+[run] pause_step
+resume_ramp: 0
+
+[run] pause_boost
+resume_boost_rate: 240
+resume_boost_s: 2
+
+[run] pause_servo
+resume_servo: yes

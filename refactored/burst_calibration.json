@@ -1,0 +1,60 @@
+{
+  "_meta": {
+    "description": "Measured burst-protocol constants per syringe count. The burst uses ABSOLUTE calibrated rates from this file (not multipliers of the baseline). Keys are str(n_syringes). Re-measure with: python headless_rig.py calib ../experiments/Burst_Calibration_1rep.txt",
+    "sensor": "Fluigent Flow Unit M, +/-120 uL/min full scale",
+    "units": "rates uL/min combined line; times s; slopes uL/min/s"
+  },
+  "1": {
+    "measured_on": "2026-07-16",
+    "source_trace": "Sensor_Readings/Burst_Calib_16_07_26_16_58_58.csv",
+    "baseline_tested": 40.0,
+    "up_cmd": 320.0,
+    "up_trigger": 115.0,
+    "up_max_s": 10.0,
+    "rev_cmd": 280.0,
+    "rev_stop_offset": 12.0,
+    "rev_max_s": 10.0,
+    "level_settle_s": 10.0,
+    "expected": {
+      "time_40_to_115_at_320_s": [4.5, 6],
+      "time_115_to_40_reverse_s": [5, 7],
+      "typical_total_burst_s": 20
+    },
+    "slopes": {
+      "up_cmd160": 3.7,
+      "up_cmd200": 7.4,
+      "up_cmd240": 9.4,
+      "up_cmd280": 9.9,
+      "up_cmd320": 11.7,
+      "up_cmd400": 15.0,
+      "fall_reverse_160_to_320": [-7.6, -10.9],
+      "fall_note": "descent mildly rate-dependent (320 fastest); undershoot after cutting reverse at baseline is ~12 uL/min below the cut point at ALL reverse rates -> rev_stop_offset 12 so the dip lands on baseline",
+      "fall_baseline_cmd_only": -2.4
+    }
+  },
+  "2": {
+    "measured_on": "2026-07-16",
+    "source_trace": "Sensor_Readings/Burst_Calib_16_07_26_16_26_21.csv",
+    "baseline_tested": 40.0,
+    "up_cmd": 400.0,
+    "up_trigger": 115.0,
+    "up_max_s": 25.0,
+    "rev_cmd": 280.0,
+    "rev_stop_offset": 8.0,
+    "rev_max_s": 25.0,
+    "level_settle_s": 10.0,
+    "expected": {
+      "time_40_to_115_at_400_s": [13, 21],
+      "time_115_to_40_reverse_s": [23, 25],
+      "typical_total_burst_s": 43
+    },
+    "slopes": {
+      "up_cmd400_direct": 5.0,
+      "up_cmd400_direct_range": [4.4, 6.5],
+      "up_cmd160_320_nominal": "misses 115 within 20s; knee ~340-360",
+      "fall_reverse_160_to_320": -3.2,
+      "fall_reverse_note": "descent is discharge-dominated: slope nearly independent of reverse rate 160-320; no benefit above ~280",
+      "fall_baseline_cmd_only": -1.0
+    }
+  }
+}

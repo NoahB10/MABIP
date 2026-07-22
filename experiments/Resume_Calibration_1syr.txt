@@ -1,0 +1,45 @@
+# RESUME/MOVE CALIBRATION — 1 syringe. Smoothest flow profile across well moves.
+# Run headless: python headless_rig.py wells ../experiments/Resume_Calibration_1syr.txt
+#
+# 5 strategies × the same 2 wells, real robot moves (real air events).
+# Each run tags transit/resume/well/buffer segments in the trace, plus an AIR
+# column from the Flow Unit — so we can compare per strategy: dip depth,
+# air-slug count, recovery time to 40±3, overshoot.
+#
+#   nopause_step  : pump runs straight through the move (air ingested) — control
+#   nopause_boost : air ingested, then a 160×1.5s boost at tip re-entry to recover
+#   pause_step    : classic feed-forward (stop 0.45s after move, step resume at 10s)
+#   pause_ramp4   : feed-forward with 4s ramped resume
+#   pause_boost   : feed-forward with bang-bang resume (160 for 1.5s, then 40)
+#
+# Boost numbers are first guesses from the 1-syringe burst calibration
+# (slope +3.7 µL/min/s at 160) — iterate after the first pass.
+
+wells: A1, A2
+sample_time: 45
+buffer_time: 30
+flow_rate: 40
+direction: withdraw
+pause_after: 0.45      # s after move cmd → tip exits liquid (measured 15 Jul)
+resume_after: 10       # s after move cmd → tip back in liquid
+
+[run] nopause_step
+pause_on_move: no
+
+[run] nopause_boost
+pause_on_move: no
+resume_boost_rate: 160
+resume_boost_s: 1.5
+
+[run] pause_step
+pause_on_move: yes
+resume_ramp: 0
+
+[run] pause_ramp4
+pause_on_move: yes
+resume_ramp: 4
+
+[run] pause_boost
+pause_on_move: yes
+resume_boost_rate: 160
+resume_boost_s: 1.5

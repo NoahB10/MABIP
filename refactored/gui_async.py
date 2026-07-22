@@ -1582,18 +1582,43 @@ class AsyncAMUZAGUI(QMainWindow):
         self.add_to_display(f"Experiment loaded: {len(wells)} wells, "
                             f"sample {sampling}s, buffer {buffer}s. Press Start Sampling.")
 
+    def _exp_log(self, msg):
+        """Log an experiment message to BOTH the Sampling display and the Flow-tab console."""
+        self.add_to_display(msg)
+        tab = getattr(self, "flow_tab", None)
+        if tab is not None:
+            try:
+                tab.log(msg)
+            except Exception:
+                pass
+
     def run_experiment_runs(self, runs):
         """Run every run in `runs` back-to-back over the selected wells, tagging the
         data per-run (called by the Flow Control tab's Run experiment button)."""
+        names = ", ".join(r.get("name", "?") for r in runs)
+        self._exp_log(f"▶ Run experiment pressed — {len(runs)} runs ({names}).")
         if not (self.connection and self.connection.is_connected):
+            self._exp_log("✗ Can't start: AMUZA robot is NOT connected. Connect it on the Sampling tab first.")
             QMessageBox.warning(self, "Not connected", "Connect to the AMUZA robot first.")
             return
         for task in self.task_manager.get_running_tasks():
             if task.get_name() in ("sampling_sequence", "experiment_runs") and not task.done():
+                self._exp_log("✗ Can't start: a sampling run is already in progress.")
                 QMessageBox.warning(self, "Busy", "A sampling run is already in progress.")
                 return
+        self._exp_log("✓ AMUZA connected — starting experiment…")
+        tab = getattr(self, "flow_tab", None)
+        if tab is not None:
+            tab.exp_running.emit(True)      # light up the Stop-experiment button
         task = asyncio.create_task(self._run_experiment_runs_task(runs))
         self.task_manager.add_task(task, "experiment_runs")
+
+    def stop_experiment(self):
+        """Halt a running multi-run experiment: set the stop flag so the run loop
+        finishes the current well then stops (no further runs/wells). Called by the
+        Flow Control tab's Stop-experiment button."""
+        self._exp_log("⏹ Stop experiment requested — will finish the current well then halt.")
+        self.app_state.stop_event.set()   # asyncio.Event.set() is synchronous
 
     async def _settle_flow_to(self, target_line, label=""):
         """Command the pump to `target_line` µL/min and wait until the SENSOR actually
@@ -1611,21 +1636,29 @@ class AsyncAMUZAGUI(QMainWindow):
                 return float(cfg.get(k, d))
             except (ValueError, TypeError):
                 return d
-        tol = _f("exp_settle_tol", 10.0) / 100.0
+        max_var = _f("exp_settle_max_var", 5.0)     # µL/min: never deviate more than this from setpoint
         hold_s = _f("exp_settle_hold", 5.0)
-        timeout_s = _f("exp_settle_timeout", 120.0)
+        # exp_settle_timeout is now the STALL window: how long the flow may make NO
+        # progress toward the setpoint before we call it stuck. It is NOT a "give up
+        # and start anyway" clock — as long as the flow keeps climbing toward target
+        # we keep waiting, however long that takes. Only a genuine stall stops us,
+        # and then we DO NOT start (bad data); the caller halts the run.
+        stall_s = _f("exp_settle_timeout", 120.0)
         bump = _f("exp_settle_bump", 5.0) / 100.0
-        cap = target_line * _f("exp_settle_max", 2.0)
+        cap = target_line + max_var                 # pump is never pushed past setpoint + max_var
         n = tab._nsyr()
         direction = cfg.get("direction", "withdraw")
         commanded = target_line
-        low = target_line * (1.0 - tol)
+        low = target_line - max_var                 # "reached" once within max_var of setpoint
+        prog_eps = max(1.0, 0.02 * target_line)     # meaningful step toward target
         try:
             tab.line.start_flow_single(commanded / n, direction=direction)
         except Exception as e:
-            self.add_to_display(f"settle: flow start error {e}")
-        self.add_to_display(f"Settling flow to {target_line:g} µL/min before {label}…")
+            self._exp_log(f"settle: flow start error {e}")
+        self._exp_log(f"Settling flow to {target_line:g} µL/min before {label} — "
+                      f"waiting until the sensor actually reaches it…")
         t0 = time.time(); stable_since = None; last_bump = t0
+        best = -1.0; last_prog = t0                 # closest approach to target + when
         while True:
             if self.app_state.stop_event.is_set():
                 return False
@@ -1634,7 +1667,7 @@ class AsyncAMUZAGUI(QMainWindow):
             m = tab.latest_flow
             if m is None:                                   # no sensor → can't verify
                 if now - t0 >= max(hold_s, 8.0):
-                    self.add_to_display("settle: no sensor reading — starting without flow verification.")
+                    self._exp_log("settle: no sensor reading — can't verify flow; proceeding.")
                     return True
                 continue
             mval = abs(m)
@@ -1642,40 +1675,78 @@ class AsyncAMUZAGUI(QMainWindow):
                 if stable_since is None:
                     stable_since = now
                 if now - stable_since >= hold_s:
-                    self.add_to_display(f"✓ Flow at {mval:.1f} µL/min (target {target_line:g}) — starting {label}.")
+                    self._exp_log(f"✓ Flow at {mval:.1f} µL/min (target {target_line:g}) — starting {label}.")
                     return True
             else:
                 stable_since = None
-                if now - last_bump >= 4.0 and commanded < cap:   # measured low → raise the pump
-                    commanded = min(cap, commanded + target_line * bump)
+                # Measured low and not approaching → the command is too weak to move
+                # the line: escalate HARD (×1.5 steps, up to 400) until the flow
+                # moves. Once measured nears the target, cut back to the setpoint so
+                # the flow never runs past it (the `mval >= low` branch + hold do the
+                # rest). The old +5%-capped bump could never unstick a heavy line.
+                if now - last_bump >= 4.0:
+                    if mval >= 0.85 * target_line and commanded > cap:
+                        commanded = target_line          # moving → rein back to target
+                    elif mval < 0.85 * target_line:
+                        commanded = min(400.0, commanded * 1.5)
                     try:
                         tab.line.start_flow_single(commanded / n, direction=direction)
                     except Exception:
                         pass
                     last_bump = now
-                    self.add_to_display(f"settle: {mval:.1f} < {target_line:g} → raising pump to "
+                    self._exp_log(f"settle: {mval:.1f} < {target_line:g} → pump to "
                                         f"{commanded:.1f} µL/min (line)")
-            if now - t0 >= timeout_s:
-                self.add_to_display(f"⚠ settle timeout ({timeout_s:g}s): measured {mval:.1f} vs "
-                                    f"target {target_line:g} — starting {label} anyway.")
-                return True
+            # Still climbing toward the setpoint? Keep waiting — reset the stall clock.
+            if mval > best + prog_eps:
+                best = mval; last_prog = now
+            elif mval < low and (now - last_prog) >= stall_s:
+                # No progress for stall_s AND still short of target → genuinely stuck.
+                self._exp_log(f"✗ Flow STALLED at {mval:.1f} µL/min (target {target_line:g}) — "
+                              f"not approaching for {stall_s:g}s. Likely AIR/blockage; prime the "
+                              f"line. NOT starting {label} (would be bad data) — halting.")
+                return False
 
     async def _run_experiment_runs_task(self, runs):
         """Loop the runs: apply each run's flow settings, then run the well sequence."""
         tab = getattr(self, "flow_tab", None)
         try:
-            wells = await self.app_state.get_selected_wells()
-            if not wells:
-                self.add_to_display("Experiment: no wells selected — load the experiment file first.")
+            # Shared selection is the fallback for runs that don't name their own
+            # wells. A run may carry its own `wells:` so runs can use DISTINCT wells.
+            shared = await self.app_state.get_selected_wells()
+            shared_list = (sorted(list(shared), key=lambda x: (x[0], int(x[1:])))
+                           if shared else [])
+
+            def run_well_list(run):
+                s = str(run.get("wells", "") or "").replace(";", ",")
+                ws = [w.strip().upper() for w in s.split(",") if w.strip()]
+                return (sorted(ws, key=lambda x: (x[0], int(x[1:]))) if ws else shared_list)
+
+            if not any(run_well_list(r) for r in runs):
+                self._exp_log("Experiment: no wells for any run — load the experiment file first.")
                 return
-            wells_list = sorted(list(wells), key=lambda x: (x[0], int(x[1:])))
+            # Fresh start: clear any leftover STOP from a previous run/press so the
+            # first run isn't aborted before it begins.
+            await self.app_state.clear_stop()
             for i, run in enumerate(runs, 1):
                 if self.app_state.stop_event.is_set():
-                    self.add_to_display("Experiment stopped before run %d." % i)
+                    self._exp_log("Experiment stopped before run %d." % i)
                     break
                 name = run.get("name", f"run{i}")
-                self.add_to_display(f"════════ RUN {i}/{len(runs)}: {name} ════════")
+                wells_list = run_well_list(run)
+                if not wells_list:
+                    self._exp_log(f"Run {name}: no wells — skipping.")
+                    continue
+                self._exp_log(f"════════ RUN {i}/{len(runs)}: {name} ════════")
                 await self.app_state.clear_stop()
+                # Reflect THIS run's wells on the plate + selection so the well-log
+                # and completion tracking follow the run (distinct wells per run).
+                for wid, lbl in self.well_labels.items():
+                    lbl.set_selected(wid in wells_list)
+                    lbl.set_completed(False)
+                await self.app_state.clear_selections()
+                for w in wells_list:
+                    if w in self.well_labels:
+                        await self.app_state.add_selected_well(w)
                 if tab is not None:
                     tab.apply_run(run)                       # settings + start flow + tag log
 
@@ -1686,7 +1757,7 @@ class AsyncAMUZAGUI(QMainWindow):
                     target_line = 0.0
                 if target_line > 0:
                     if not await self._settle_flow_to(target_line, f"run {name}"):
-                        self.add_to_display(f"Experiment stopped while settling ({name}).")
+                        self._exp_log(f"Experiment stopped while settling ({name}).")
                         break
 
                 # per-run sequence setup (mirrors _on_start)
@@ -1701,19 +1772,20 @@ class AsyncAMUZAGUI(QMainWindow):
                 for wid in wells_list:
                     sequence.add_method(Method(pos=wid, wait=t_sampling, buffer_time=t_buffer,
                                                eject=False, insert=False))
-                self.add_to_display(f"Run {name} on wells: {', '.join(wells_list)}")
+                self._exp_log(f"Run {name} on wells: {', '.join(wells_list)}")
                 await self._execute_sequence(sequence)
                 if self.app_state.stop_event.is_set():
-                    self.add_to_display(f"Experiment stopped during run {name}.")
+                    self._exp_log(f"Experiment stopped during run {name}.")
                     break
             else:
-                self.add_to_display("✓ Experiment complete — all runs done and tagged per-run in the flow log.")
+                self._exp_log("✓ Experiment complete — all runs done and tagged per-run in the flow log.")
         except Exception as e:
             logger.error(f"Experiment runs error: {e}")
-            self.add_to_display(f"Experiment failed: {e}")
+            self._exp_log(f"Experiment failed: {e}")
         finally:
             if tab is not None:
                 tab.clear_run_tag()
+                tab.exp_running.emit(False)     # clear Stop / re-enable Run
                 try:
                     tab.line and tab.line.stop()
                 except Exception:

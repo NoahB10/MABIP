@@ -13,8 +13,12 @@ refactored/Amuza_Logs/
 *.csv
 Flow_Log_*.csv
 
-# Raw measurement text dumps at the repo root
+# Raw measurement text dumps at the repo root and in refactored/
 /*.txt
+refactored/*.txt
+
+# Local Claude Code state
+.claude/
 
 # Keep experiment definition files
 !experiments/
