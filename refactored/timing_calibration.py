@@ -56,7 +56,7 @@ try:
     from config import HARDWARE
     DEVICES = HARDWARE.AMUZA_DEVICES
 except Exception:
-    DEVICES = {"Machine 1": "FC90-0034"}
+    DEVICES = {"Machine 1": "FC90-0037"}
 
 
 # ----------------------------------------------------------------- geometry
@@ -383,7 +383,7 @@ async def amain():
         return
 
     wells = [w.strip().upper() for w in args.wells.split(",") if w.strip()]
-    device_name = DEVICES.get(args.machine, "FC90-0034")
+    device_name = DEVICES.get(args.machine, "FC90-0037")
     ts = datetime.now().strftime("%d_%m_%y_%H_%M")
     csv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                             f"Timing_Calibration_{ts}.csv")
