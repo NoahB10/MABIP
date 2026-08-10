@@ -20,6 +20,9 @@ refactored/*.txt
 # Local Claude Code state
 .claude/
 
+# Editor config
+.vscode/
+
 # Keep experiment definition files
 !experiments/
 !experiments/*.txt
