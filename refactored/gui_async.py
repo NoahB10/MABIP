@@ -4,8 +4,6 @@ Async version of AMUZA GUI using qasync for PyQt5 async integration.
 Key improvements:
 - Uses qasync for proper async/await in PyQt5
 - @asyncSlot decorators for signal handlers
-vhttps://claude.com/cai/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e&response_type=code&redirect_uri=https%3A%2F%2Fplatform.claude.com%2Foauth%2Fcode%2Fcallback&scope=org%3Acreate_api_key+user%3Aprofile+user%3Ainference+user%3Asessions%3Aclaude_code+user%3Amcp_servers+user%3Afile_upload&code_challenge=ya6zPauyukxKFxmr4wtS_8aFIGfFDmY-k9wqC-nqdY0&code_challenge_method=S256&state=nnIadu0uUMBwxBd0WHNqOyjt98GwfBH1w_xu_zvQxTk
-
 - AppState for thread-safe state management
 - AsyncTaskManager for background task tracking
 - Incremental file reading for plot updates
@@ -99,8 +97,12 @@ class WellLabel(QLabel):
                 border-color: #4a90e2;
             }
         """)
-        # Mouse events will be handled by parent widget
-        self.setAttribute(Qt.WA_TransparentForMouseEvents, False)
+        # All mouse handling lives on WellGridWidget: the labels must NOT take
+        # part in the event chain. If a label accepts the press, Qt hands it the
+        # implicit mouse grab and every following move event is delivered to
+        # THAT label instead of the grid, which is what made drags "disconnect"
+        # the moment the cursor crossed into a different well.
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
 
     def set_selected(self, selected: bool):
         """Update selection state"""
@@ -145,6 +147,102 @@ class WellLabel(QLabel):
                 border-color: #4a90e2;
             }}
         """)
+
+
+class WellGridWidget(QWidget):
+    """The 8x12 well plate, and the single owner of its mouse interaction.
+
+    Previously the press/move/release handlers lived on the QMainWindow and
+    hit-tested labels by mapping global coordinates. That relied on the press
+    event bubbling all the way up the widget chain, which meant Qt never gave
+    the window the implicit mouse grab -- so mid-drag the move events went to
+    whichever child happened to be under the cursor and the selection stopped
+    updating. Owning the events here keeps the grab for the whole gesture, and
+    positions outside the grid are CLAMPED to the nearest cell so dragging past
+    the edge extends the block instead of dropping it.
+    """
+
+    well_pressed = pyqtSignal(int, int, object)   # row, col, modifiers
+    well_dragged = pyqtSignal(int, int)           # row, col (clamped)
+    drag_finished = pyqtSignal()
+
+    def __init__(self, rows: int, cols: int, cell_size: int, parent=None):
+        super().__init__(parent)
+        self.rows = rows
+        self.cols = cols
+        self.cell_size = cell_size
+        self.labels: Dict[str, WellLabel] = {}
+        self._dragging = False
+
+        self._grid = QGridLayout(self)
+        self._grid.setContentsMargins(4, 4, 4, 4)
+        self._grid.setHorizontalSpacing(6)
+        self._grid.setVerticalSpacing(6)
+
+        for row in range(rows):
+            for col in range(cols):
+                well_id = f"{chr(65 + row)}{col + 1}"
+                label = WellLabel(well_id, row, col, cell_size)
+                self._grid.addWidget(label, row, col)
+                self.labels[well_id] = label
+
+        margins = self._grid.contentsMargins()
+        self._pitch_x = cell_size + self._grid.horizontalSpacing()
+        self._pitch_y = cell_size + self._grid.verticalSpacing()
+        self._origin_x = margins.left()
+        self._origin_y = margins.top()
+
+        self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        self.setFixedSize(
+            cols * cell_size + (cols - 1) * self._grid.horizontalSpacing()
+            + margins.left() + margins.right(),
+            rows * cell_size + (rows - 1) * self._grid.verticalSpacing()
+            + margins.top() + margins.bottom(),
+        )
+
+    def _rc_clamped(self, pos) -> tuple:
+        """Nearest (row, col) for a point, clamped to the plate."""
+        col = int((pos.x() - self._origin_x) // self._pitch_x)
+        row = int((pos.y() - self._origin_y) // self._pitch_y)
+        return (max(0, min(self.rows - 1, row)),
+                max(0, min(self.cols - 1, col)))
+
+    def _rc_exact(self, pos) -> Optional[tuple]:
+        """(row, col) only when the point is actually inside a well, else None."""
+        row, col = self._rc_clamped(pos)
+        label = self._grid.itemAtPosition(row, col)
+        if label is not None and label.widget().geometry().contains(pos):
+            return row, col
+        return None
+
+    def mousePressEvent(self, event):
+        if event.button() != Qt.LeftButton:
+            event.ignore()
+            return
+        rc = self._rc_exact(event.pos())
+        if rc is None:
+            event.ignore()
+            return
+        self._dragging = not (event.modifiers() & Qt.ControlModifier)
+        self.well_pressed.emit(rc[0], rc[1], event.modifiers())
+        event.accept()   # keeps the implicit grab for the rest of the drag
+
+    def mouseMoveEvent(self, event):
+        if not self._dragging or not (event.buttons() & Qt.LeftButton):
+            event.ignore()
+            return
+        row, col = self._rc_clamped(event.pos())
+        self.well_dragged.emit(row, col)
+        event.accept()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() != Qt.LeftButton:
+            event.ignore()
+            return
+        if self._dragging:
+            self._dragging = False
+            self.drag_finished.emit()
+        event.accept()
 
 
 class PlotWindow(QMainWindow):
@@ -368,6 +466,30 @@ class PlotWindow(QMainWindow):
         # Control buttons
         button_layout = QHBoxLayout()
 
+        # Sensor connect/disconnect live here (this is the Plotting tab), so the
+        # metabolite sensor is started from the same place its data shows up.
+        self.connect_sensor_btn = QPushButton("Connect Sensor")
+        self.connect_sensor_btn.setToolTip(
+            "Connect the metabolite (SIX) sensor and start recording. "
+            "Auto-picks the CP210x transmitter port.")
+        self.connect_sensor_btn.setStyleSheet(
+            "QPushButton { background:#2e7d32; color:white; font-weight:700; }"
+            "QPushButton:hover { background:#276b2a; }")
+        self.connect_sensor_btn.clicked.connect(self._on_connect_sensor)
+        button_layout.addWidget(self.connect_sensor_btn)
+
+        self.disconnect_sensor_btn = QPushButton("Disconnect Sensor")
+        self.disconnect_sensor_btn.setToolTip("Stop recording and release the sensor port.")
+        self.disconnect_sensor_btn.setEnabled(False)
+        self.disconnect_sensor_btn.clicked.connect(self._on_disconnect_sensor)
+        button_layout.addWidget(self.disconnect_sensor_btn)
+
+        self.sensor_status_label = QLabel("Sensor: Not Connected")
+        self.sensor_status_label.setStyleSheet("QLabel { font-weight: 600; color: #555; }")
+        button_layout.addWidget(self.sensor_status_label)
+
+        button_layout.addStretch(1)
+
         self.auto_follow_btn = QPushButton("Auto-Follow")
         self.auto_follow_btn.setToolTip("Resume auto-scrolling after pan/zoom")
         self.auto_follow_btn.clicked.connect(self._on_auto_follow)
@@ -404,6 +526,10 @@ class PlotWindow(QMainWindow):
     
     def _on_timer_update(self):
         """Timer callback for plot updates"""
+        # Skip the redraw entirely while another tab is on top — incoming
+        # readings still accumulate in the deques, so switching back shows them.
+        if not self.isVisible():
+            return
         # Use asyncio to run update
         loop = asyncio.get_event_loop()
         loop.create_task(self._update_plot_async())
@@ -967,28 +1093,38 @@ class PlotWindow(QMainWindow):
 
             logger.info(f"Calibration updated from PlotWindow: {values}")
 
-    def update_sensor_status(self, connected: bool, port: str = None):
-        """Update sensor menu status"""
+    def update_sensor_status(self, connected: bool, port: str = None, detail: str = ""):
+        """Update the sensor buttons, status label and menu entries together."""
         if connected:
             self.sensor_status_action.setText(f"Status: Connected ({port})")
             self.connect_sensor_action.setEnabled(False)
             self.disconnect_sensor_action.setEnabled(True)
+            self.connect_sensor_btn.setEnabled(False)
+            self.disconnect_sensor_btn.setEnabled(True)
+            text = f"Sensor: {port}" + (f" — {detail}" if detail else "")
+            self.sensor_status_label.setText(text)
+            self.sensor_status_label.setStyleSheet(
+                "QLabel { font-weight: 600; color: #2e7d32; }")
         else:
             self.sensor_status_action.setText("Status: Not Connected")
             self.connect_sensor_action.setEnabled(True)
             self.disconnect_sensor_action.setEnabled(False)
+            self.connect_sensor_btn.setEnabled(True)
+            self.disconnect_sensor_btn.setEnabled(False)
+            self.sensor_status_label.setText("Sensor: Not Connected" + (f" — {detail}" if detail else ""))
+            self.sensor_status_label.setStyleSheet(
+                "QLabel { font-weight: 600; color: #555; }")
+
+    def set_sensor_detail(self, detail: str, warn: bool = False):
+        """Append a live diagnostic (packet/byte counts) to the sensor status."""
+        base = self.sensor_status_label.text().split(" — ")[0]
+        self.sensor_status_label.setText(f"{base} — {detail}" if detail else base)
+        color = "#c62828" if warn else "#2e7d32"
+        self.sensor_status_label.setStyleSheet(f"QLabel {{ font-weight: 600; color: {color}; }}")
 
     def closeEvent(self, event):
-        """Handle window close - hide instead of close if sensor is running"""
-        # Check if sensor is running via main_gui
-        if self.main_gui and self.main_gui.sensor_reader and self.main_gui.sensor_reader.is_running:
-            # Just hide the window, don't actually close
-            event.ignore()
-            self.hide()
-            if self.main_gui:
-                self.main_gui.add_to_display("Plot window hidden (sensor still recording)")
-            return
-
+        """This is a tab page now, so a close only means the app is shutting
+        down: stop the redraw timer and let it go."""
         self.timer.stop()
         event.accept()
 
@@ -1441,10 +1577,6 @@ class AsyncAMUZAGUI(QMainWindow):
         self.settings_btn.clicked.connect(self._on_settings)
         left_col.addWidget(self.settings_btn)
 
-        self.plot_btn = QPushButton("Show Plot")
-        self.plot_btn.clicked.connect(self._on_show_plot)
-        left_col.addWidget(self.plot_btn)
-        
         # Status labels
         self.status_label = QLabel("AMUZA: Not Connected")
         self.status_label.setAlignment(Qt.AlignCenter)
@@ -1472,36 +1604,32 @@ class AsyncAMUZAGUI(QMainWindow):
         
         # Center: well grid
         center_col = QVBoxLayout()
-        grid_layout = QGridLayout()
-        grid_layout.setContentsMargins(4, 4, 4, 4)
-        grid_layout.setHorizontalSpacing(6)
-        grid_layout.setVerticalSpacing(6)
-        grid_widget = QWidget()
-        grid_widget.setLayout(grid_layout)
-        grid_widget.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-        
-        for row in range(8):
-            for col in range(12):
-                row_letter = chr(65 + row)  # A-H
-                col_number = col + 1
-                well_id = f"{row_letter}{col_number}"
-                
-                well_label = WellLabel(well_id, row, col, self.cell_size)
-                
-                grid_layout.addWidget(well_label, row, col)
-                self.well_labels[well_id] = well_label
-        
-        total_w = 12 * self.cell_size + (12 - 1) * grid_layout.horizontalSpacing() + grid_layout.contentsMargins().left() + grid_layout.contentsMargins().right()
-        total_h = 8 * self.cell_size + (8 - 1) * grid_layout.verticalSpacing() + grid_layout.contentsMargins().top() + grid_layout.contentsMargins().bottom()
-        grid_widget.setFixedSize(total_w, total_h)
-        
-        center_col.addWidget(grid_widget, alignment=Qt.AlignCenter)
-        
-        # Clear button directly below grid
+        self.grid_widget = WellGridWidget(8, 12, self.cell_size)
+        self.well_labels = self.grid_widget.labels
+        self.grid_widget.well_pressed.connect(self._on_well_pressed)
+        self.grid_widget.well_dragged.connect(self._on_well_dragged)
+        self.grid_widget.drag_finished.connect(self._on_well_released)
+
+        # Selection buttons sit directly beside the plate
+        grid_row = QHBoxLayout()
+        grid_row.addStretch(1)
+        grid_row.addWidget(self.grid_widget, alignment=Qt.AlignVCenter)
+
+        grid_side = QVBoxLayout()
+        grid_side.addStretch(1)
+        self.select_all_btn = QPushButton("Select All Wells")
+        self.select_all_btn.setToolTip("Select every well (A1-H12) for the sampling sequence.")
+        self.select_all_btn.clicked.connect(self._select_all_wells)
+        grid_side.addWidget(self.select_all_btn)
         clear_btn = QPushButton("Clear Selection")
+        clear_btn.setToolTip("Clear blue (sampling) and green (move) selections.")
         clear_btn.clicked.connect(self._clear_selections)
-        center_col.addWidget(clear_btn)
-        
+        grid_side.addWidget(clear_btn)
+        grid_side.addStretch(1)
+        grid_row.addLayout(grid_side)
+        grid_row.addStretch(1)
+        center_col.addLayout(grid_row)
+
         # Display log below clear button
         self.display = QTextEdit()
         self.display.setReadOnly(True)
@@ -1521,7 +1649,8 @@ class AsyncAMUZAGUI(QMainWindow):
             "4. Ctrl+Click wells to build a MOVE list (green).\n"
             "5. 'Start Sampling' runs the block sequence. 'Move' runs ctrl list.\n"
             "6. 'Stop' interrupts current run.\n"
-            "7. 'Show Plot' opens live data; 'Settings' adjusts timing.\n"
+            "7. The 'Plotting' tab shows live data and connects the sensor;\n"
+            "   'Settings' adjusts timing.\n"
             "Coded By: Noah Bernten   Noah.Bernten@mail.huji.ac.il"
         )
         instructions.setMinimumWidth(260)
@@ -1531,7 +1660,7 @@ class AsyncAMUZAGUI(QMainWindow):
         main_layout.addLayout(center_col, 5)
         main_layout.addLayout(right_col, 2)
 
-        # --- Tabs: Sampling + Flow Control -----------------------------------
+        # --- Tabs: Sampling + Flow Control + Plotting -------------------------
         self.tabs = QTabWidget()
         self.tabs.addTab(central_widget, "Sampling")
         self.flow_tab = None
@@ -1542,6 +1671,13 @@ class AsyncAMUZAGUI(QMainWindow):
             self.tabs.addTab(self.flow_tab, "Flow Control")
         except Exception as e:
             logger.error(f"Flow Control tab unavailable: {e}")
+
+        # Plotting lives in a tab (not a separate window) and owns the sensor
+        # connect/disconnect buttons.
+        self.plot_window = PlotWindow(self.app_state, main_gui=self)
+        self.tabs.addTab(self.plot_window, "Plotting")
+        self.plot_window.update_sensor_status(False)
+
         self.setCentralWidget(self.tabs)
 
     def _on_flow_clog(self, clogged: bool):
@@ -1951,63 +2087,31 @@ class AsyncAMUZAGUI(QMainWindow):
         
         logger.info(f"Well {well_id} clicked")
     
-    def mousePressEvent(self, event):
-        """Handle mouse press for drag selection"""
-        if event.button() == Qt.LeftButton:
-            # Find which well was clicked
-            for well_id, label in self.well_labels.items():
-                if label.geometry().contains(label.parent().mapFromGlobal(event.globalPos())):
-                    if event.modifiers() & Qt.ControlModifier:
-                        # Ctrl+Click for MOVE command
-                        asyncio.create_task(self._toggle_ctrl_well(well_id))
-                    else:
-                        # Start drag selection for RUNPLATE
-                        self.drag_start = (label.row, label.col)
-                        self.drag_active = True
-                        self._apply_drag_selection(label.row, label.col)
-                    break
-        super().mousePressEvent(event)
-    
-    def mouseMoveEvent(self, event):
-        """Handle mouse move for drag selection"""
-        if self.drag_active and (event.buttons() & Qt.LeftButton) and not (event.modifiers() & Qt.ControlModifier):
-            # Find which well we're over
-            for _, label in self.well_labels.items():
-                if label.geometry().contains(label.parent().mapFromGlobal(event.globalPos())):
-                    self._apply_drag_selection(label.row, label.col)
-                    break
-        super().mouseMoveEvent(event)
-    
-    def mouseReleaseEvent(self, event):
-        """Handle mouse release to complete drag selection"""
-        if self.drag_active:
-            self.drag_active = False
-            asyncio.create_task(self._commit_drag_selection())
-        super().mouseReleaseEvent(event)
-    
-    def _on_well_pressed(self, row: int, col: int, modifiers: Qt.KeyboardModifiers):
+    def _on_well_pressed(self, row: int, col: int, modifiers):
         """Handle start of selection or ctrl toggle"""
         well_id = self._well_id_from_rc(row, col)
         if modifiers & Qt.ControlModifier:
             asyncio.create_task(self._toggle_ctrl_well(well_id))
             return
-        
+
         self.drag_start = (row, col)
         self.drag_active = True
         self._apply_drag_selection(row, col)
-    
-    def _on_well_dragged(self, row: int, col: int, modifiers: Qt.KeyboardModifiers):
+
+    def _on_well_dragged(self, row: int, col: int):
         """Handle drag selection updates"""
-        if not self.drag_active or (modifiers & Qt.ControlModifier):
+        if not self.drag_active:
             return
         self._apply_drag_selection(row, col)
-    
-    def _on_well_released(self, row: int, col: int, modifiers: Qt.KeyboardModifiers):
+
+    def _on_well_released(self):
         """Commit selection on release"""
-        if self.drag_active and not (modifiers & Qt.ControlModifier):
-            self.drag_active = False
-            asyncio.create_task(self._commit_drag_selection())
-    
+        if not self.drag_active:
+            return
+        self.drag_active = False
+        selected = {wid for wid, lbl in self.well_labels.items() if lbl.is_selected}
+        asyncio.create_task(self._commit_selection(selected))
+
     def _apply_drag_selection(self, row: int, col: int):
         """Preview selection during drag"""
         if not self.drag_start:
@@ -2020,10 +2124,13 @@ class AsyncAMUZAGUI(QMainWindow):
             for c in range(c_min, c_max + 1):
                 selected.add(self._well_id_from_rc(r, c))
         self._update_selection_preview(selected)
-    
-    async def _commit_drag_selection(self):
-        """Persist drag selection to state"""
-        selected = {wid for wid, lbl in self.well_labels.items() if lbl.is_selected}
+
+    async def _commit_selection(self, selected: Set[str]):
+        """Persist a finished selection to state.
+
+        The well set is captured by the CALLER at release time -- reading the
+        labels in here would race a drag that has already started again.
+        """
         ctrl_wells = await self.app_state.get_selected_wells(ctrl=True)
         await self.app_state.clear_selections()
         # Restore ctrl wells
@@ -2034,7 +2141,17 @@ class AsyncAMUZAGUI(QMainWindow):
         for wid in selected:
             await self.app_state.add_selected_well(wid)
         logger.info(f"Selected wells: {sorted(selected)}")
-    
+
+    def _select_all_wells(self):
+        """Select every well on the plate for the sampling sequence."""
+        self.drag_active = False
+        self.drag_start = None
+        all_wells = set(self.well_labels.keys())
+        self._update_selection_preview(all_wells)
+        asyncio.create_task(self._commit_selection(all_wells))
+        self.add_to_display(f"Selected all {len(all_wells)} wells.")
+
+
     @asyncSlot()
     async def _clear_selections(self):
         """Clear all selections and completed wells. Only reset pause state if paused."""
@@ -2925,23 +3042,10 @@ class AsyncAMUZAGUI(QMainWindow):
             QMessageBox.critical(self, "Error", f"Move failed: {e}")
     
     def _on_show_plot(self):
-        """Show plot window"""
-        if not self.plot_window:
-            self.plot_window = PlotWindow(self.app_state, main_gui=self)
+        """Bring the Plotting tab to the front."""
+        if self.plot_window is not None:
+            self.tabs.setCurrentWidget(self.plot_window)
 
-        # If sensor is already running, connect plot to the sensor's output file
-        if self.sensor_reader and self.sensor_reader.is_running:
-            sensor_output_file = self.sensor_reader.get_output_file()
-            self.plot_window.set_sensor_file(sensor_output_file)
-            self.plot_window._using_callback = True  # Enable callback mode for live data
-            self.plot_window.update_sensor_status(True, self.sensor_reader.port)
-            self.add_to_display(f"Plot connected to live sensor data")
-        else:
-            self.plot_window.update_sensor_status(False)
-
-        self.plot_window.show()
-        self.plot_window.raise_()
-    
     def _on_settings(self):
         """Show settings dialog"""
         dialog = SettingsDialog(self.app_state, self)
@@ -3070,6 +3174,14 @@ class AsyncAMUZAGUI(QMainWindow):
                     if "cp210" in desc or "cp2102" in desc or "silicon" in desc:
                         six = p.device
                         break
+                # Say which ports were seen and which one was picked — when the
+                # sensor "isn't reading", the first thing to rule out is that
+                # the app grabbed the pump's FTDI port instead.
+                seen = ", ".join(f"{p.device} ({p.description})" for p in ports)
+                self.add_to_display(f"Serial ports: {seen}")
+                if six is None:
+                    self.add_to_display("⚠ No CP210x (SIX transmitter) port found — "
+                                        f"falling back to {ports[0].device}.")
                 port = six or ports[0].device
                 self.add_to_display(f"Auto-connecting to sensor on {port}"
                                     f"{' (SIX/CP2102)' if six else ''}...")
@@ -3083,6 +3195,8 @@ class AsyncAMUZAGUI(QMainWindow):
 
     async def _disconnect_sensor(self):
         """Async helper to disconnect sensor"""
+        if self.sensor_reader is None:
+            return
         try:
             await self.sensor_reader.stop()
             await self.sensor_reader.disconnect()
@@ -3142,24 +3256,23 @@ class AsyncAMUZAGUI(QMainWindow):
                 self.sensor_log_start_time = datetime.now()
                 self._init_well_log()
 
-                # Auto-open plot window if not already open
-                if not self.plot_window:
-                    self.plot_window = PlotWindow(self.app_state, main_gui=self)
-
-                # Update PlotWindow with the sensor's output file path
+                # Point the Plotting tab at the sensor's output file and show it
                 sensor_output_file = self.sensor_reader.get_output_file()
                 self.plot_window.set_sensor_file(sensor_output_file)
                 self.plot_window._using_callback = True  # Enable callback mode
-                self.plot_window.update_sensor_status(True, port)
-                self.plot_window.show()
-                self.plot_window.raise_()
-                self.add_to_display(f"Plot window opened - receiving data")
+                self.plot_window.update_sensor_status(True, port, "waiting for data…")
+                self.tabs.setCurrentWidget(self.plot_window)
 
                 # Update UI status
                 self.sensor_status_label.setText(f"Sensor: {port}")
                 self.add_to_display(f"Sensor connected on {port}")
                 self.add_to_display(f"Data file: {Path(sensor_output_file).name}")
                 logger.info(f"Sensor connected on {port}, output: {sensor_output_file}")
+
+                # Watch the stream so a silent port is reported instead of
+                # looking like a working connection that just never plots.
+                watchdog = asyncio.create_task(self._sensor_stream_watchdog(port))
+                self.task_manager.add_task(watchdog, "sensor_watchdog")
             else:
                 QMessageBox.warning(self, "Connection Failed", "Could not connect to sensor")
                 self.sensor_reader = None
@@ -3168,7 +3281,58 @@ class AsyncAMUZAGUI(QMainWindow):
             logger.error(f"Sensor connection error: {e}")
             QMessageBox.critical(self, "Error", f"Sensor connection failed: {e}")
             self.sensor_reader = None
-    
+
+    async def _sensor_stream_watchdog(self, port: str, grace_s: float = 10.0):
+        """Report WHY a connected sensor produces nothing.
+
+        Three outcomes, and they need different fixes:
+          * no bytes at all  -> the transmitter is off/unplugged, or the app is
+            on the wrong port (e.g. the pump's FTDI instead of the SIX CP210x);
+          * bytes but no valid packets -> baud rate / protocol mismatch;
+          * packets -> fine, just report the rate.
+        """
+        reader = self.sensor_reader
+        warned = False
+        try:
+            while reader is not None and reader is self.sensor_reader:
+                await asyncio.sleep(grace_s)
+                if reader is not self.sensor_reader or self.stop_flag_set(reader):
+                    return
+
+                readings = reader.readings_count
+                raw = reader.bytes_received
+
+                if readings > 0:
+                    self.plot_window.set_sensor_detail(f"{readings} readings")
+                    warned = False
+                elif raw < 25:   # a stray byte or two is still "silent"
+                    msg = (f"No data on {port}: {raw} bytes received in {grace_s:.0f}s. "
+                           "The SIX transmitter is off, unplugged, or on another "
+                           "port — check that it is powered and streaming.")
+                    self.plot_window.set_sensor_detail("no bytes received", warn=True)
+                    if not warned:
+                        self.add_to_display(f"⚠ {msg}")
+                        logger.warning(msg)
+                        warned = True
+                else:
+                    msg = (f"{raw} bytes on {port} but no valid packets "
+                           f"({reader.bad_frames} rejected) — likely a baud-rate "
+                           f"mismatch (expected {reader.baudrate}).")
+                    self.plot_window.set_sensor_detail("bytes but no valid packets", warn=True)
+                    if not warned:
+                        self.add_to_display(f"⚠ {msg}")
+                        logger.warning(msg)
+                        warned = True
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"Sensor watchdog error: {e}")
+
+    @staticmethod
+    def stop_flag_set(reader) -> bool:
+        """True once the reader has been asked to stop."""
+        return reader.stop_event.is_set()
+
     def resizeEvent(self, event):
         """Handle window resize to update size display"""
         super().resizeEvent(event)
