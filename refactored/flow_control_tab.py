@@ -319,11 +319,16 @@ class FlowControlTab(QWidget):
             _f.editingFinished.connect(self._save_cfg)   # remember the run params
         left.addWidget(params)
 
-        # push/pull direction, right on the main panel
-        self.chk_pull = QCheckBox("Pull (withdraw)   —   unchecked = push / infuse")
+        # push/pull direction — a big two-state button on the main panel, so the
+        # current direction is readable at a glance and one click flips it
+        self.chk_pull = QPushButton()
+        self.chk_pull.setCheckable(True)
         self.chk_pull.setChecked(self.cfg["direction"] == "withdraw")
-        self.chk_pull.setToolTip("Direction for Start / Run / Burst: checked = PULL (withdraw), unchecked = PUSH (infuse).")
+        self.chk_pull.setMinimumHeight(38)
+        self.chk_pull.setToolTip("Flow direction for Start / Run volume / Burst / Ramp. "
+                                 "Click to switch between PUSH (infuse) and PULL (withdraw).")
         self.chk_pull.toggled.connect(self._on_pull_toggled)
+        self._style_direction_btn(self.chk_pull.isChecked())
         left.addWidget(self.chk_pull)
 
         grid = QGridLayout(); grid.setSpacing(6); self.btn = {}
@@ -491,11 +496,25 @@ class FlowControlTab(QWidget):
                 raise
             return default
 
+    def _style_direction_btn(self, pulling: bool):
+        """Label + colour the direction button for its current state."""
+        if pulling:
+            self.chk_pull.setText("Direction:  ▲  PULL (withdraw)\nclick to switch to PUSH")
+            bg, hover = "#6a1b9a", "#7b27ab"
+        else:
+            self.chk_pull.setText("Direction:  ▼  PUSH (infuse)\nclick to switch to PULL")
+            bg, hover = ACCENT, "#1565c0"
+        self.chk_pull.setStyleSheet(
+            f"QPushButton{{background:{bg};color:white;font-weight:700;text-align:center;}}"
+            f"QPushButton:hover{{background:{hover};}}")
+
     def _on_pull_toggled(self, checked):
         self.cfg["direction"] = "withdraw" if checked else "infuse"
+        self._style_direction_btn(bool(checked))
         if self.line is not None:
             self.line.direction = self.cfg["direction"]
         self._save_cfg()
+        self.status_msg.emit(f"Flow direction: {'PULL (withdraw)' if checked else 'PUSH (infuse)'}")
 
     # ------------------------------------------------------- persist settings
     def _load_cfg(self):
@@ -1560,9 +1579,11 @@ class FlowControlTab(QWidget):
                 self.lbl_status.setText("Metabolite plot active — flow shown there (right axis).")
             return
 
-        # redraw ~ every 300 ms
+        # redraw ~ every 300 ms — but only while this tab is actually on screen.
+        # Re-rendering a matplotlib canvas behind another tab burned a whole CPU
+        # core on the Pi and made the UI (well-plate dragging especially) stutter.
         self._tick += 1
-        if self._tick % 2:
+        if self._tick % 2 or not self.isVisible():
             return
         try:
             win = max(10.0, float(self.cfg["window"]))
