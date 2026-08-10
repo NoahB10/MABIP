@@ -2433,6 +2433,14 @@ class AsyncAMUZAGUI(QMainWindow):
         finally:
             det.end_hold()
             det.set_cycling(True)
+            # Stop any in-flight clearing escalation now the hold is over (resumed
+            # or stopped), so the pump isn't left mid reverse-push.
+            tab = getattr(self, "flow_tab", None)
+            if tab is not None and hasattr(tab, "abort_clog_clear"):
+                try:
+                    tab.abort_clog_clear()
+                except Exception:
+                    pass
 
         if not proceed:
             self.add_to_display("Run stopped while blocked.")
@@ -2484,19 +2492,27 @@ class AsyncAMUZAGUI(QMainWindow):
         ONLY in the buffer — try_clear_burst enforces the phase — never mid-well,
         and never while one is already running, so bursts cannot stack."""
         tab = getattr(self, "flow_tab", None)
-        if tab is None or not hasattr(tab, "try_clear_burst"):
+        if tab is None:
             return
         now = time.monotonic()
         if now - self._last_burst_attempt < self.BLOCKAGE_BURST_COOLDOWN_S:
             return
         try:
-            fired = tab.try_clear_burst()
+            # Prefer the escalated clear (forward bursts -> reverse-push); fall back
+            # to a single burst on older tabs without it.
+            if hasattr(tab, "request_clog_clear"):
+                fired = tab.request_clog_clear("metabolite")
+            elif hasattr(tab, "try_clear_burst"):
+                fired = tab.try_clear_burst()
+            else:
+                return
         except Exception as e:
-            logger.debug(f"Clog-clearing burst failed: {e}")
+            logger.debug(f"Clog-clearing attempt failed: {e}")
             return
         if fired:
             self._last_burst_attempt = now
-            self.add_to_display("Bursting in the buffer to try to clear the line…")
+            self.add_to_display("Clearing the line in the buffer "
+                                "(forward bursts, then reverse-push if needed)…")
 
     async def _ask_blockage_cleared(self) -> bool:
         """Popup: has the blockage been cleared? True to continue, False to stop.

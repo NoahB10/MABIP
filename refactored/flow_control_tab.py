@@ -62,6 +62,12 @@ class FlowDefinitionsDialog(QDialog):
         ("b_backflow_s", "Burst backflow (s)"), ("b_backflow_rate", "Burst backflow rate (µL/min, 0=baseline)"),
         ("b_settle_base_s", "Burst settle base (s)"), ("b_settle_k", "Burst settle k (s·µL/min)"),
         ("b_settle_tol", "Burst steady tol (µL/min)"), ("b_settle_hold", "Burst steady hold (s)"),
+        ("clog_frac", "Clog: flow-below frac (0-1)"), ("clog_seconds", "Clog: sustained (s)"),
+        ("clog_arm_frac", "Clog: arm at frac of setpoint (0-1)"),
+        ("clog_arm_timeout_s", "Clog: startup budget before warning (s)"),
+        ("clear_fwd_bursts", "Clear: # forward bursts"), ("clear_wait_s", "Clear: wait before reverse (s)"),
+        ("rev_rate", "Clear: reverse rate (µL/min, 0=baseline)"), ("rev_time_s", "Clear: reverse time (s)"),
+        ("rev_attempts", "Clear: max reverse attempts"), ("clear_settle_s", "Clear: recheck settle (s)"),
         ("prime_pull_vol", "Prime pull vol (µL)"), ("prime_pull_rate", "Prime pull rate (µL/min)"),
         ("prime_push_vol", "Prime push vol (µL)"), ("prime_push_rate", "Prime push rate (µL/min)"),
         ("exp_buffer_rate", "Well-flow: buffer rate"), ("exp_well_rate", "Well-flow: well rate"),
@@ -75,13 +81,15 @@ class FlowDefinitionsDialog(QDialog):
     def __init__(self, cfg, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Flow — Definitions / Settings")
-        self.setMinimumWidth(330)
+        self.setMinimumWidth(660)
         self.cfg = dict(cfg); self.w = {}
         lay = QVBoxLayout(self); lay.setContentsMargins(16, 16, 16, 16); lay.setSpacing(8)
-        form = QFormLayout(); form.setVerticalSpacing(7)
+        cols = QHBoxLayout(); cols.setSpacing(24)
+        form_l = QFormLayout(); form_l.setVerticalSpacing(7)
+        form_r = QFormLayout(); form_r.setVerticalSpacing(7)
 
-        self.w["port"] = QLineEdit(str(cfg["port"])); form.addRow("Pump port", self.w["port"])
-        self.w["diameter"] = QLineEdit(str(cfg["diameter"])); form.addRow("Syringe Ø (mm)", self.w["diameter"])
+        self.w["port"] = QLineEdit(str(cfg["port"]))
+        self.w["diameter"] = QLineEdit(str(cfg["diameter"]))
         seg = QWidget(); sh = QHBoxLayout(seg); sh.setContentsMargins(0, 0, 0, 0); sh.setSpacing(6)
         self._syr = {}
         self._syr_group = QButtonGroup(seg); self._syr_group.setExclusive(True)
@@ -90,10 +98,22 @@ class FlowDefinitionsDialog(QDialog):
             b.setStyleSheet("QPushButton:checked{background:#2f81f7;color:white;font-weight:700;}")
             b.setChecked(int(cfg["n"]) == n)
             self._syr_group.addButton(b); sh.addWidget(b); self._syr[n] = b
-        sh.addStretch(1); form.addRow("# syringes", seg)
+        sh.addStretch(1)
+
+        # All rows in order, then split across two columns so the dialog stays
+        # short enough that the OK/Cancel buttons remain on-screen.
+        rows = [("Pump port", self.w["port"]),
+                ("Syringe Ø (mm)", self.w["diameter"]),
+                ("# syringes", seg)]
         for key, label in self._FIELDS:
-            self.w[key] = QLineEdit(str(cfg[key])); form.addRow(label, self.w[key])
-        lay.addLayout(form)
+            self.w[key] = QLineEdit(str(cfg[key]))
+            rows.append((label, self.w[key]))
+        half = (len(rows) + 1) // 2
+        for i, (label, widget) in enumerate(rows):
+            (form_l if i < half else form_r).addRow(label, widget)
+
+        cols.addLayout(form_l); cols.addLayout(form_r)
+        lay.addLayout(cols)
 
         bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         bb.accepted.connect(self.accept); bb.rejected.connect(self.reject)
@@ -117,6 +137,7 @@ class FlowControlTab(QWidget):
     """Flow control + live plot + clog detection, as a MABIP tab."""
 
     clog_changed = pyqtSignal(bool)
+    clog_ui = pyqtSignal(bool, str)  # banner/button paint; queued when a worker raises it
     exp_running = pyqtSignal(bool)    # True while an experiment is running (toggles Stop button)
     status_msg = pyqtSignal(str)
     cal_msg = pyqtSignal(float)
@@ -131,9 +152,13 @@ class FlowControlTab(QWidget):
         self.latest_flow = None          # read by the well-log writer
         self.flow_unit = "uL/min"
         self.is_clogged = False          # read by the well-log writer
+        self._clog_flagged = False       # clog raised but NOT auto-cleared (user must act)
         self._steady = False             # pump in steady flow (clog check active)
         self._expected = 0.0
         self._clog_since = None
+        self._flow_seen = False          # sensor has reached the setpoint since this command
+        self._steady_since = 0.0         # when the current flow command was issued
+        self._arm_warned = False         # one-shot "never got going" warning
         self._busy = False
         self._abort = False
         # burst / experiment-phase gating
@@ -149,6 +174,10 @@ class FlowControlTab(QWidget):
         self._ff_enabled = False         # feed-forward pause/resume across moves
         self._ff_gen = 0                 # cancels stale pause/resume timers
         self._last_air = False           # latest Fluigent air-bubble flag
+        self._clearing = False           # True while the clog-clearing escalation runs
+        self._abort_clear = False        # STOP / resume flag that unwinds the escalation
+        self._last_clear_method = None   # "forward burst" | "reverse push" | None(failed)
+        self._clear_baseline = 0.0       # line rate to restore after clearing
         self._flow_log_path = None       # own continuous flow-rate log file
         self._flow_log_last = 0.0
         self._seg_label = ""             # tags flow-log rows during an experiment
@@ -166,7 +195,20 @@ class FlowControlTab(QWidget):
             "settle": 30.0, "measure": 15.0, "window": 120.0,
             "r_start": 5.0, "r_max": 60.0, "r_step": 5.0, "r_dwell": 20.0, "r_tol": 5.0,
             "clog_frac": 0.4, "clog_seconds": 6.0,
+            # Arming: the watch judges nothing until the sensor has reached
+            # clog_arm_frac of setpoint at least once since the flow command. Above
+            # clog_frac so establishing flow and losing it cannot chatter.
+            "clog_arm_frac": 0.8, "clog_arm_timeout_s": 120.0,
             "metab_window": 12.0, "metab_thresh": 0.15,
+            # clog-clearing escalation (Strategy 1 forward burst -> Strategy 2 reverse push).
+            # Sequence: N forward bursts to completion, wait, then reverse-push attempts.
+            "clear_fwd_bursts": 2.0,        # forward bursts to run before escalating
+            "clear_wait_s": 60.0,           # wait after the forward bursts before reversing
+            "auto_clear": False,            # OFF: a clog only warns; the user presses Burst now
+            "clear_settle_s": 8.0,          # settle+measure window when checking if flow returned
+            "rev_rate": 0.0,                # reverse-push line rate µL/min (0 => use baseline)
+            "rev_time_s": 10.0,             # reverse-push duration per attempt (fixed time)
+            "rev_attempts": 3.0,            # max reverse-push attempts before giving up
             "b_mult": 1.7, "b_high_s": 10.0, "b_stop_s": 8.0,
             # burst resettle: backflow pulse bleeds the overshoot, then confirm
             # the sensor is back at baseline before the well starts. The settle
@@ -192,6 +234,7 @@ class FlowControlTab(QWidget):
 
         self.status_msg.connect(lambda s: self.lbl_status.setText(s))
         self.status_msg.connect(self._console_log)
+        self.clog_ui.connect(self._apply_clog_ui)
         self.cal_msg.connect(lambda c: self.lbl_status.setText(f"cal_factor = {c:.4f}"))
         self.pump_result.connect(self._after_pump)
         self.sensor_result.connect(self._after_sensor)
@@ -301,6 +344,15 @@ class FlowControlTab(QWidget):
         self.chk_auto.setToolTip("Automatically fire one Burst each time the run enters the buffer (needs ≥1 well).")
         self.chk_auto.toggled.connect(lambda v: setattr(self, "_auto_burst", bool(v)))
         left.addWidget(self.chk_auto)
+        self.chk_autoclear = QCheckBox("Auto-clear on detected clog")
+        self.chk_autoclear.setToolTip("OFF (default): a clog only RAISES A WARNING — the banner turns red and "
+                                      "'Burst now' lights up, and you decide whether to clear. ON: the pump runs "
+                                      "the forward-burst → reverse-push escalation by itself. Leave it off unless "
+                                      "you trust the flow sensor: a dead or unprimed sensor reads ~0 and looks "
+                                      "exactly like a clog.")
+        self.chk_autoclear.setChecked(bool(self.cfg.get("auto_clear", False)))
+        self.chk_autoclear.toggled.connect(lambda v: self.cfg.__setitem__("auto_clear", bool(v)))
+        left.addWidget(self.chk_autoclear)
         self.lbl_phase = QLabel("phase: idle")
         self.lbl_phase.setStyleSheet(f"color:{MUTED};")
         left.addWidget(self.lbl_phase)
@@ -343,6 +395,13 @@ class FlowControlTab(QWidget):
         u = QLabel("µL/min (combined)"); u.setStyleSheet(f"color:{MUTED};")
         rr.addWidget(self.lbl_flow); rr.addWidget(u, alignment=Qt.AlignBottom); rr.addStretch(1)
         right.addLayout(rr)
+
+        # Clog banner — hidden until the watcher flags one. This is the whole
+        # point of not auto-clearing: the operator sees the call and decides.
+        self.lbl_clog = QLabel("")
+        self.lbl_clog.setWordWrap(True)
+        self.lbl_clog.setVisible(False)
+        right.addWidget(self.lbl_clog)
 
         self.fig = Figure(figsize=(5, 3)); self.fig.set_tight_layout(True)
         self.canvas = FigureCanvas(self.fig)
@@ -846,8 +905,8 @@ class FlowControlTab(QWidget):
         line_rate = self._num(self.f_rate)          # what you want in the LINE
         n = self._nsyr(); machine = line_rate / n   # per-syringe rate to the pump
         self._abort = False
-        self._expected = self.line.expected_combined(machine); self._steady = True
-        self._clog_since = None
+        self._arm_clog_watch(self.line.expected_combined(machine))
+        self._clog_flagged = False; self._set_clog_ui(False)
         self.status_msg.emit(f"Flowing {line_rate:g} µL/min in the line "
                              f"({machine:g}/syringe × {n}). Change + press again to update.")
         self._work(lambda: self.line.start_flow_single(machine, direction=self.cfg["direction"]))
@@ -858,8 +917,8 @@ class FlowControlTab(QWidget):
         line_vol, line_rate = self._num(self.f_vol), self._num(self.f_rate)
         n = self._nsyr(); mvol, mrate = line_vol / n, line_rate / n
         self._abort = False
-        self._expected = self.line.expected_combined(mrate); self._steady = True
-        self._clog_since = None
+        self._arm_clog_watch(self.line.expected_combined(mrate))
+        self._clog_flagged = False; self._set_clog_ui(False)
         self.status_msg.emit(f"Running {line_vol:g} µL @ {line_rate:g} µL/min in the line "
                              f"({mvol:g} µL @ {mrate:g}/syringe × {n})…")
         def fn():
@@ -1261,7 +1320,10 @@ class FlowControlTab(QWidget):
         self._work(fn)
 
     def _stop(self):
-        self._abort = True; self._steady = False; self._bursting = False
+        self._abort = True; self._abort_clear = True
+        self._steady = False; self._bursting = False
+        self._clog_flagged = False; self._clog_since = None
+        self._set_clog_ui(False)
         if self.line is None:
             return
         try:
@@ -1269,7 +1331,140 @@ class FlowControlTab(QWidget):
         except Exception as e:
             self.status_msg.emit(f"Stop error: {e}")
 
+    # ------------------------------------------------------------- clog arming
+    def _arm_clog_watch(self, expected):
+        """Command accepted: start watching, but do NOT start judging yet.
+
+        `clog_seconds` is the sustained-low duration, not a startup grace — it used
+        to begin the instant the button was pressed, which meant a dry or
+        depressurised line had 6 s to reach 40% of setpoint or be called a clog. It
+        cannot: the syringe has to take up backlash and pressurise the line first.
+
+        So judging is gated on flow having been ESTABLISHED at least once since this
+        command (`_flow_seen`). That is the correct definition anyway — a clog is the
+        LOSS of flow that was working. Below setpoint before flow ever started is a
+        priming problem, and it is reported as one. It also means a dead or unprimed
+        sensor, which reads ~0 forever, can never arm the watch and so can never
+        trigger a burst against nothing."""
+        self._expected = expected
+        self._steady = True
+        self._flow_seen = False
+        self._arm_warned = False
+        self._steady_since = time.monotonic()
+        self._clog_since = None
+
+    # ------------------------------------------------------------- clog UI
+    def _set_clog_ui(self, on, msg=""):
+        """Show/hide the clog banner and light up 'Burst now'.
+
+        Purely cosmetic — it never starts the pump. When auto-clear is off this is
+        the ONLY thing a detected clog does, so the operator can look at the trace
+        and decide whether it is a real blockage or a sensor that is reading zero.
+
+        Goes through a signal because `_finish_clear` calls it from the clearing
+        worker thread, and Qt widgets may only be touched on the GUI thread."""
+        self.clog_ui.emit(bool(on), msg)
+
+    def _apply_clog_ui(self, on, msg=""):
+        try:
+            self.lbl_clog.setVisible(bool(on))
+            if on:
+                self.lbl_clog.setText(msg)
+                self.lbl_clog.setStyleSheet(
+                    f"background:{RED};color:white;font-weight:700;padding:6px;"
+                    "border-radius:4px;")
+            b = self.btn.get("burst")
+            if b is not None:
+                b.setStyleSheet(
+                    f"QPushButton{{background:{AMBER};color:#11151c;font-weight:700;}}"
+                    if on else "")
+                b.setText("Burst now  ⚠" if on else "Burst now")
+        except Exception:
+            pass
+
     # ------------------------------------------------------------- polling
+    def _clog_watch(self, val):
+        """Flag a clog and kick the clearing escalation when the pump is COMMANDED
+        to flow but the sensor reads far below expected for a sustained time.
+
+        Idle/standalone only — during a plate run the metabolite blockage detector
+        drives clearing instead (this suppresses itself while phase != 'idle'). Does
+        nothing unless a steady flow is commanded, so a stopped pump never alarms."""
+        if not self._steady or self._expected <= 0 or self._clearing or self._bursting:
+            if not self._steady:
+                self._clog_since = None
+            return
+        if self._phase != "idle":              # a run is active -> metabolite path owns it
+            return
+        frac = self._cfgf("clog_frac", 0.4)
+        secs = self._cfgf("clog_seconds", 6.0)
+        now = time.monotonic()
+
+        # ---- arming: nothing is judged until flow has actually been established.
+        if not self._flow_seen:
+            arm_frac = self._cfgf("clog_arm_frac", 0.8)
+            if abs(val) >= arm_frac * abs(self._expected):
+                self._flow_seen = True
+                self._clog_since = None
+                self.status_msg.emit(
+                    f"[clog] flow established ({abs(val):.1f} µL/min ≥ {arm_frac:.0%} "
+                    f"of {abs(self._expected):.1f}) — clog watch armed.")
+                return
+            # Still climbing. Only complain once, and only after a generous startup
+            # budget — and call it what it is (never got going), not a clog.
+            arm_to = self._cfgf("clog_arm_timeout_s", 120.0)
+            if not self._arm_warned and (now - self._steady_since) >= arm_to:
+                self._arm_warned = True
+                self.status_msg.emit(
+                    f"⚠ [flow] never reached {abs(self._expected):.1f} µL/min in "
+                    f"{arm_to:g}s (best so far {abs(val):.1f}). NOT calling this a "
+                    "clog — check priming, air in the line, and that the sensor is "
+                    "reading. Clog watch stays disarmed.")
+                self._set_clog_ui(True, f"⚠  FLOW NEVER STARTED — still "
+                                        f"{abs(val):.1f} µL/min after {arm_to:g}s at a "
+                                        f"{abs(self._expected):.1f} µL/min setpoint. "
+                                        "Prime the line / check the sensor.")
+            return
+
+        low = abs(val) < frac * abs(self._expected)
+        if low:
+            if self._clog_since is None:
+                self._clog_since = now
+            elif (now - self._clog_since) >= secs and not self.is_clogged:
+                self.is_clogged = True
+                try:
+                    self.clog_changed.emit(True)
+                except Exception:
+                    pass
+                head = (f"flow {abs(val):.1f} < {frac:.0%} of "
+                        f"{abs(self._expected):.1f} µL/min for {secs:g}s")
+                # Detection and ACTION are separate. Detecting a clog never earns
+                # the right to drive the pump on its own — that is opt-in, because
+                # a sensor reading ~0 (unprimed, dry, dropped out) is indistinguish-
+                # able from a real blockage and would burst against nothing.
+                if self.cfg.get("auto_clear", False):
+                    self.status_msg.emit(f"⚠ [clog] {head} — auto-clearing.")
+                    self.request_clog_clear("flow-sensor")
+                else:
+                    self._clog_flagged = True
+                    self.status_msg.emit(
+                        f"⚠ [clog] {head} — NOT clearing (auto-clear is off). "
+                        "Press 'Burst now' to clear it, or check that the sensor "
+                        "is primed and reading.")
+                    self._set_clog_ui(True, f"⚠  CLOG SUSPECTED — {head}.  "
+                                            "Press 'Burst now' to clear, or STOP.")
+        else:
+            self._clog_since = None
+            if self.is_clogged:                # recovered on its own
+                self.is_clogged = False
+                self._clog_flagged = False
+                self._set_clog_ui(False)
+                self.status_msg.emit("✓ [clog] flow recovered on its own.")
+                try:
+                    self.clog_changed.emit(False)
+                except Exception:
+                    pass
+
     def _poll(self):
         # Nothing to read/plot/log without a flow sensor (pump-only is fine).
         if self.line is None or getattr(self.line, "sensor", None) is None:
@@ -1291,6 +1486,10 @@ class FlowControlTab(QWidget):
             self._last_air = False
         self.t.append(now); self.v.append(val)
         self.lbl_flow.setText(f"{val:+.2f}")
+
+        # standalone clog watch — only when a steady flow is COMMANDED (pump
+        # pumping). If the pump isn't pumping, no flow is expected, so nothing to do.
+        self._clog_watch(val)
 
         # own flow-rate log file (independent of the metabolite file), ~1 Hz
         if self._flow_log_path and (now - self._flow_log_last) >= 1.0:
@@ -1535,6 +1734,10 @@ class FlowControlTab(QWidget):
         if self._phase == "buffer" and self._n_wells < 1:
             self.status_msg.emit("Burst blocked: no active wells (wells<1).")
             return
+        if self._clog_flagged:      # the operator answered the banner — stand it down
+            self._clog_flagged = False
+            self._set_clog_ui(False)
+            self._clog_since = None
         self._trigger_burst(auto=False)
 
     def try_clear_burst(self) -> bool:
@@ -1556,6 +1759,167 @@ class FlowControlTab(QWidget):
             return False
         self._trigger_burst(auto=True)
         return True
+
+    # ---------------------------------------------------- clog-clear escalation
+    def request_clog_clear(self, source="auto") -> bool:
+        """Start the two-strategy clog-clearing escalation once.
+
+        Idempotent — returns False (and does nothing) if a sequence is already
+        running, the pump is missing/busy, we're recording a well, or no baseline
+        rate is set. Safe to call repeatedly from a watch loop.
+
+        Escalation:
+          1. Strategy 1 — run `clear_fwd_bursts` hard FORWARD bursts to completion.
+          2. Wait `clear_wait_s` for the line to recover.
+          3. Strategy 2 — if still blocked, REVERSE-push (infuse the opposite way)
+             for a fixed time, up to `rev_attempts` times, firing one forward burst
+             to re-establish flow the moment it moves.
+        The needle must be parked in the buffer or idle (never mid-well) — enforced
+        here. Whichever strategy works is recorded in `_last_clear_method`, then the
+        baseline flow rate is restored.
+
+        NOT YET VERIFIED ON THE RIG — the reverse-push maneuver expels a small bolus
+        back into the buffer; watch the first runs by hand."""
+        if self.line is None or self._busy or self._bursting or self._clearing:
+            return False
+        if self._phase == "well":              # never while recording a well
+            return False
+        base = self._num(self.f_rate, 0.0)
+        if base <= 0:                          # nothing to boost from / restore to
+            return False
+        self._clear_baseline = base
+        self._abort_clear = False
+        self._clearing = True
+        self._last_clear_method = None
+        self.status_msg.emit(f"[clog] clearing started ({source}) — baseline {base:g} µL/min.")
+        threading.Thread(target=self._clog_clear_worker, args=(source,), daemon=True).start()
+        return True
+
+    def abort_clog_clear(self):
+        """Unwind the escalation (called on STOP or when a run resumes)."""
+        if self._clearing:
+            self._abort_clear = True
+
+    def _clear_sleep(self, seconds) -> bool:
+        """Sleep in small steps; return False if aborted mid-sleep."""
+        t0 = time.monotonic()
+        while (time.monotonic() - t0) < seconds:
+            if self._abort_clear or self._abort:
+                return False
+            time.sleep(0.2)
+        return True
+
+    def _wait_burst_done(self):
+        """Block until the forward burst started by _trigger_burst finishes."""
+        while self._bursting and not (self._abort_clear or self._abort):
+            time.sleep(0.2)
+
+    def _flow_recovered(self) -> bool:
+        """True if the flow sensor shows flow back near baseline. No sensor -> False
+        (can't judge here; the metabolite hold loop decides that case instead)."""
+        if self.latest_flow is None or self.line is None:
+            return False
+        expected = self.line.expected_combined(self._clear_baseline / self._nsyr())
+        ok, _ = self._await_steady(expected, hold_s=2.0,
+                                   timeout_s=self._cfgf("clear_settle_s", 8.0))
+        return ok
+
+    def _reverse_push(self):
+        """Strategy 2: push the OPPOSITE way for a fixed time at a set rate, then
+        stop and resume forward baseline. Expels a small bolus back into the buffer
+        to dislodge the clog. Bounded volume = rev_rate * rev_time_s."""
+        n = self._nsyr()
+        base = self._clear_baseline
+        rev_line = self._cfgf("rev_rate", 0.0) or base
+        rev_s = self._cfgf("rev_time_s", 10.0)
+        fwd = self.cfg["direction"]
+        rev = "infuse" if fwd == "withdraw" else "withdraw"
+        vol = rev_line * rev_s / 60.0
+        self._busy = True; self._set_busy(True)
+        try:
+            self.status_msg.emit(f"[clog] reverse-push: {rev_line:g} µL/min {rev} for "
+                                 f"{rev_s:g}s (~{vol:g} µL back into buffer).")
+            self.line.start_flow_single(rev_line / n, direction=rev)
+            self._clear_sleep(rev_s)
+            self.line.stop()
+            if not (self._abort_clear or self._abort):
+                # resume forward baseline so _flow_recovered measures the real direction
+                self.line.start_flow_single(base / n, direction=fwd)
+        except Exception as e:
+            self.status_msg.emit(f"[clog] reverse-push error: {e}")
+        finally:
+            self._busy = False; self._set_busy(False)
+
+    def _clog_clear_worker(self, source):
+        n_fwd = max(1, int(self._cfgf("clear_fwd_bursts", 2.0)))
+        wait_s = self._cfgf("clear_wait_s", 60.0)
+        n_rev = max(0, int(self._cfgf("rev_attempts", 3.0)))
+        try:
+            # ---- Strategy 1: forward bursts to completion --------------------
+            for i in range(1, n_fwd + 1):
+                if self._abort_clear or self._abort:
+                    return
+                self.status_msg.emit(f"[clog] forward burst {i}/{n_fwd}…")
+                self._trigger_burst(auto=False)         # full-strength, own _work job
+                self._wait_burst_done()
+                if self._flow_recovered():
+                    self._finish_clear("forward burst"); return
+
+            # ---- wait, then re-check ----------------------------------------
+            self.status_msg.emit(f"[clog] forward bursts done — waiting {wait_s:g}s "
+                                 "before reversing…")
+            if not self._clear_sleep(wait_s):
+                return
+            if self._flow_recovered():
+                self._finish_clear("forward burst"); return
+
+            # ---- Strategy 2: reverse-push attempts --------------------------
+            for a in range(1, n_rev + 1):
+                if self._abort_clear or self._abort:
+                    return
+                self.status_msg.emit(f"[clog] reverse-push attempt {a}/{n_rev}…")
+                self._reverse_push()
+                if self._abort_clear or self._abort:
+                    return
+                if self._flow_recovered():
+                    self.status_msg.emit("[clog] flow moving — forward burst to re-establish.")
+                    self._trigger_burst(auto=False)
+                    self._wait_burst_done()
+                    self._finish_clear("reverse push"); return
+
+            self._finish_clear(None)     # exhausted both strategies
+        finally:
+            self._clearing = False
+
+    def _finish_clear(self, method):
+        """Record which strategy worked and restore the baseline forward flow."""
+        self._last_clear_method = method
+        n = self._nsyr()
+        try:
+            if self.line is not None and self._clear_baseline > 0 \
+                    and not (self._abort_clear or self._abort):
+                self.line.start_flow_single(self._clear_baseline / n,
+                                            direction=self.cfg["direction"])
+                # Re-arm from scratch: the line has just been burst and reversed, so
+                # it has to re-establish flow before "low" means anything again.
+                self._arm_clog_watch(self.line.expected_combined(self._clear_baseline / n))
+        except Exception as e:
+            self.status_msg.emit(f"[clog] restore-flow error: {e}")
+        if method:
+            self.is_clogged = False
+            self._clog_flagged = False
+            self._set_clog_ui(False)
+            self.status_msg.emit(f"✓ [clog] cleared by {method}. Restored "
+                                 f"{self._clear_baseline:g} µL/min.")
+            try:
+                self.clog_changed.emit(False)
+            except Exception:
+                pass
+        else:
+            self._set_clog_ui(True, "⚠  CLOG NOT CLEARED — forward bursts and reverse "
+                                    "pushes both failed. Needs a manual prime/clear.")
+            self.status_msg.emit("⚠ [clog] NOT cleared after forward bursts + reverse "
+                                 "pushes — needs a manual prime/clear.")
 
     def _burst_constants(self):
         """Measured burst-protocol constants for the CURRENT syringe count, from
@@ -1687,8 +2051,7 @@ class FlowControlTab(QWidget):
                 if self._abort:
                     self._burst_settled = True   # user STOPped; don't warn downstream
                 if self.line is not None and not self._abort:
-                    self._expected = self.line.expected_combined(mbase)
-                    self._clog_since = None; self._steady = True
+                    self._arm_clog_watch(self.line.expected_combined(mbase))
         self._work(fn)
 
     def _wait_run(self, volume, rate, label="Running"):

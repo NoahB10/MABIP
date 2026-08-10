@@ -112,6 +112,19 @@ class BurstSpy:
         return self._fires
 
 
+class ClearSpy:
+    """Newer tab surface: exposes request_clog_clear (the escalated clear)."""
+    def __init__(self, fires=True):
+        self.calls = 0
+        self.sources = []
+        self._fires = fires
+
+    def request_clog_clear(self, source="auto"):
+        self.calls += 1
+        self.sources.append(source)
+        return self._fires
+
+
 async def _call(gui):
     await gui._attempt_clearance()
 
@@ -122,7 +135,18 @@ def test_attempt_clearance_fires_the_burst():
     gui = FakeGUI(spy)
     asyncio.run(_call(gui))
     assert spy.calls == 1
-    assert any("Bursting in the buffer" in m for m in gui.displayed)
+    assert any("Clearing the line in the buffer" in m for m in gui.displayed)
+
+
+def test_attempt_clearance_prefers_escalated_clear():
+    """When the tab exposes request_clog_clear, use it (not the single burst)."""
+    import asyncio
+    spy = ClearSpy(fires=True)
+    gui = FakeGUI(spy)
+    asyncio.run(_call(gui))
+    assert spy.calls == 1
+    assert spy.sources == ["metabolite"]
+    assert any("Clearing the line in the buffer" in m for m in gui.displayed)
 
 
 def test_attempt_clearance_is_a_noop_without_a_pump():
