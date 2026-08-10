@@ -50,6 +50,33 @@ ACCENT = "#2f81f7"; RED = "#e5484d"; GREEN = "#2ea043"; AMBER = "#d9a406"; MUTED
 from experiment_parse import parse_experiment, num_list as _num_list
 
 
+class _SignedSensor:
+    """Wraps the Fluigent sensor so the positive direction can be flipped.
+
+    Which way the sensor calls "positive" depends on how it is plumbed into the
+    line, so on one rig a push reads +70 and on another it reads -70. Correct it
+    once, here at the source, rather than sprinkling sign handling through every
+    consumer — the plot, the readout, the flow log, the burst triggers and
+    `dual_syringe.read_flow()` all then agree that forward flow is positive.
+
+    Doing it anywhere later would not be enough: `calibrate()` trims cal_factor by
+    measured/target, so an inverted sensor silently drives cal_factor negative.
+
+    The sign is read through a callable on every sample, not captured, so changing
+    it in Definitions takes effect immediately on an already-connected sensor.
+    Everything else (unit, air_bubble, close) passes straight through."""
+
+    def __init__(self, inner, sign_fn):
+        self._inner = inner
+        self._sign_fn = sign_fn
+
+    def read(self, *a, **kw):
+        return self._sign_fn() * float(self._inner.read(*a, **kw))
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
 class FlowDefinitionsDialog(QDialog):
     """Pop-up for the rarely-changed 'definitions' so they don't crowd the tab."""
 
@@ -62,6 +89,7 @@ class FlowDefinitionsDialog(QDialog):
         ("b_backflow_s", "Burst backflow (s)"), ("b_backflow_rate", "Burst backflow rate (µL/min, 0=baseline)"),
         ("b_settle_base_s", "Burst settle base (s)"), ("b_settle_k", "Burst settle k (s·µL/min)"),
         ("b_settle_tol", "Burst steady tol (µL/min)"), ("b_settle_hold", "Burst steady hold (s)"),
+        ("flow_sign", "Sensor: positive direction (+1 / -1)"),
         ("clog_frac", "Clog: flow-below frac (0-1)"), ("clog_seconds", "Clog: sustained (s)"),
         ("clog_arm_frac", "Clog: arm at frac of setpoint (0-1)"),
         ("clog_arm_timeout_s", "Clog: startup budget before warning (s)"),
@@ -194,6 +222,9 @@ class FlowControlTab(QWidget):
             "port": "auto", "diameter": 19.13, "n": 1, "direction": "withdraw",
             "settle": 30.0, "measure": 15.0, "window": 120.0,
             "r_start": 5.0, "r_max": 60.0, "r_step": 5.0, "r_dwell": 20.0, "r_tol": 5.0,
+            # +1: the sensor already reads positive when flowing forward. -1: it is
+            # plumbed the other way round, so flip it at the source.
+            "flow_sign": 1.0,
             "clog_frac": 0.4, "clog_seconds": 6.0,
             # Arming: the watch judges nothing until the sensor has reached
             # clog_arm_frac of setpoint at least once since the flow command. Above
@@ -515,7 +546,15 @@ class FlowControlTab(QWidget):
         if dlg.exec_():
             new = dlg.values()
             diam_changed = new.get("diameter") != self.cfg.get("diameter")
+            sign_before = self._flow_sign()
             self.cfg = new
+            if self._flow_sign() != sign_before:
+                # Live from the next sample, but the trace still holds old-sign
+                # points — drop them so the plot isn't half-flipped.
+                self.t.clear(); self.v.clear()
+                self.status_msg.emit(
+                    f"Flow sensor sign set to {self._flow_sign():+.0f} — plot cleared. "
+                    "Re-run Calibrate if cal_factor was trimmed against the old sign.")
             if self.line is not None:
                 self.line.n_syringes = int(new["n"])
                 if diam_changed:
@@ -799,6 +838,13 @@ class FlowControlTab(QWidget):
         self._refresh_actions()
         self.status_msg.emit("Pump disconnected.")
 
+    def _flow_sign(self):
+        """+1.0 or -1.0. Anything that isn't clearly negative means "don't flip"."""
+        try:
+            return -1.0 if float(self.cfg.get("flow_sign", 1.0)) < 0 else 1.0
+        except (TypeError, ValueError):
+            return 1.0
+
     def _connect_sensor(self):
         """Attach the Fluigent flow sensor to the live pump (optional)."""
         if self.line is None:
@@ -811,8 +857,11 @@ class FlowControlTab(QWidget):
             ok = False
             try:
                 self.line.connect_sensor(channel=int(self.cfg.get("sensor_channel", 0)))
+                # Correct the orientation at the source, before anything reads it.
+                self.line.sensor = _SignedSensor(self.line.sensor, self._flow_sign)
                 ok = True
-                self.status_msg.emit("Flow sensor connected — plotting + logging.")
+                inv = " (readings INVERTED: flow_sign = -1)" if self._flow_sign() < 0 else ""
+                self.status_msg.emit(f"Flow sensor connected — plotting + logging.{inv}")
             except Exception as e:
                 self.status_msg.emit(f"Sensor connect failed: {e}")
             self.sensor_result.emit(ok)
