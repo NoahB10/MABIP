@@ -1058,15 +1058,28 @@ class AsyncAmuzaConnection:
                 logger.info(f"Device ready after {elapsed:.1f}s")
                 return True
 
-            # Update progress using device's countdown if available
-            elapsed = int(asyncio.get_event_loop().time() - start_time)
-            current_second = method.buffer_time + elapsed
+            # The needle takes move_time (measured per-well by calculate_move_time)
+            # to reach the well after the command goes out. The device does not
+            # cleanly signal arrival, so we use that measured time to keep the
+            # SAMPLING countdown from starting during travel: while still en route we
+            # report "Moving…" (which leaves the Flow tab in the buffer phase); only
+            # after arrival do we report "Sampling…" and count the well's dwell.
+            travel_elapsed = asyncio.get_event_loop().time() - start_time
+            current_second = method.buffer_time + int(travel_elapsed)
             if on_progress:
-                countdown = self.status.countdown
-                if countdown > 0:
-                    on_progress(f"Sampling: well {method.pos} ({countdown}s left)", current_second, total_time)
+                if travel_elapsed < move_time and not self.is_ready():
+                    to_arrival = max(0, int(round(move_time - travel_elapsed)))
+                    on_progress(f"Moving to well {method.pos} (~{to_arrival}s to arrival)",
+                                current_second, total_time)
                 else:
-                    on_progress(f"Sampling: well {method.pos}", current_second, total_time)
+                    # Time actually spent in the well so far -> remaining dwell.
+                    sampling_left = max(0, int(round(method.wait - (travel_elapsed - move_time))))
+                    # Trust the device countdown only once it reads like the dwell.
+                    dev = self.status.countdown
+                    if 0 < dev <= method.wait:
+                        sampling_left = dev
+                    on_progress(f"Sampling: well {method.pos} ({sampling_left}s left)",
+                                current_second, total_time)
 
             await asyncio.sleep(0.5)
 

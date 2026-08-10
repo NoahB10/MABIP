@@ -2078,8 +2078,11 @@ class AsyncAMUZAGUI(QMainWindow):
     
     def _start_experiment_timer(self, num_wells: int, t_buffer: int, t_sampling: int):
         """Start the experiment countdown timer"""
-        # Calculate total time: (buffer + sampling) * number of wells
-        self.experiment_total_seconds = (t_buffer + t_sampling) * num_wells
+        # Each well = buffer + move-to-well + sampling. Include a ~10 s move
+        # allowance (arrival saturates ~9 s by mid-plate) so the initial estimate
+        # isn't short; it's refined from the measured first-well duration anyway.
+        move_allowance = 10
+        self.experiment_total_seconds = (t_buffer + move_allowance + t_sampling) * num_wells
         self.experiment_remaining_seconds = self.experiment_total_seconds
         
         # Start timer (update every second)
@@ -2167,8 +2170,8 @@ class AsyncAMUZAGUI(QMainWindow):
             new_remaining = int(self.measured_well_duration * len(self.remaining_wells))
             self.experiment_remaining_seconds = new_remaining
         else:
-            # Use estimate
-            self.experiment_remaining_seconds = (t_buffer + t_sampling) * len(self.remaining_wells)
+            # Use estimate (buffer + ~10 s move + sampling per well)
+            self.experiment_remaining_seconds = (t_buffer + 10 + t_sampling) * len(self.remaining_wells)
 
         # Reset first well timing for this segment
         self.first_well_start_time = time.time()
