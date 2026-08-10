@@ -148,6 +148,12 @@ class AsyncPotentiostatReader:
         self.is_running = False
         self.stop_event = asyncio.Event()
         self.readings_count = 0
+        # Raw byte / bad-frame counters. These separate the two very different
+        # failure modes behind "the sensor isn't reading": zero bytes means the
+        # transmitter is off or on another port, while bytes with no valid
+        # packets means a baud-rate or protocol mismatch.
+        self.bytes_received = 0
+        self.bad_frames = 0
         self.start_time: Optional[datetime] = None
 
         # Binary packet buffer
@@ -338,6 +344,7 @@ class AsyncPotentiostatReader:
                 )
 
                 if data:
+                    self.bytes_received += len(data)
                     self.packet_buffer.extend(data)
 
                     # Process complete packets
@@ -381,6 +388,7 @@ class AsyncPotentiostatReader:
                 )
 
                 if data:
+                    self.bytes_received += len(data)
                     self.packet_buffer.extend(data)
 
                     while len(self.packet_buffer) >= PACKET_LENGTH:
@@ -441,6 +449,7 @@ class AsyncPotentiostatReader:
         else:
             # Invalid packet - shift buffer by 1 byte and try again
             del self.packet_buffer[0]
+            self.bad_frames += 1
             return None
 
     def _validate_packet(self, packet: bytes) -> bool:
