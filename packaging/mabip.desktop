@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=MABIP
+Comment=Microdialysis instrument control
+Exec=/opt/mabip/mabip.sh
+Icon=mabip
+Terminal=false
+StartupNotify=true
+Categories=Science;

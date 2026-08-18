@@ -29,7 +29,7 @@ from collections import deque
 # Vendored copies live in <repo>/hardware; the Pi's ~/pumpcontrol-project (the
 # live dev copies) wins over them when it exists. Insert order = reverse
 # priority: each insert(0) lands in front of the previous one.
-_HW = os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "hardware")
+_HW = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hardware")
 _PC = "/home/rpi/pumpcontrol-project"
 for p in (_HW, os.path.join(_PC, "fgt-SDK", "Python"), _PC):
     if os.path.isdir(p) and p not in sys.path:
@@ -740,7 +740,7 @@ class FlowControlTab(QWidget):
     def _load_experiment(self):
         """Load a text experiment file: apply the pump/flow settings here and set
         the wells + sample/buffer times on the Sampling tab."""
-        start_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "experiments"))
+        start_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "experiments"))
         if not os.path.isdir(start_dir):
             start_dir = ""      # fall back to the last/default location
         path, _ = QFileDialog.getOpenFileName(

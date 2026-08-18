@@ -2,20 +2,25 @@
 __pycache__/
 *.pyc
 *.pyo
+.pytest_cache/
 .venv/
 venv/
 
 # Data & logs (not source)
 Sensor_Readings/
 Amuza_Logs/
-refactored/Sensor_Readings/
-refactored/Amuza_Logs/
+exports/
 *.csv
-Flow_Log_*.csv
+*.log
 
-# Raw measurement text dumps at the repo root and in refactored/
+# Raw measurement text dumps at the repo root
 /*.txt
-refactored/*.txt
+
+# Build output
+packaging/build/
+packaging/dist/
+packaging/stage/
+packaging/*.tar.gz
 
 # Local Claude Code state
 .claude/

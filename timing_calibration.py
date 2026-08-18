@@ -44,7 +44,7 @@ from time import perf_counter
 # amuza_async lives beside this file; pump/sensor backend is vendored in
 # <repo>/hardware, with the Pi's pumpcontrol-project taking precedence.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-_HW = os.path.join(os.path.dirname(os.path.abspath(__file__)), os.pardir, "hardware")
+_HW = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hardware")
 _PC = "/home/rpi/pumpcontrol-project"
 for _p in (_HW, os.path.join(_PC, "fgt-SDK", "Python"), _PC):
     if os.path.isdir(_p) and _p not in sys.path:

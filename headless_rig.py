@@ -31,7 +31,7 @@ import threading
 from datetime import datetime
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_HW = os.path.join(_HERE, os.pardir, "hardware")   # vendored drivers in the repo
+_HW = os.path.join(_HERE, "hardware")   # vendored drivers in the repo
 _PC = "/home/rpi/pumpcontrol-project"              # live dev copies on the Pi win
 for p in (_HW, os.path.join(_PC, "fgt-SDK", "Python"), _PC, _HERE):
     if os.path.isdir(p) and p not in sys.path:
