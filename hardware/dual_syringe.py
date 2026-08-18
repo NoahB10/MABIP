@@ -95,6 +95,7 @@ class DualSyringeLine:
             raise ValueError("n_syringes must be >= 1")
         if direction not in ("infuse", "withdraw"):
             raise ValueError("direction must be 'infuse' or 'withdraw'")
+        self._diam_on_pump = None      # last diameter the PUMP actually took
         self.diameter_mm = float(diameter_mm)
         self.n_syringes = int(n_syringes)
         self.cal_factor = float(cal_factor)
@@ -114,6 +115,44 @@ class DualSyringeLine:
             self.sensor = None
 
         self._configured = False
+
+    # ----------------------------------------------------------- syringe bore
+    @property
+    def diameter_mm(self):
+        """Inner diameter of ONE syringe, in mm."""
+        return self._diameter_mm
+
+    @diameter_mm.setter
+    def diameter_mm(self, mm):
+        # A new bore invalidates whatever the pump was last told, so the next
+        # run re-pushes it (see _diam_arg). Assigning this attribute IS the
+        # supported way to change the syringe mid-session — the GUI does it.
+        self._diameter_mm = float(mm)
+        if self._diam_on_pump != self._diameter_mm:
+            self._configured = False
+
+    def _diam_arg(self):
+        """Diameter to send WITH the next run block, or None if the pump has it.
+
+        configure() on its own is not enough. This firmware ignores 'set'
+        commands issued while the motor is turning, and the GUI's 'apply rate'
+        re-commands a pump that is still running — so a mid-session diameter
+        change was pushed at a running pump, silently dropped, and then never
+        retried because _configured had already been latched True. Sending it
+        as part of the run block puts it after the stop, where it lands.
+        """
+        return None if self._diam_on_pump == self.diameter_mm else self.diameter_mm
+
+    def _send_run(self, per_syringe_volume, rate, direction, start):
+        """Send one run block to the pump: diameter (if stale), rate, volume, start."""
+        diameter = self._diam_arg()
+        move = self.pump.infuse if direction == "infuse" else self.pump.withdraw
+        replies = move(volume=abs(per_syringe_volume), rate=abs(rate),
+                       diameter=diameter, start=start)
+        # Only now, after the pump accepted it (a rejection raises), is the
+        # pump's bore known to match ours.
+        self._diam_on_pump = self.diameter_mm
+        return replies
 
     # ------------------------------------------------------------- lifecycle
     def __enter__(self):
@@ -203,7 +242,13 @@ class DualSyringeLine:
 
     # ------------------------------------------------------------- pump setup
     def configure(self):
-        """Push syringe diameter + working unit to the pump (idempotent)."""
+        """Push syringe diameter + working unit to the pump (idempotent).
+
+        _diam_on_pump is deliberately NOT set here: this can run while the pump
+        is still turning, where the firmware drops 'set' commands. The run block
+        that follows re-sends the diameter once the pump is stopped, and only
+        that send counts as landed.
+        """
         self.pump.set_units(self.UNIT)
         time.sleep(0.05)
         self.pump.set_diameter(self.diameter_mm)
@@ -228,10 +273,7 @@ class DualSyringeLine:
             f"[deliver] line {p['line_volume']:g} µL @ {p['line_rate']:g} µL/min "
             f"-> per-syringe {ps_vol:g} µL @ {ps_rate:g} µL/min "
             f"({direction}, ~{p['runtime_min']:.2f} min, cal={self.cal_factor:.4f})")
-        if direction == "infuse":
-            self.pump.infuse(volume=ps_vol, rate=ps_rate, start=start)
-        else:
-            self.pump.withdraw(volume=ps_vol, rate=ps_rate, start=start)
+        self._send_run(ps_vol, ps_rate, direction, start)
         return p
 
     def hold(self, line_rate, seconds, direction=None, start=True):
@@ -249,10 +291,7 @@ class DualSyringeLine:
             self.configure()
         self._log(f"[hold] {line_rate:g} µL/min line for ~{seconds:g}s "
                   f"(per-syringe {ps_rate:g} µL/min, {ps_vol:g} µL, {direction})")
-        if direction == "infuse":
-            self.pump.infuse(volume=ps_vol, rate=ps_rate, start=start)
-        else:
-            self.pump.withdraw(volume=ps_vol, rate=ps_rate, start=start)
+        self._send_run(ps_vol, ps_rate, direction, start)
         return ps_rate
 
     def start_flow(self, line_rate, direction=None, max_volume=18000.0):
@@ -275,10 +314,7 @@ class DualSyringeLine:
         ps_vol = min(abs(max_volume), 19000.0)
         self._log(f"[flow] line {line_rate:g} µL/min -> per-syringe {ps_rate:g} "
                   f"µL/min continuous ({direction})")
-        if direction == "infuse":
-            self.pump.infuse(volume=ps_vol, rate=ps_rate, start=True)
-        else:
-            self.pump.withdraw(volume=ps_vol, rate=ps_rate, start=True)
+        self._send_run(ps_vol, ps_rate, direction, start=True)
         return ps_rate
 
     def ramp(self, start_rate, max_rate, step, dwell_s, target,
@@ -342,10 +378,7 @@ class DualSyringeLine:
         # aren't measurable, which is fine.
         if not self._configured:
             self.configure()
-        if direction == "infuse":
-            self.pump.infuse(volume=abs(single_volume), rate=abs(machine_rate), start=start)
-        else:
-            self.pump.withdraw(volume=abs(single_volume), rate=abs(machine_rate), start=start)
+        self._send_run(single_volume, machine_rate, direction, start)
 
     def deliver_single(self, single_volume, machine_rate, direction=None, start=True):
         """Deliver `single_volume` per syringe at `machine_rate` — the exact
@@ -363,20 +396,19 @@ class DualSyringeLine:
         direction = direction or self.direction
         # NO sensor-range cap: the pump can run FASTER than the flow sensor reads
         # (needed to push through clogs); you just can't measure those flows.
-        # Configure BEFORE stopping so a valid rate change can never strand the
-        # pump halted with nothing to restart it.
-        if not self._configured:
-            self.configure()
         ps_vol = min(abs(max_volume), 19000.0)
         try:
             self.pump.stop()
         except Exception:
             pass
         time.sleep(0.12)
-        if direction == "infuse":
-            self.pump.infuse(volume=ps_vol, rate=abs(machine_rate), start=True)
-        else:
-            self.pump.withdraw(volume=ps_vol, rate=abs(machine_rate), start=True)
+        # Configure AFTER the stop (as start_flow does): this pump ignores 'set'
+        # commands while the motor turns, and re-applying a rate on a running
+        # pump is exactly this method's job — so configuring first threw the
+        # units/diameter away.
+        if not self._configured:
+            self.configure()
+        self._send_run(ps_vol, machine_rate, direction, start=True)
         return machine_rate
 
     def ramp_single(self, start_rate, max_rate, step, dwell_s, sensor_target,

@@ -23,9 +23,9 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QGridLayout, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QLineEdit, QComboBox, QMessageBox, QDialog,
     QDialogButtonBox, QFormLayout, QSpinBox, QDoubleSpinBox, QCheckBox,
-    QTextEdit, QSizePolicy, QFileDialog, QListWidget, QAction, QMenuBar, QTabWidget
+    QTextEdit, QSizePolicy, QFileDialog, QListWidget, QGroupBox, QTabWidget
 )
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal
+from PyQt5.QtCore import Qt, QTimer, QEvent, pyqtSignal
 from PyQt5.QtGui import QPalette, QColor
 
 import pandas as pd
@@ -245,9 +245,13 @@ class WellGridWidget(QWidget):
         event.accept()
 
 
-class PlotWindow(QMainWindow):
+class PlotWindow(QWidget):
     """
-    Real-time plotting window with OPTIMIZED rendering.
+    Real-time plotting page with OPTIMIZED rendering.
+
+    A plain QWidget, not a QMainWindow: it lives as the "Plotting" tab, and a
+    QMainWindow only earned its keep for the menu bar that has since been
+    replaced by the left-hand button column.
 
     Optimizations:
     - Pre-created line artists with set_data() instead of clear/replot
@@ -296,6 +300,14 @@ class PlotWindow(QMainWindow):
 
         # User interaction tracking - when True, don't auto-scroll
         self._user_panned = False
+
+        # Which traces are drawn. Temperature starts off: it is a slow, nearly
+        # flat line whose only job is to confirm the heater, so it would just be
+        # clutter on top of the metabolites unless asked for.
+        self.series_enabled = {
+            "Glutamate": True, "Glutamine": True, "Glucose": True,
+            "Lactate": True, "Temperature": False, "Flow": True,
+        }
 
         self._init_ui()
 
@@ -354,62 +366,122 @@ class PlotWindow(QMainWindow):
         # Don't reset _using_callback - sensor may still be running
     
     def _init_ui(self):
-        """Initialize UI"""
+        """Initialize UI.
+
+        Laid out like the Sampling and Flow Control tabs: a fixed-width column of
+        buttons on the left, the plot filling the rest. The old File/Sensor/
+        Calibration menu bar is gone -- a menu strip inside a tab page looked
+        wrong next to the other two tabs, and every one of its entries is a
+        button in the left column now.
+        """
         self.setWindowTitle("Sensor Data - Real-time")
-        self.setGeometry(100, 100, UI.PLOT_WINDOW_WIDTH, UI.PLOT_WINDOW_HEIGHT)
-        
-        # Menu bar
-        menu_bar = self.menuBar()
-        
-        # File Menu
-        file_menu = menu_bar.addMenu("File")
 
-        load_action = QAction("Load Saved", self)
-        load_action.triggered.connect(self._on_load_file)
-        file_menu.addAction(load_action)
+        outer = QHBoxLayout(self)
+        outer.setContentsMargins(10, 10, 10, 10)
+        outer.setSpacing(12)
 
-        save_action = QAction("Save As", self)
-        save_action.triggered.connect(self._on_save_file)
-        file_menu.addAction(save_action)
+        # ---- left control column -------------------------------------------
+        left = QVBoxLayout()
+        left.setSpacing(8)
 
-        file_menu.addSeparator()
+        sensor_box = QGroupBox("Sensor")
+        sensor_v = QVBoxLayout(sensor_box)
+        sensor_v.setSpacing(6)
 
-        hide_action = QAction("Hide Plot", self)
-        hide_action.setShortcut("Ctrl+H")
-        hide_action.triggered.connect(self.hide)
-        file_menu.addAction(hide_action)
+        self.sensor_status_label = QLabel("Sensor: Not Connected")
+        self.sensor_status_label.setWordWrap(True)
+        self.sensor_status_label.setStyleSheet("QLabel { font-weight: 600; color: #555; }")
+        sensor_v.addWidget(self.sensor_status_label)
 
-        # Sensor Menu
-        sensor_menu = menu_bar.addMenu("Sensor")
+        self.connect_sensor_btn = QPushButton("Connect Sensor")
+        self.connect_sensor_btn.setToolTip(
+            "Connect the metabolite (SIX) sensor and start recording. "
+            "Auto-picks the CP210x transmitter port.")
+        self.connect_sensor_btn.setStyleSheet(
+            "QPushButton { background:#2e7d32; color:white; font-weight:700; }"
+            "QPushButton:hover { background:#276b2a; }")
+        self.connect_sensor_btn.clicked.connect(self._on_connect_sensor)
+        sensor_v.addWidget(self.connect_sensor_btn)
 
-        self.connect_sensor_action = QAction("Connect Sensor...", self)
-        self.connect_sensor_action.triggered.connect(self._on_connect_sensor)
-        sensor_menu.addAction(self.connect_sensor_action)
+        self.disconnect_sensor_btn = QPushButton("Disconnect Sensor")
+        self.disconnect_sensor_btn.setToolTip("Stop recording and release the sensor port.")
+        self.disconnect_sensor_btn.setEnabled(False)
+        self.disconnect_sensor_btn.clicked.connect(self._on_disconnect_sensor)
+        sensor_v.addWidget(self.disconnect_sensor_btn)
+        left.addWidget(sensor_box)
 
-        self.disconnect_sensor_action = QAction("Disconnect Sensor", self)
-        self.disconnect_sensor_action.triggered.connect(self._on_disconnect_sensor)
-        self.disconnect_sensor_action.setEnabled(False)
-        sensor_menu.addAction(self.disconnect_sensor_action)
+        data_box = QGroupBox("Data")
+        data_v = QVBoxLayout(data_box)
+        data_v.setSpacing(6)
 
-        sensor_menu.addSeparator()
+        self.load_btn = QPushButton("📂  Load Saved…")
+        self.load_btn.setToolTip("Load a previously saved sensor file into the plot.")
+        self.load_btn.clicked.connect(self._on_load_file)
+        data_v.addWidget(self.load_btn)
 
-        self.sensor_status_action = QAction("Status: Not Connected", self)
-        self.sensor_status_action.setEnabled(False)
-        sensor_menu.addAction(self.sensor_status_action)
+        self.save_btn = QPushButton("💾  Save As…")
+        self.save_btn.setToolTip("Write the collected data to a file you choose (legacy tab format).")
+        self.save_btn.clicked.connect(self._on_save_file)
+        data_v.addWidget(self.save_btn)
 
-        # Calibration Menu
-        calibration_menu = menu_bar.addMenu("Calibration")
+        self.export_btn = QPushButton("Export CSV")
+        self.export_btn.setToolTip("Export the plotted metabolite traces as CSV.")
+        self.export_btn.clicked.connect(self._on_export_data)
+        data_v.addWidget(self.export_btn)
 
-        calibration_action = QAction("Calibration Settings...", self)
-        calibration_action.triggered.connect(self._on_calibration)
-        calibration_menu.addAction(calibration_action)
+        left.addWidget(data_box)
 
-        # Main widget
-        main_widget = QWidget()
-        self.setCentralWidget(main_widget)
-        
-        layout = QVBoxLayout(main_widget)
-        
+        # One checkbox per plotted series. Each keeps its own units -- the four
+        # metabolites share the left axis (mM), flow has the right axis (µL/min)
+        # and temperature gets a third spine (°C) -- so a trace can be switched
+        # on without dragging the others' scaling around.
+        traces_box = QGroupBox("Traces")
+        traces_v = QVBoxLayout(traces_box)
+        traces_v.setSpacing(4)
+        self.series_checks = {}
+        for name, tip in (
+            ("Glutamate", "Channel 1 − Channel 2, scaled by its gain."),
+            ("Glutamine", "Channel 3 − Channel 1, scaled by its gain."),
+            ("Glucose", "Channel 5 − Channel 4, scaled by its gain."),
+            ("Lactate", "Channel 6 − Channel 4, scaled by its gain."),
+            ("Temperature", "Channel 7, in °C, on its own right-hand axis."),
+            ("Flow", "Live Fluigent flow rate from the Flow Control tab (µL/min)."),
+        ):
+            cb = QCheckBox(name if name != "Flow" else "Flow rate")
+            cb.setToolTip(tip)
+            cb.setChecked(self.series_enabled[name])
+            cb.toggled.connect(lambda on, n=name: self._on_series_toggled(n, on))
+            traces_v.addWidget(cb)
+            self.series_checks[name] = cb
+        left.addWidget(traces_box)
+
+        view_box = QGroupBox("View")
+        view_v = QVBoxLayout(view_box)
+        view_v.setSpacing(6)
+
+        self.auto_follow_btn = QPushButton("Auto-Follow")
+        self.auto_follow_btn.setToolTip("Resume auto-scrolling after pan/zoom")
+        self.auto_follow_btn.clicked.connect(self._on_auto_follow)
+        view_v.addWidget(self.auto_follow_btn)
+
+        self.calibration_btn = QPushButton("⚙  Calibration…")
+        self.calibration_btn.setToolTip("Per-metabolite gains used to scale the plotted traces.")
+        self.calibration_btn.clicked.connect(self._on_calibration)
+        view_v.addWidget(self.calibration_btn)
+        left.addWidget(view_box)
+
+        left.addStretch(1)
+
+        left_widget = QWidget()
+        left_widget.setLayout(left)
+        left_widget.setFixedWidth(268)   # same column width as Flow Control
+        outer.addWidget(left_widget)
+
+        # ---- right: toolbar + plot -----------------------------------------
+        layout = QVBoxLayout()
+        layout.setSpacing(6)
+        outer.addLayout(layout, 1)
+
         # Create matplotlib figure with single plot
         self.figure = Figure(figsize=(12, 8))
         self.canvas = FigureCanvas(self.figure)
@@ -446,64 +518,104 @@ class PlotWindow(QMainWindow):
             line, = self.ax.plot([], [], color=color, linewidth=1, label=metabolite)
             self._lines[metabolite] = line
 
-        self.ax.legend(loc="upper left")
-
         # Right-hand axis: overlay the Fluigent flow rate as one extra line.
         self.ax_flow = self.ax.twinx()
         self.ax_flow.set_ylabel("Flow (µL/min)", color="#b0651a")
         self.ax_flow.tick_params(axis="y", labelcolor="#b0651a")
         (self._flow_line,) = self.ax_flow.plot([], [], color="#b0651a",
-                                               linewidth=1.2, label="Flow")
+                                               linewidth=1.2, label="Flow rate")
         from collections import deque as _deque
         self._flow_time = _deque(maxlen=self.MAX_POINTS)
         self._flow_vals = _deque(maxlen=self.MAX_POINTS)
+
+        # Temperature: °C shares neither the mM nor the µL/min scale, so it gets
+        # a third spine pushed clear of the flow axis.
+        self.ax_temp = self.ax.twinx()
+        self.ax_temp.spines["right"].set_position(("outward", 52))
+        self.ax_temp.set_ylabel("Temperature (°C)", color="#7b5cd6")
+        self.ax_temp.tick_params(axis="y", labelcolor="#7b5cd6")
+        (self._temp_line,) = self.ax_temp.plot([], [], color="#7b5cd6",
+                                               linewidth=1.2, linestyle="--",
+                                               label="Temperature")
+
+        self._apply_series_visibility()
         self.figure.tight_layout()
 
-        # Connect to navigation toolbar events to detect user pan/zoom
-        # When user interacts, pause auto-scrolling
+        # Pause auto-follow the moment an interaction STARTS, not when it ends.
+        # Pausing only on release let the 2 s auto-scroll keep moving the axes
+        # underneath a zoom-rectangle drag, so the selected box was applied
+        # against shifted limits — "zoom doesn't work".
+        self.canvas.mpl_connect('button_press_event', self._on_mouse_press)
         self.canvas.mpl_connect('button_release_event', self._on_mouse_release)
-        
-        # Control buttons
-        button_layout = QHBoxLayout()
+        # Scroll wheel: zoom about the cursor (matplotlib has none built in).
+        self.canvas.mpl_connect('scroll_event', self._on_scroll_zoom)
 
-        # Sensor connect/disconnect live here (this is the Plotting tab), so the
-        # metabolite sensor is started from the same place its data shows up.
-        self.connect_sensor_btn = QPushButton("Connect Sensor")
-        self.connect_sensor_btn.setToolTip(
-            "Connect the metabolite (SIX) sensor and start recording. "
-            "Auto-picks the CP210x transmitter port.")
-        self.connect_sensor_btn.setStyleSheet(
-            "QPushButton { background:#2e7d32; color:white; font-weight:700; }"
-            "QPushButton:hover { background:#276b2a; }")
-        self.connect_sensor_btn.clicked.connect(self._on_connect_sensor)
-        button_layout.addWidget(self.connect_sensor_btn)
+    def showEvent(self, event):
+        """First time this tab is actually on screen the canvas has its real
+        size, so re-fit the margins that were computed against the placeholder."""
+        super().showEvent(event)
+        if not getattr(self, "_margins_fitted", False):
+            self._margins_fitted = True
+            self._refit_margins()
+            self.canvas.draw_idle()
 
-        self.disconnect_sensor_btn = QPushButton("Disconnect Sensor")
-        self.disconnect_sensor_btn.setToolTip("Stop recording and release the sensor port.")
-        self.disconnect_sensor_btn.setEnabled(False)
-        self.disconnect_sensor_btn.clicked.connect(self._on_disconnect_sensor)
-        button_layout.addWidget(self.disconnect_sensor_btn)
+    def _series_line(self, name):
+        """The Line2D drawing a given series."""
+        if name == "Flow":
+            return self._flow_line
+        if name == "Temperature":
+            return self._temp_line
+        return self._lines.get(name)
 
-        self.sensor_status_label = QLabel("Sensor: Not Connected")
-        self.sensor_status_label.setStyleSheet("QLabel { font-weight: 600; color: #555; }")
-        button_layout.addWidget(self.sensor_status_label)
+    def _apply_series_visibility(self):
+        """Show only the ticked traces, and hide the axis that belongs to a
+        trace that is off so its spine and tick labels go with it."""
+        for name, on in self.series_enabled.items():
+            line = self._series_line(name)
+            if line is not None:
+                line.set_visible(bool(on))
 
-        button_layout.addStretch(1)
+        # A secondary axis with nothing on it is just an unlabelled ruler.
+        flow_on = bool(self.series_enabled.get("Flow"))
+        self.ax_flow.set_visible(flow_on)
+        self.ax_temp.set_visible(bool(self.series_enabled.get("Temperature")))
+        # Only step the temperature spine out when it has the flow axis to clear;
+        # on its own it sits flush against the plot.
+        self.ax_temp.spines["right"].set_position(("outward", 52 if flow_on else 0))
 
-        self.auto_follow_btn = QPushButton("Auto-Follow")
-        self.auto_follow_btn.setToolTip("Resume auto-scrolling after pan/zoom")
-        self.auto_follow_btn.clicked.connect(self._on_auto_follow)
-        button_layout.addWidget(self.auto_follow_btn)
+        # Rebuild the legend from what is actually drawn, across all three axes.
+        handles, labels = [], []
+        for name in ("Glutamate", "Glutamine", "Glucose", "Lactate",
+                     "Temperature", "Flow"):
+            line = self._series_line(name)
+            if line is not None and self.series_enabled.get(name):
+                handles.append(line)
+                labels.append(line.get_label())
+        old = self.ax.get_legend()
+        if old is not None:
+            old.remove()
+        if handles:
+            self.ax.legend(handles, labels, loc="upper left", fontsize=8)
 
-        self.clear_btn = QPushButton("Clear Data")
-        self.clear_btn.clicked.connect(self._on_clear_data)
-        button_layout.addWidget(self.clear_btn)
+        # Re-fit the margins: the temperature spine sits 52 px outside the flow
+        # axis, so without this its tick labels fall off the right edge of the
+        # figure (and the left y-label gets clipped when they come back).
+        self._refit_margins()
 
-        self.export_btn = QPushButton("Export CSV")
-        self.export_btn.clicked.connect(self._on_export_data)
-        button_layout.addWidget(self.export_btn)
+    def _refit_margins(self):
+        """Recompute figure padding for the axes that are currently visible."""
+        try:
+            self.figure.tight_layout()
+        except Exception as e:          # tight_layout can fail on odd geometry
+            logger.debug(f"tight_layout skipped: {e}")
 
-        layout.addLayout(button_layout)
+    def _on_series_toggled(self, name: str, on: bool):
+        """Trace checkbox flipped: redraw with the new selection."""
+        self.series_enabled[name] = bool(on)
+        self._apply_series_visibility()
+        self._needs_full_redraw = True
+        self._update_plots()
+        logger.info(f"Plot series {name} {'shown' if on else 'hidden'}")
 
     def _on_auto_follow(self):
         """Resume auto-scrolling to latest data"""
@@ -517,12 +629,47 @@ class PlotWindow(QMainWindow):
         self._user_panned = False  # Resume auto-scrolling
         self._update_plots()
 
+    def _nav_tool_armed(self) -> bool:
+        """True while the toolbar's pan or zoom tool is selected."""
+        return str(self.nav_toolbar.mode) in ('pan/zoom', 'zoom rect')
+
+    def _on_mouse_press(self, event):
+        """A pan/zoom drag is starting: freeze auto-follow right now so the
+        axes hold still under the rubber band."""
+        if self._nav_tool_armed():
+            self._user_panned = True
+
     def _on_mouse_release(self, event):
         """Detect when user finishes panning/zooming"""
-        # Check if pan or zoom mode is active in the toolbar
-        if self.nav_toolbar.mode in ('pan/zoom', 'zoom rect'):
+        if self._nav_tool_armed():
             self._user_panned = True
             logger.debug("User panned - auto-scroll paused. Click 'Home' or 'Auto-Follow' to resume.")
+
+    def _on_scroll_zoom(self, event):
+        """Zoom about the cursor with the scroll wheel.
+
+        Scales x on the shared axis and y on every visible axis, each about the
+        cursor's own position in that axis's coordinates, so the three y-scales
+        (mM / µL/min / °C) stay aligned with what's under the pointer.
+        """
+        if event.inaxes is None:
+            return
+        factor = 0.8 if event.button == 'up' else 1.25
+        self._user_panned = True          # stop auto-follow fighting the zoom
+
+        def scale(lo, hi, centre):
+            return centre - (centre - lo) * factor, centre + (hi - centre) * factor
+
+        if event.xdata is not None:
+            self.ax.set_xlim(*scale(*self.ax.get_xlim(), event.xdata))
+        for axis in (self.ax, self.ax_flow, self.ax_temp):
+            if not axis.get_visible():
+                continue
+            # Cursor y in THIS axis's data coordinates (event.ydata belongs to
+            # whichever axis is on top, so convert per axis).
+            _, ydata = axis.transData.inverted().transform((event.x, event.y))
+            axis.set_ylim(*scale(*axis.get_ylim(), ydata))
+        self.canvas.draw_idle()
     
     def _on_timer_update(self):
         """Timer callback for plot updates"""
@@ -682,15 +829,23 @@ class PlotWindow(QMainWindow):
         """
         import numpy as np
 
+        # An interactive pan/zoom drag holds the canvas widgetlock. Redrawing
+        # during it erases the zoom rubber band and shifts the axes under the
+        # cursor — skip this tick, data keeps accumulating regardless.
+        if self.canvas.widgetlock.locked():
+            return
+
         # Determine data source: internal arrays or cached DataFrame
         if self._time_data:
-            # Use internal arrays (from direct callback)
+            # Use internal arrays (from direct callback). Channel 7 is the
+            # temperature, so it comes along for the Temperature trace.
             time_arr = np.array(self._time_data)
-            channels = {i: np.array(self._channel_data[i]) for i in range(1, 7)}
+            channels = {i: np.array(self._channel_data[i]) for i in range(1, 8)}
         elif not self.cached_data.empty and 'Channel 1' in self.cached_data.columns:
             # Use cached DataFrame (from file polling)
             time_arr = self.cached_data['Time'].values
-            channels = {i: self.cached_data[f'Channel {i}'].values for i in range(1, 7)}
+            channels = {i: self.cached_data[f'Channel {i}'].values
+                        for i in range(1, 8) if f'Channel {i}' in self.cached_data.columns}
         else:
             # No data
             return
@@ -716,7 +871,11 @@ class PlotWindow(QMainWindow):
         # Apply rolling window filter to time
         max_time = time_minutes.max() if len(time_minutes) > 0 else 0
 
-        if self.show_full_graph:
+        if self.show_full_graph or self._user_panned:
+            # Full data while zoomed/panned: trimming to the rolling window
+            # left blank lines when the user zoomed into anything older than
+            # the last N minutes. The axis limits (untouched during a pan)
+            # do the clipping instead.
             mask = np.ones(len(time_minutes), dtype=bool)
             x_min, x_max = 0, max(1, max_time)
         else:
@@ -734,7 +893,9 @@ class PlotWindow(QMainWindow):
         y_min, y_max = float('inf'), float('-inf')
 
         for metabolite, line in self._lines.items():
-            if metabolite in metabolites:
+            # An unticked trace contributes no data and no y-range, so the
+            # remaining traces get the full height of the axis.
+            if metabolite in metabolites and self.series_enabled.get(metabolite):
                 filtered_values = metabolites[metabolite][mask]
                 line.set_data(filtered_time, filtered_values)
 
@@ -755,67 +916,57 @@ class PlotWindow(QMainWindow):
                 padding = max(0.1, y_range * 0.1)  # At least 0.1 padding
                 self.ax.set_ylim(y_min - padding, y_max + padding)
 
+        # --- temperature on its own right-hand spine -------------------------
+        if self.series_enabled.get("Temperature") and 7 in channels:
+            temps = np.asarray(channels[7], dtype=float)[mask]
+            self._temp_line.set_data(filtered_time, temps)
+            if len(temps) > 0 and not self._user_panned:
+                lo, hi = float(np.nanmin(temps)), float(np.nanmax(temps))
+                pad = max(0.5, (hi - lo) * 0.15)
+                self.ax_temp.set_ylim(lo - pad, hi + pad)
+        else:
+            self._temp_line.set_data([], [])
+
         # --- overlay the live flow rate on the right axis --------------------
         # Keep the FULL flow history (don't trim to the window) so pressing Home /
         # showing the whole timeline displays all of it, exactly like the
         # metabolites. The shared x-axis limits clip it to the visible window.
+        #
+        # The source is the Flow Control tab's live sensor reading via
+        # main_gui.flow_reading() -- the same value that tab plots and that the
+        # sensor reader appends to each row of the metabolite log as the trailing
+        # flow_uL_min column. So both tabs show one number from one sensor, and
+        # the saved file keeps it even if this window is never opened.
         flow_val = None
         if getattr(self, "main_gui", None) is not None:
             try:
                 flow_val, _c = self.main_gui.flow_reading()
             except Exception:
                 flow_val = None
+        # Keep recording flow even while the trace is hidden, so ticking it back
+        # on shows the history rather than starting from a blank line.
         if flow_val is not None and len(filtered_time) > 0:
             self._flow_time.append(float(filtered_time[-1]))
             self._flow_vals.append(float(flow_val))
-        if len(self._flow_time) > 0:
+        if self.series_enabled.get("Flow") and len(self._flow_time) > 0:
             ft = np.array(self._flow_time); fv = np.array(self._flow_vals)
             self._flow_line.set_data(ft, fv)
-            # scale the right axis to the flow that is actually visible right now
-            visible = fv[ft >= x_min]
-            ref = visible if len(visible) else fv
-            lo, hi = float(np.nanmin(ref)), float(np.nanmax(ref))
-            pad = max(1.0, (hi - lo) * 0.15)
-            self.ax_flow.set_ylim(lo - pad, hi + pad)
+            # Scale the right axis to the flow actually visible right now —
+            # but NOT while the user holds a zoom/pan: rescaling here every
+            # 2 s silently un-zoomed the flow axis while the left axis kept
+            # the user's view.
+            if not self._user_panned:
+                visible = fv[ft >= x_min]
+                ref = visible if len(visible) else fv
+                lo, hi = float(np.nanmin(ref)), float(np.nanmax(ref))
+                pad = max(1.0, (hi - lo) * 0.15)
+                self.ax_flow.set_ylim(lo - pad, hi + pad)
         else:
             self._flow_line.set_data([], [])
 
         # Use draw_idle for deferred rendering (more efficient)
         self.canvas.draw_idle()
 
-    def _on_clear_data(self):
-        """
-        Clear PLOT display only - does NOT affect the sensor log file.
-        The sensor continues recording to the same file in the background.
-        After clear, the plot shows only new data from this point onwards.
-        """
-        # Clear display-related caches (NOT the sensor file!)
-        self.cached_data = pd.DataFrame()
-        self.full_data = pd.DataFrame()
-        self.last_file_position = 0
-        self.last_line_count = 0
-        self.header_lines_skipped = False
-        self.loaded_file_path = None
-        self.show_full_graph = False
-        self._user_panned = False
-
-        # Clear internal plot arrays - sensor file continues unaffected
-        self._clear_data_arrays()
-
-        # Reset line data on plot
-        for line in self._lines.values():
-            line.set_data([], [])
-        # Clear the flow overlay history too, so it matches the metabolites
-        if hasattr(self, "_flow_time"):
-            self._flow_time.clear(); self._flow_vals.clear()
-            self._flow_line.set_data([], [])
-
-        self.ax.set_xlim(0, self.rolling_window_minutes)
-        self.ax.set_ylim(0, 1)
-
-        self.canvas.draw_idle()
-        logger.info("Plot display cleared (sensor file continues recording)")
-    
     def _on_export_data(self):
         """
         Export what's currently shown on the plot to CSV.
@@ -1094,11 +1245,8 @@ class PlotWindow(QMainWindow):
             logger.info(f"Calibration updated from PlotWindow: {values}")
 
     def update_sensor_status(self, connected: bool, port: str = None, detail: str = ""):
-        """Update the sensor buttons, status label and menu entries together."""
+        """Update the sensor buttons and status label together."""
         if connected:
-            self.sensor_status_action.setText(f"Status: Connected ({port})")
-            self.connect_sensor_action.setEnabled(False)
-            self.disconnect_sensor_action.setEnabled(True)
             self.connect_sensor_btn.setEnabled(False)
             self.disconnect_sensor_btn.setEnabled(True)
             text = f"Sensor: {port}" + (f" — {detail}" if detail else "")
@@ -1106,9 +1254,6 @@ class PlotWindow(QMainWindow):
             self.sensor_status_label.setStyleSheet(
                 "QLabel { font-weight: 600; color: #2e7d32; }")
         else:
-            self.sensor_status_action.setText("Status: Not Connected")
-            self.connect_sensor_action.setEnabled(True)
-            self.disconnect_sensor_action.setEnabled(False)
             self.connect_sensor_btn.setEnabled(True)
             self.disconnect_sensor_btn.setEnabled(False)
             self.sensor_status_label.setText("Sensor: Not Connected" + (f" — {detail}" if detail else ""))
@@ -1492,6 +1637,14 @@ class AsyncAMUZAGUI(QMainWindow):
         # Plot window
         self.plot_window: Optional[PlotWindow] = None
         
+        # Safety net for the run buttons. _refresh_run_buttons() is called at
+        # every state change, but this guarantees that a Start button left
+        # greyed out by a path nobody predicted comes back within a couple of
+        # seconds instead of needing a reconnect or a restart.
+        self.button_state_timer = QTimer()
+        self.button_state_timer.timeout.connect(self._refresh_run_buttons)
+        self.button_state_timer.start(2000)
+
         # Experiment timer
         self.experiment_timer = QTimer()
         self.experiment_timer.timeout.connect(self._update_experiment_timer)
@@ -1610,25 +1763,28 @@ class AsyncAMUZAGUI(QMainWindow):
         self.grid_widget.well_dragged.connect(self._on_well_dragged)
         self.grid_widget.drag_finished.connect(self._on_well_released)
 
-        # Selection buttons sit directly beside the plate
-        grid_row = QHBoxLayout()
-        grid_row.addStretch(1)
-        grid_row.addWidget(self.grid_widget, alignment=Qt.AlignVCenter)
+        center_col.addWidget(self.grid_widget, alignment=Qt.AlignHCenter)
 
-        grid_side = QVBoxLayout()
-        grid_side.addStretch(1)
+        # Selection buttons sit under the plate: fixed width and pushed apart by
+        # stretches, so they stay two distinct buttons instead of stretching to
+        # fill the row.
+        sel_row = QHBoxLayout()
+        sel_row.setContentsMargins(0, 8, 0, 8)
         self.select_all_btn = QPushButton("Select All Wells")
         self.select_all_btn.setToolTip("Select every well (A1-H12) for the sampling sequence.")
+        self.select_all_btn.setFixedWidth(UI.BUTTON_MAX_WIDTH)
         self.select_all_btn.clicked.connect(self._select_all_wells)
-        grid_side.addWidget(self.select_all_btn)
-        clear_btn = QPushButton("Clear Selection")
-        clear_btn.setToolTip("Clear blue (sampling) and green (move) selections.")
-        clear_btn.clicked.connect(self._clear_selections)
-        grid_side.addWidget(clear_btn)
-        grid_side.addStretch(1)
-        grid_row.addLayout(grid_side)
-        grid_row.addStretch(1)
-        center_col.addLayout(grid_row)
+        self.clear_sel_btn = QPushButton("Clear Selection")
+        self.clear_sel_btn.setToolTip("Clear blue (sampling) and green (move) selections.")
+        self.clear_sel_btn.setFixedWidth(UI.BUTTON_MAX_WIDTH)
+        self.clear_sel_btn.clicked.connect(self._clear_selections)
+
+        sel_row.addStretch(2)
+        sel_row.addWidget(self.select_all_btn)
+        sel_row.addStretch(3)          # wider gap between them than at the edges
+        sel_row.addWidget(self.clear_sel_btn)
+        sel_row.addStretch(2)
+        center_col.addLayout(sel_row)
 
         # Display log below clear button
         self.display = QTextEdit()
@@ -1678,7 +1834,49 @@ class AsyncAMUZAGUI(QMainWindow):
         self.tabs.addTab(self.plot_window, "Plotting")
         self.plot_window.update_sensor_status(False)
 
+        # Big red SHUTDOWN in the top-right of the tab strip, above every tab.
+        #
+        # Deliberately NOT QTabWidget.setCornerWidget(): Qt sizes the corner slot
+        # from leftovers, and at this window width it gave the button ~16 px, so
+        # all that showed was a red sliver hanging off the edge. A plain child of
+        # the tab widget, positioned by hand in _place_safe_exit_btn() and kept
+        # there by an event filter on resize, always lands where intended.
+        self.btn_safe_exit = QPushButton("✕  SHUTDOWN", self.tabs)
+        self.btn_safe_exit.setCursor(Qt.PointingHandCursor)
+        self.btn_safe_exit.setToolTip(
+            "SAFE SHUTDOWN — stop the pump, release the flow sensor, disconnect "
+            "the AMUZA, flush and stop the metabolite sensor.")
+        self.btn_safe_exit.setStyleSheet(
+            "QPushButton{background:#e5484d;color:white;font-size:13px;font-weight:800;"
+            "border:none;border-radius:5px;padding:0px 12px;}"
+            "QPushButton:hover{background:#ff5a5f;}"
+            "QPushButton:pressed{background:#b3383c;}")
+        self.btn_safe_exit.clicked.connect(self._on_safe_shutdown_clicked)
+        self.tabs.installEventFilter(self)          # keep it pinned on resize
+        QTimer.singleShot(0, self._place_safe_exit_btn)
+
         self.setCentralWidget(self.tabs)
+
+    def _place_safe_exit_btn(self):
+        """Pin the red button to the top-right of the tab strip.
+
+        Height follows the tab bar so it reads as part of that strip rather than
+        floating over the page, and the right edge keeps a small inset so it is
+        never flush against (or clipped by) the window border."""
+        btn = getattr(self, "btn_safe_exit", None)
+        if btn is None:
+            return
+        bar_h = max(26, self.tabs.tabBar().sizeHint().height())
+        btn.resize(btn.sizeHint().width() + 6, bar_h - 4)
+        btn.move(max(0, self.tabs.width() - btn.width() - 6), 2)
+        btn.raise_()
+        btn.show()
+
+    def eventFilter(self, obj, event):
+        if obj is getattr(self, "tabs", None) and event.type() in (
+                QEvent.Resize, QEvent.Show, QEvent.LayoutRequest):
+            self._place_safe_exit_btn()
+        return super().eventFilter(obj, event)
 
     def _on_flow_clog(self, clogged: bool):
         """Surface a flow-line clog in the main display log."""
@@ -1748,6 +1946,8 @@ class AsyncAMUZAGUI(QMainWindow):
             tab.exp_running.emit(True)      # light up the Stop-experiment button
         task = asyncio.create_task(self._run_experiment_runs_task(runs))
         self.task_manager.add_task(task, "experiment_runs")
+        self._watch_run_task(task)
+        self._refresh_run_buttons()
 
     def stop_experiment(self):
         """Halt a running multi-run experiment: set the stop flag so the run loop
@@ -2017,11 +2217,7 @@ class AsyncAMUZAGUI(QMainWindow):
                 self.status_label.setText(f"AMUZA: {selected_machine}")
                 self.connect_btn.setText("Disconnect")
                 self.connect_btn.setEnabled(True)
-                self.insert_btn.setEnabled(True)
-                self.eject_btn.setEnabled(True)
-                self.move_btn.setEnabled(True)
-                self.start_btn.setEnabled(True)
-                self.stop_btn.setEnabled(True)
+                self._refresh_run_buttons()
                 self.add_to_display(f"Connected to {selected_machine}.")
                 logger.info(f"Connected to AMUZA ({selected_machine}, device={device_name})")
             else:
@@ -2053,17 +2249,53 @@ class AsyncAMUZAGUI(QMainWindow):
             self.status_label.setText("AMUZA: Disconnected")
             self.connect_btn.setText("Connect to AMUZA")
             self.connect_btn.setEnabled(True)
-            self.insert_btn.setEnabled(False)
-            self.eject_btn.setEnabled(False)
-            self.move_btn.setEnabled(False)
-            self.start_btn.setEnabled(False)
-            self.stop_btn.setEnabled(False)
+            self._refresh_run_buttons()
             self.add_to_display("Disconnected from AMUZA.")
             logger.info("Disconnected from AMUZA")
 
         except Exception as e:
             logger.error(f"Disconnect error: {e}")
             self.add_to_display(f"Disconnect error: {e}")
+
+    # Tracked task names that mean "the plate is busy". Start/Move/Insert/Eject
+    # stay out until every one of them has finished.
+    RUN_TASK_NAMES = ("sampling_sequence", "move_sequence", "experiment_runs")
+
+    def _sequence_running(self) -> bool:
+        """True while a sampling, move or experiment task is still alive."""
+        return any(t.get_name() in self.RUN_TASK_NAMES and not t.done()
+                   for t in self.task_manager.get_running_tasks())
+
+    def _refresh_run_buttons(self):
+        """Derive the run buttons from the state that actually exists.
+
+        Start used to be re-enabled from exactly one place -- the `finally` of
+        _execute_sequence -- while five different places disabled it. Any path
+        that switched it off without reaching that finally (an exception raised
+        between disabling it and the task starting, a task cancelled before its
+        body ever ran, a dropped AMUZA connection) left it greyed out with no
+        way back except reconnecting. Computing the state instead of toggling it
+        means every one of those paths recovers on the next refresh.
+        """
+        if not hasattr(self, "start_btn"):
+            return          # timer can outpace _init_ui on a slow first paint
+        connected = bool(self.connection and getattr(self.connection, "is_connected", False))
+        running = self._sequence_running()
+        idle = connected and not running
+        for b in (self.start_btn, self.move_btn, self.insert_btn, self.eject_btn):
+            b.setEnabled(idle)
+        # STOP is only meaningful with something to stop, or a paused run to resume.
+        self.stop_btn.setEnabled(connected and (running or self.is_paused))
+
+    def _watch_run_task(self, task):
+        """Refresh the buttons once `task` is done.
+
+        Deliberately a done-callback rather than a line in the task's own
+        `finally`: inside the finally the task is still running, so it would
+        still count as busy. This also fires when a task is cancelled before its
+        body executes, which is the case no `finally` can cover.
+        """
+        task.add_done_callback(lambda _t: self._refresh_run_buttons())
 
     def _on_amuza_timeout(self, command: str, attempts: int):
         """Called when AMUZA command times out after all retries"""
@@ -2293,12 +2525,11 @@ class AsyncAMUZAGUI(QMainWindow):
         # Reset first well timing for this segment
         self.first_well_start_time = time.time()
 
-        self.start_btn.setEnabled(False)
-        self.stop_btn.setEnabled(True)
-
         # Run in background task
         task = asyncio.create_task(self._execute_sequence(sequence))
         self.task_manager.add_task(task, "sampling_sequence")
+        self._watch_run_task(task)
+        self._refresh_run_buttons()
 
     @asyncSlot()
     async def _on_start(self):
@@ -2309,6 +2540,15 @@ class AsyncAMUZAGUI(QMainWindow):
             if not wells:
                 QMessageBox.warning(self, "No Wells", "Please select wells to sample")
                 return
+
+            # A fresh Start replaces whatever a previous STOP left parked --
+            # say so, rather than silently dropping the wells that were queued.
+            if self.is_paused and self.remaining_wells:
+                self.add_to_display(
+                    f"Starting fresh — discarding the {len(self.remaining_wells)} "
+                    f"well(s) left from the stopped run.")
+                logger.info(f"Fresh start overrides {len(self.remaining_wells)} paused wells")
+            self.remaining_wells = []
 
             # Clear any previous stop state and ensure clean start
             await self.app_state.clear_stop()
@@ -2356,17 +2596,21 @@ class AsyncAMUZAGUI(QMainWindow):
                 sequence.add_method(method)
 
             # Execute sequence
-            self.start_btn.setEnabled(False)
-            self.stop_btn.setEnabled(True)
             self.add_to_display(f"Running plate on wells: {', '.join(wells_list)}")
 
             # Run in background task
             task = asyncio.create_task(self._execute_sequence(sequence))
             self.task_manager.add_task(task, "sampling_sequence")
+            self._watch_run_task(task)
+            self._refresh_run_buttons()
 
         except Exception as e:
             logger.error(f"Start error: {e}")
             QMessageBox.critical(self, "Error", f"Failed to start: {e}")
+        finally:
+            # Whatever happened above, the buttons must match reality -- a throw
+            # part-way through used to leave Start greyed out for good.
+            self._refresh_run_buttons()
     
     async def _execute_sequence(self, sequence: Sequence):
         """Execute sampling sequence with real-time well completion updates"""
@@ -2508,10 +2752,11 @@ class AsyncAMUZAGUI(QMainWindow):
             self._reset_stop_button()
 
         finally:
-            self.start_btn.setEnabled(True)
-            # Only disable stop button if sequence fully completed (not paused)
-            if not self.is_paused:
-                self.stop_btn.setEnabled(False)
+            # The task is still executing right here, so this alone cannot
+            # re-enable Start -- the done-callback from _watch_run_task does
+            # that once it is genuinely finished. Called anyway so the nested
+            # experiment case (which awaits this inline) stays consistent.
+            self._refresh_run_buttons()
             if getattr(self, "flow_tab", None) is not None:
                 self.flow_tab.set_experiment_phase("idle", 0)
 
@@ -2799,8 +3044,10 @@ class AsyncAMUZAGUI(QMainWindow):
             # Pause the experiment timer
             self.experiment_timer.stop()
 
+            self._refresh_run_buttons()
             logger.info("Stop requested - will finish current well then pause")
-            self.add_to_display("STOPPED - Finishing current well, then pausing. Press RESUME to continue.")
+            self.add_to_display("STOPPED - Finishing current well, then pausing. "
+                                "Press RESUME to continue, or Start Sampling for a new run.")
         else:
             # RESUME: Continue from remaining wells
             if not self.remaining_wells:
@@ -2829,6 +3076,7 @@ class AsyncAMUZAGUI(QMainWindow):
         self.is_paused = False
         self.stop_btn.setText("STOP")
         self.stop_btn.setStyleSheet("QPushButton { background:#e53935; color:white; font-weight:700; } QPushButton:hover{ background:#d32f2f; }")
+        self._refresh_run_buttons()
 
     def _init_well_log(self):
         """Initialize well completion log file with header (only when sensor is logging)"""
@@ -3032,14 +3280,15 @@ class AsyncAMUZAGUI(QMainWindow):
                 method = Method(pos=well_id, wait=t_sampling, buffer_time=t_buffer, eject=False, insert=False)
                 sequence.add_method(method)
 
-            self.start_btn.setEnabled(False)
-            self.stop_btn.setEnabled(True)
             self.add_to_display(f"Moving to wells: {', '.join(wells_list)}")
             task = asyncio.create_task(self._execute_sequence(sequence))
             self.task_manager.add_task(task, "move_sequence")
+            self._watch_run_task(task)
         except Exception as e:
             logger.error(f"Move error: {e}")
             QMessageBox.critical(self, "Error", f"Move failed: {e}")
+        finally:
+            self._refresh_run_buttons()
     
     def _on_show_plot(self):
         """Bring the Plotting tab to the front."""
@@ -3344,16 +3593,108 @@ class AsyncAMUZAGUI(QMainWindow):
         height = self.height()
         self.size_label.setText(f"Window: {width} × {height}")
     
+    # ------------------------------------------------------- safe shutdown
+    # Nothing here may depend on the asyncio loop still running: the paths that
+    # matter most (a crash, a SIGTERM, the window manager's X) are exactly the
+    # ones where it is already gone. Anything that must happen — above all
+    # STOPPING THE PUMP — is done with plain blocking calls.
+
+    def safe_shutdown_sync(self, reason="") -> list:
+        """Put every piece of hardware in a safe state, synchronously.
+
+        Order is by consequence of being left running:
+        pump (syringes driving into a closed line) -> AMUZA (needle in a well,
+        and the Bluetooth socket held open so the next launch cannot connect)
+        -> metabolite sensor (buffered readings not yet on disk).
+
+        Idempotent, never raises, safe to call from a signal handler or atexit.
+        Returns the log lines it produced."""
+        if getattr(self, "_shutdown_done", False):
+            return []
+        self._shutdown_done = True
+        notes = [f"SAFE SHUTDOWN{(' — ' + reason) if reason else ''}"]
+
+        # 1. Pump first — the only thing here that can damage anything.
+        tab = getattr(self, "flow_tab", None)
+        if tab is not None:
+            try:
+                notes += [f"  flow: {n}" for n in (tab.safe_shutdown(reason) or [])]
+            except Exception as e:
+                notes.append(f"  flow: SHUTDOWN ERROR: {e}")
+
+        # 2. AMUZA. The async disconnect unwinds its reader tasks properly, so
+        # prefer it; but it needs a live loop, so fall back to setting the stop
+        # event and closing the socket by hand. Either way the port is released.
+        if self.connection is not None:
+            try:
+                self.connection.stop_event.set()
+            except Exception:
+                pass
+            scheduled = False
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    loop.create_task(self._disconnect_amuza())
+                    scheduled = True
+            except Exception:
+                pass
+            if scheduled:
+                notes.append("  AMUZA: disconnect started")
+            else:
+                try:
+                    if getattr(self.connection, "socket", None):
+                        self.connection.socket.close()
+                    self.connection.is_connected = False
+                    notes.append("  AMUZA: socket closed")
+                except Exception as e:
+                    notes.append(f"  AMUZA: close error: {e}")
+
+        # 3. Metabolite sensor — stop_event makes the reader flush and close its
+        # file, which is what actually protects the data.
+        if self.sensor_reader is not None:
+            try:
+                self.sensor_reader.stop_event.set()
+                notes.append("  metabolite sensor: stop requested (file flushed)")
+            except Exception as e:
+                notes.append(f"  metabolite sensor: stop error: {e}")
+
+        for line in notes:
+            logger.info(line)
+            try:
+                self.add_to_display(line)
+            except Exception:
+                pass
+        return notes
+
+    def _on_safe_shutdown_clicked(self):
+        """The red ✕ in the corner of the tab bar."""
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("Safe shutdown")
+        box.setText("<b>Safe shutdown</b>")
+        box.setInformativeText(
+            "Stops the pump, releases the flow sensor, disconnects the AMUZA and "
+            "stops the metabolite sensor (flushing its file).<br><br>"
+            "Close MABIP afterwards, or keep the window open?")
+        b_close = box.addButton("Shut down && close", QMessageBox.AcceptRole)
+        b_hw = box.addButton("Shutdown hardware only", QMessageBox.ApplyRole)
+        box.addButton("Cancel", QMessageBox.RejectRole)
+        box.setDefaultButton(b_close)
+        box.exec_()
+        clicked = box.clickedButton()
+        if clicked is b_close:
+            self.safe_shutdown_sync("red ✕ pressed")
+            self.close()
+        elif clicked is b_hw:
+            self.safe_shutdown_sync("red ✕ pressed — hardware only")
+            # Not an app exit, so allow a later shutdown to run again.
+            self._shutdown_done = False
+
     def closeEvent(self, event):
-        """Handle window close - ensure sensor stops saving"""
-        logger.info("Main window closing - stopping sensor")
+        """Window closing — safe the hardware before anything else."""
+        logger.info("Main window closing — running safe shutdown")
+        self.safe_shutdown_sync("window closed")
 
-        # Stop sensor reader synchronously to ensure file is flushed
-        if self.sensor_reader and self.sensor_reader.is_running:
-            self.sensor_reader.stop_event.set()
-            self.add_to_display("Stopping sensor on application close...")
-
-        # Close plot window
         if self.plot_window:
             self.plot_window.close()
 
@@ -3362,6 +3703,10 @@ class AsyncAMUZAGUI(QMainWindow):
     async def cleanup(self):
         """Cleanup resources"""
         logger.info("Cleaning up GUI resources")
+
+        # Hardware first, in case we got here without a closeEvent (idempotent,
+        # so a normal close has already done it and this is a no-op).
+        self.safe_shutdown_sync("cleanup")
 
         # Cancel all tasks
         await self.task_manager.cancel_all_tasks()
@@ -3409,6 +3754,12 @@ async def async_main():
     gui = AsyncAMUZAGUI(app_state, task_manager)
     gui.show()
 
+    # Ctrl-C / SIGTERM (logout, `kill`, a script stopping us) never reaches
+    # closeEvent, so wire them to the same sequence. Last resort: atexit, which
+    # still runs on an unhandled exception — a crash must not leave syringes
+    # pushing into the line.
+    _install_shutdown_hooks(gui)
+
     # Wait for window to close
     try:
         while gui.isVisible():
@@ -3417,6 +3768,42 @@ async def async_main():
         # Save settings before closing
         await app_state.save_settings()
         await gui.cleanup()
+
+
+def _install_shutdown_hooks(gui):
+    """Route process-level exits through the GUI's safe-shutdown sequence."""
+    import atexit
+    import signal
+
+    def _bail(signum, _frame):
+        name = signal.Signals(signum).name if hasattr(signal, "Signals") else signum
+        try:
+            gui.safe_shutdown_sync(f"{name} received")
+        finally:
+            try:
+                gui.close()          # unblocks async_main -> cleanup()
+            except Exception:
+                pass
+            app = QApplication.instance()
+            if app is not None:
+                app.quit()
+
+    for sig in (signal.SIGINT, signal.SIGTERM, getattr(signal, "SIGHUP", None)):
+        if sig is None:
+            continue
+        try:
+            signal.signal(sig, _bail)
+        except (ValueError, OSError):
+            pass                     # not the main thread / unsupported here
+
+    atexit.register(lambda: gui.safe_shutdown_sync("process exiting"))
+
+    # Python's signal handlers only run between bytecodes, and Qt can sit inside
+    # C for a long time. This timer hands control back to the interpreter often
+    # enough that Ctrl-C is acted on immediately rather than at the next click.
+    gui._sig_timer = QTimer(gui)
+    gui._sig_timer.timeout.connect(lambda: None)
+    gui._sig_timer.start(200)
 
 
 def main():

@@ -3,6 +3,7 @@ Configuration constants for MABIP system.
 Centralizes all magic numbers and settings.
 """
 import os
+import sys
 from dataclasses import dataclass
 from typing import Dict
 
@@ -12,6 +13,14 @@ from typing import Dict
 # to cwd, which scattered logs between MABIP/Sensor_Readings (launched from the
 # repo root) and refactored/Sensor_Readings (launched from refactored/).
 _APP_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# Frozen (PyInstaller) builds run from a bundle directory that must not hold
+# user data; write to a visible per-user folder instead. Unfrozen runs are
+# unchanged.
+if getattr(sys, "frozen", False):
+    _DATA_DIR = os.path.join(os.path.expanduser("~"), "MABIP_Data")
+else:
+    _DATA_DIR = _APP_DIR
 
 @dataclass
 class HardwareConfig:
@@ -136,12 +145,12 @@ class SensorConfig:
 @dataclass
 class FileConfig:
     """File I/O and logging settings."""
-    # Folders — anchored to the app directory (see _APP_DIR) so every run's logs
-    # land in ONE consistent place (refactored/Sensor_Readings), regardless of
-    # the working directory the app happens to be launched from.
-    SENSOR_READINGS_FOLDER: str = os.path.join(_APP_DIR, "Sensor_Readings")
-    AMUZA_LOGS_FOLDER: str = os.path.join(_APP_DIR, "Amuza_Logs")
-    OUTPUT_FILE_PATH: str = os.path.join(_APP_DIR, "Sensor_Readings", "output.csv")
+    # Folders — anchored to _DATA_DIR (app dir, or ~/MABIP_Data when frozen) so
+    # every run's logs land in ONE consistent place regardless of the working
+    # directory the app happens to be launched from.
+    SENSOR_READINGS_FOLDER: str = os.path.join(_DATA_DIR, "Sensor_Readings")
+    AMUZA_LOGS_FOLDER: str = os.path.join(_DATA_DIR, "Amuza_Logs")
+    OUTPUT_FILE_PATH: str = os.path.join(_DATA_DIR, "Sensor_Readings", "output.csv")
     SETTINGS_FOLDER: str = ".mabip"  # In user home directory
 
     # File formats

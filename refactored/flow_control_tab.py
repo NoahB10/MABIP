@@ -38,7 +38,8 @@ for p in (_HW, os.path.join(_PC, "fgt-SDK", "Python"), _PC):
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QFormLayout, QGroupBox,
     QPushButton, QLineEdit, QLabel, QComboBox, QFrame, QCheckBox,
-    QDialog, QDialogButtonBox, QButtonGroup, QMessageBox, QFileDialog, QPlainTextEdit)
+    QDialog, QDialogButtonBox, QButtonGroup, QMessageBox, QFileDialog, QPlainTextEdit,
+    QStackedWidget)
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
@@ -48,6 +49,20 @@ ACCENT = "#2f81f7"; RED = "#e5484d"; GREEN = "#2ea043"; AMBER = "#d9a406"; MUTED
 
 
 from experiment_parse import parse_experiment, num_list as _num_list
+
+
+def _sensor_readings_dir():
+    """Writable Sensor_Readings folder. Frozen (PyInstaller) builds must not
+    write inside the bundle directory, so when config is unavailable fall back
+    to ~/MABIP_Data instead of the module's own folder."""
+    try:
+        from config import FILES
+        return FILES.SENSOR_READINGS_FOLDER
+    except Exception:
+        base = (os.path.join(os.path.expanduser("~"), "MABIP_Data")
+                if getattr(sys, "frozen", False)
+                else os.path.dirname(os.path.abspath(__file__)))
+        return os.path.join(base, "Sensor_Readings")
 
 
 class _SignedSensor:
@@ -89,7 +104,8 @@ class FlowDefinitionsDialog(QDialog):
         ("b_backflow_s", "Burst backflow (s)"), ("b_backflow_rate", "Burst backflow rate (µL/min, 0=baseline)"),
         ("b_settle_base_s", "Burst settle base (s)"), ("b_settle_k", "Burst settle k (s·µL/min)"),
         ("b_settle_tol", "Burst steady tol (µL/min)"), ("b_settle_hold", "Burst steady hold (s)"),
-        ("flow_sign", "Sensor: positive direction (+1 / -1)"),
+        # flow_sign is not here: it is the "flip" checkbox below the columns,
+        # since +1/-1 in a text box reads worse than a tick box.
         ("clog_frac", "Clog: flow-below frac (0-1)"), ("clog_seconds", "Clog: sustained (s)"),
         ("clog_arm_frac", "Clog: arm at frac of setpoint (0-1)"),
         ("clog_arm_timeout_s", "Clog: startup budget before warning (s)"),
@@ -143,6 +159,29 @@ class FlowDefinitionsDialog(QDialog):
         cols.addLayout(form_l); cols.addLayout(form_r)
         lay.addLayout(cols)
 
+        # Sensor sign: a tick box, not a +1/-1 field, so which way is "positive"
+        # is a yes/no question rather than a number to get wrong.
+        self.chk_flip = QCheckBox("Flip flow sensor direction — invert the +/- of every reading")
+        self.chk_flip.setToolTip(
+            "Off: the sensor already reads POSITIVE when the line flows forward.\n"
+            "On: it is plumbed the other way round, so readings are negated at the "
+            "source — plot, readout, flow log, burst triggers and calibration all "
+            "then agree that forward flow is positive.\n"
+            "Takes effect on the next sample, even while connected.")
+        self.chk_flip.setChecked(float(cfg.get("flow_sign", 1.0)) < 0)
+        self.chk_flip.setStyleSheet("QCheckBox{font-weight:600;padding-top:6px;}")
+        lay.addWidget(self.chk_flip)
+
+        # Dev mode: the one switch on this dialog that changes what the TAB shows,
+        # so it sits apart from the numeric fields rather than lost among them.
+        self.chk_dev = QCheckBox("Developer mode — show bench controls "
+                                 "(Run volume, Ramp, load/run/stop experiment)")
+        self.chk_dev.setToolTip("Off: only the controls used for a normal run. "
+                                "On: adds the experiment-authoring and bench-test buttons.")
+        self.chk_dev.setChecked(bool(cfg.get("dev_mode", False)))
+        self.chk_dev.setStyleSheet("QCheckBox{font-weight:600;padding-top:6px;}")
+        lay.addWidget(self.chk_dev)
+
         bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         bb.accepted.connect(self.accept); bb.rejected.connect(self.reject)
         lay.addWidget(bb)
@@ -157,6 +196,8 @@ class FlowDefinitionsDialog(QDialog):
                     out[k] = float(w.text())
                 except ValueError:
                     pass
+        out["flow_sign"] = -1.0 if self.chk_flip.isChecked() else 1.0
+        out["dev_mode"] = bool(self.chk_dev.isChecked())
         out["n"] = 2 if self._syr[2].isChecked() else 1
         return out
 
@@ -189,6 +230,7 @@ class FlowControlTab(QWidget):
         self._arm_warned = False         # one-shot "never got going" warning
         self._busy = False
         self._abort = False
+        self._shutdown_done = False      # safe_shutdown latch; cleared on reconnect
         # burst / experiment-phase gating
         self._phase = "idle"             # 'idle' | 'buffer' | 'well'
         self._n_wells = 0
@@ -229,7 +271,12 @@ class FlowControlTab(QWidget):
             # Arming: the watch judges nothing until the sensor has reached
             # clog_arm_frac of setpoint at least once since the flow command. Above
             # clog_frac so establishing flow and losing it cannot chatter.
-            "clog_arm_frac": 0.8, "clog_arm_timeout_s": 120.0,
+            #
+            # 0.5, not 0.8: air leaking into the line means this rig routinely
+            # settles well short of the commanded rate, so an 80% bar was never
+            # cleared on a healthy run and the "FLOW NEVER STARTED" banner fired
+            # on rigs that were working as well as they ever do.
+            "clog_arm_frac": 0.5, "clog_arm_timeout_s": 120.0,
             "metab_window": 12.0, "metab_thresh": 0.15,
             # clog-clearing escalation (Strategy 1 forward burst -> Strategy 2 reverse push).
             # Sequence: N forward bursts to completion, wait, then reverse-push attempts.
@@ -260,6 +307,14 @@ class FlowControlTab(QWidget):
             # closed-loop settle: reach the specified flow (sensor) before a run starts
             "exp_settle": True, "exp_settle_max_var": 5.0, "exp_settle_hold": 5.0,
             "exp_settle_timeout": 120.0, "exp_settle_bump": 5.0,
+            # Dev mode reveals the bench/experiment-authoring controls (Run
+            # volume, Ramp, and the load/run/stop experiment buttons). Day-to-day
+            # plate runs are driven from the Sampling tab, so they are hidden by
+            # default to keep this panel to the controls actually used.
+            "dev_mode": False,
+            # One burst per buffer entry during a run, on by default. Bursts are
+            # phase-gated regardless of this switch — never mid-well.
+            "auto_burst": True,
         }
         self._load_cfg()   # restore saved definitions/fields over the defaults
 
@@ -282,27 +337,33 @@ class FlowControlTab(QWidget):
 
         # ---- left controls
         left = QVBoxLayout(); left.setSpacing(8)
-        conn1 = QHBoxLayout()
+        # Status pill ABOVE its button, both full width: side by side, a 268 px
+        # column left the buttons too narrow and clipped "Disconnect sensor".
+        conn1 = QVBoxLayout(); conn1.setSpacing(3)
         self.pill_pump = QLabel()
         self.btn_pump = QPushButton("Connect pump")
         self.btn_pump.setStyleSheet(f"QPushButton{{background:{ACCENT};color:white;}}")
         self.btn_pump.clicked.connect(self._connect_pump)
         self.btn_pump.setToolTip("Connect / disconnect the Chemyx syringe pump. Works with NO flow sensor.")
-        conn1.addWidget(self.pill_pump); conn1.addStretch(1); conn1.addWidget(self.btn_pump)
+        conn1.addWidget(self.pill_pump); conn1.addWidget(self.btn_pump)
         left.addLayout(conn1)
-        conn2 = QHBoxLayout()
+        conn2 = QVBoxLayout(); conn2.setSpacing(3)
         self.pill_sensor = QLabel()
         self.btn_sensor = QPushButton("Connect sensor")
         self.btn_sensor.clicked.connect(self._connect_sensor)
         self.btn_sensor.setToolTip("Connect / disconnect the Fluigent flow sensor (OPTIONAL). "
                                    "Enables live plotting, flow logging, clog detection, and Ramp/Calibrate/Verify.")
-        conn2.addWidget(self.pill_sensor); conn2.addStretch(1); conn2.addWidget(self.btn_sensor)
+        conn2.addWidget(self.pill_sensor); conn2.addWidget(self.btn_sensor)
         left.addLayout(conn2)
         self._set_pill(self.pill_pump, False, "pump")
         self._set_pill(self.pill_sensor, False, "sensor")
 
         params = QGroupBox("Run parameters")
         pf = QFormLayout(params); pf.setVerticalSpacing(6)
+        # Label above field, not beside it. Side by side, label + entry could not
+        # both fit the 268 px column and Qt resolved it by squeezing the label
+        # column to zero width, leaving unlabelled boxes.
+        pf.setRowWrapPolicy(QFormLayout.WrapAllRows)
         sf = getattr(self, "_saved_fields", {})
         self.f_rate = QLineEdit(sf.get("rate", "5"))
         self.f_vol = QLineEdit(sf.get("vol", "1000"))
@@ -314,6 +375,9 @@ class FlowControlTab(QWidget):
         pf.addRow("Flow rate (µL/min, line)", self.f_rate)
         pf.addRow("Run volume (µL, line)", self.f_vol)
         pf.addRow("Target sensor (µL/min)", self.f_target)
+        # The Run-volume field only feeds the dev-only 'Run volume' button, so it
+        # hides with it (label included).
+        self._vol_label = pf.labelForField(self.f_vol)
         self.f_target.textChanged.connect(self._sync_target)
         for _f in (self.f_rate, self.f_vol, self.f_target):
             _f.editingFinished.connect(self._save_cfg)   # remember the run params
@@ -324,7 +388,8 @@ class FlowControlTab(QWidget):
         self.chk_pull = QPushButton()
         self.chk_pull.setCheckable(True)
         self.chk_pull.setChecked(self.cfg["direction"] == "withdraw")
-        self.chk_pull.setMinimumHeight(38)
+        # Two lines of text: below ~52 px the layout squeezes it and clips both.
+        self.chk_pull.setMinimumHeight(52)
         self.chk_pull.setToolTip("Flow direction for Start / Run volume / Burst / Ramp. "
                                  "Click to switch between PUSH (infuse) and PULL (withdraw).")
         self.chk_pull.toggled.connect(self._on_pull_toggled)
@@ -356,13 +421,13 @@ class FlowControlTab(QWidget):
         for _k, _t in _tips.items():
             self.btn[_k].setToolTip(_t)
         left.addLayout(grid)
-        self.chk_ff = QCheckBox("Pause pump during moves (feed-forward)")
+        self.chk_ff = QCheckBox("Pause pump on moves")
         self.chk_ff.setToolTip("On each well move: PAUSE the pump ~0.45 s after the move command "
                                "(tip lifts out of liquid) and RESUME ~10 s later (tip back in liquid) — "
                                "kills the air surge. Runs at the Flow rate; calibrated, needs NO sensor.")
         self.chk_ff.toggled.connect(lambda v: setattr(self, "_ff_enabled", bool(v)))
         left.addWidget(self.chk_ff)
-        self.chk_settle = QCheckBox("Settle to specified rate before each run")
+        self.chk_settle = QCheckBox("Settle to rate before run")
         self.chk_settle.setToolTip("Before an experiment run starts, command the pump to the run's flow "
                                    "rate and wait for the SENSOR to actually reach it — if the measured "
                                    "flow is low, raise the pump until it hits the target, then start the "
@@ -370,17 +435,21 @@ class FlowControlTab(QWidget):
         self.chk_settle.setChecked(bool(self.cfg.get("exp_settle", True)))
         self.chk_settle.toggled.connect(lambda v: self.cfg.__setitem__("exp_settle", bool(v)))
         left.addWidget(self.chk_settle)
-        self.chk_follow = QCheckBox("Flow follows wells (buffer↔well)")
+        self.chk_follow = QCheckBox("Flow follows wells")
         self.chk_follow.setToolTip("During a well-plate run, drive the pump to the buffer-rate and "
                                    "well-rate (with ramps) from Definitions, instead of a single Start rate. "
                                    "Ramps happen on each buffer→well and well→buffer transition.")
         self.chk_follow.toggled.connect(lambda v: setattr(self, "_exp_follow", bool(v)))
         left.addWidget(self.chk_follow)
-        self.chk_auto = QCheckBox("Auto-burst in buffer (during a run)")
-        self.chk_auto.setToolTip("Automatically fire one Burst each time the run enters the buffer (needs ≥1 well).")
-        self.chk_auto.toggled.connect(lambda v: setattr(self, "_auto_burst", bool(v)))
+        self.chk_auto = QCheckBox("Auto-burst in buffer")
+        self.chk_auto.setToolTip("Automatically fire one Burst each time the run enters the buffer "
+                                 "(needs ≥1 well). Bursts NEVER fire mid-well — the buffer is the "
+                                 "only window where one can't spoil a reading.")
+        self.chk_auto.setChecked(bool(self.cfg.get("auto_burst", True)))
+        self._auto_burst = self.chk_auto.isChecked()
+        self.chk_auto.toggled.connect(self._on_auto_burst_toggled)
         left.addWidget(self.chk_auto)
-        self.chk_autoclear = QCheckBox("Auto-clear on detected clog")
+        self.chk_autoclear = QCheckBox("Auto-clear on clog")
         self.chk_autoclear.setToolTip("OFF (default): a clog only RAISES A WARNING — the banner turns red and "
                                       "'Burst now' lights up, and you decide whether to clear. ON: the pump runs "
                                       "the forward-burst → reverse-push escalation by itself. Leave it off unless "
@@ -393,8 +462,17 @@ class FlowControlTab(QWidget):
         self.lbl_phase.setStyleSheet(f"color:{MUTED};")
         left.addWidget(self.lbl_phase)
 
-        self.btn_defs = QPushButton("⚙  Definitions / Settings…")
-        self.btn_defs.setToolTip("Rarely-changed settings: port, syringe Ø, # syringes, direction, ramp / clog / burst / prime parameters. Saved automatically.")
+        self.btn_savelog = QPushButton("💾  Save flow log…")
+        self.btn_savelog.setToolTip("Save a copy of this run's flow-rate log (elapsed, flow, air) "
+                                    "to a file you choose. Also auto-logs to Sensor_Readings/, and "
+                                    "appends to the metabolite file when the sensor is recording.")
+        self.btn_savelog.clicked.connect(self._save_log)
+        left.addWidget(self.btn_savelog)
+
+        self.btn_defs = QPushButton("⚙  Settings…")
+        self.btn_defs.setToolTip("Rarely-changed settings: port, syringe Ø, # syringes, direction, "
+                                 "ramp / clog / burst / prime parameters, and the developer-mode "
+                                 "switch. Saved automatically.")
         self.btn_defs.clicked.connect(self._open_defs)
         left.addWidget(self.btn_defs)
         self.btn_loadexp = QPushButton("📂  Load experiment…")
@@ -446,17 +524,36 @@ class FlowControlTab(QWidget):
         self.ax.grid(True, alpha=0.25)
         (self.trace,) = self.ax.plot([], [], color=ACCENT, lw=1.6)
         self.hline = self.ax.axhline(0.0, color=RED, ls="--", lw=1.0)
-        right.addWidget(self.canvas, 1)
 
-        # Save-log row directly under the graph
-        saverow = QHBoxLayout()
-        self.btn_savelog = QPushButton("💾  Save flow log…")
-        self.btn_savelog.setToolTip("Save a copy of this run's flow-rate log (elapsed, flow, air) "
-                                    "to a file you choose. Also auto-logs to Sensor_Readings/, and "
-                                    "appends to the metabolite file when the sensor is recording.")
-        self.btn_savelog.clicked.connect(self._save_log)
-        saverow.addStretch(1); saverow.addWidget(self.btn_savelog)
-        right.addLayout(saverow)
+        # While the metabolite sensor runs, the flow trace is drawn on the
+        # Plotting tab's right axis and this canvas is frozen (see _poll). A dead
+        # plot that still looks live is worse than no plot, so cover it with a
+        # panel that says where the trace went and keeps the live number visible.
+        cover = QWidget()
+        cover.setStyleSheet("background:#11151c;border:1px solid #2a3340;border-radius:6px;")
+        cl = QVBoxLayout(cover); cl.setContentsMargins(24, 24, 24, 24); cl.setSpacing(4)
+        cl.addStretch(1)
+        cap = QLabel("CURRENT FLOW"); cap.setAlignment(Qt.AlignCenter)
+        cap.setStyleSheet(f"color:{MUTED};font-size:12px;font-weight:700;"
+                          "letter-spacing:2px;border:none;")
+        self.lbl_cover_flow = QLabel("—"); self.lbl_cover_flow.setAlignment(Qt.AlignCenter)
+        self.lbl_cover_flow.setStyleSheet(
+            f"color:{ACCENT};font-size:56px;font-weight:700;border:none;")
+        cunit = QLabel("µL/min (combined)"); cunit.setAlignment(Qt.AlignCenter)
+        cunit.setStyleSheet(f"color:{MUTED};font-size:13px;border:none;")
+        msg = QLabel("Live flow plotting is on the <b>Plotting</b> tab —\n"
+                     "the trace is drawn there on the right-hand axis "
+                     "while the metabolite sensor is recording.")
+        msg.setAlignment(Qt.AlignCenter); msg.setWordWrap(True)
+        msg.setStyleSheet("color:#cfe3ff;font-size:14px;padding-top:18px;border:none;")
+        for wdg in (cap, self.lbl_cover_flow, cunit, msg):
+            cl.addWidget(wdg)
+        cl.addStretch(1)
+
+        self.plot_stack = QStackedWidget()
+        self.plot_stack.addWidget(self.canvas)   # 0 = live plot
+        self.plot_stack.addWidget(cover)         # 1 = "see the Plotting tab"
+        right.addWidget(self.plot_stack, 1)
 
         self.lbl_status = QLabel("Not connected. Press Connect to plot the Fluigent sensor.")
         self.lbl_status.setStyleSheet(f"color:{MUTED};")
@@ -475,7 +572,12 @@ class FlowControlTab(QWidget):
         right.addWidget(self.console)
         outer.addLayout(right, 1)
 
-        self._sync_target(); self._refresh_actions()
+        self._sync_target(); self._refresh_actions(); self._apply_dev_mode()
+
+        # Say out loud when a saved setting was carried onto a new default —
+        # a threshold that changes itself silently is worse than the old value.
+        for note in getattr(self, "_migration_notes", []):
+            self.status_msg.emit(f"[settings] updated: {note}")
 
     # ------------------------------------------------------------- helpers
     def _set_pill(self, lbl, ok, name):
@@ -498,15 +600,22 @@ class FlowControlTab(QWidget):
 
     def _style_direction_btn(self, pulling: bool):
         """Label + colour the direction button for its current state."""
+        # Keep both lines short enough to fit the 268 px control column — the
+        # longer "Direction: ▲ PULL (withdraw)" wording clipped at both ends.
         if pulling:
-            self.chk_pull.setText("Direction:  ▲  PULL (withdraw)\nclick to switch to PUSH")
+            self.chk_pull.setText("▲  PULL  (withdraw)\nclick to switch to PUSH")
             bg, hover = "#6a1b9a", "#7b27ab"
         else:
-            self.chk_pull.setText("Direction:  ▼  PUSH (infuse)\nclick to switch to PULL")
+            self.chk_pull.setText("▼  PUSH  (infuse)\nclick to switch to PULL")
             bg, hover = ACCENT, "#1565c0"
         self.chk_pull.setStyleSheet(
             f"QPushButton{{background:{bg};color:white;font-weight:700;text-align:center;}}"
             f"QPushButton:hover{{background:{hover};}}")
+
+    def _on_auto_burst_toggled(self, on):
+        self._auto_burst = bool(on)
+        self.cfg["auto_burst"] = bool(on)
+        self._save_cfg()
 
     def _on_pull_toggled(self, checked):
         self.cfg["direction"] = "withdraw" if checked else "infuse"
@@ -517,12 +626,17 @@ class FlowControlTab(QWidget):
         self.status_msg.emit(f"Flow direction: {'PULL (withdraw)' if checked else 'PUSH (infuse)'}")
 
     # ------------------------------------------------------- persist settings
+    # Bump when a default changes in a way that must reach machines whose saved
+    # settings already pin the old value (see _migrate_cfg).
+    CFG_VERSION = 2
+
     def _load_cfg(self):
         """Restore saved definitions + run params over the defaults, so nothing
         resets between launches."""
         import json, os
         self._cfg_path = os.path.expanduser("~/.mabip/flow_settings.json")
         self._saved_fields = {}
+        saved_version = 0
         try:
             with open(self._cfg_path) as f:
                 saved = json.load(f)
@@ -530,19 +644,52 @@ class FlowControlTab(QWidget):
                 if k in self.cfg:
                     self.cfg[k] = v
             self._saved_fields = saved.get("fields") or {}
+            saved_version = int(saved.get("cfg_version") or 0)
         except Exception:
             pass
+        self._migrate_cfg(saved_version)
+
+    def _migrate_cfg(self, saved_version: int):
+        """Carry changed defaults onto settings files that pin the old value.
+
+        _load_cfg lays the saved file OVER the defaults, so simply editing a
+        default here never reaches a machine that has already saved settings.
+        Each step only rewrites a value that still equals the superseded
+        default, so a deliberately chosen number is left alone.
+        """
+        if saved_version >= self.CFG_VERSION:
+            return
+        notes = []
+        if saved_version < 2 and abs(float(self.cfg.get("clog_arm_frac", 0.5)) - 0.8) < 1e-9:
+            self.cfg["clog_arm_frac"] = 0.5
+            notes.append("clog arm threshold 80% -> 50% of setpoint "
+                         "(air leaks keep this rig below 80%)")
+        self._migration_notes = notes
+        # Stamp the version even with nothing to change, so this runs once.
+        self._save_cfg()
 
     def _save_cfg(self):
-        """Persist the current definitions + run params (called on every change)."""
+        """Persist the current definitions + run params (called on every change).
+
+        Also runs before _build(), from the migration in _load_cfg, so the run-param
+        widgets may not exist yet — fall back to the values just read off disk
+        rather than losing them.
+        """
         import json, os
+        saved = getattr(self, "_saved_fields", {}) or {}
+
+        def _field(widget_name, key):
+            w = getattr(self, widget_name, None)
+            return w.text() if w is not None else saved.get(key, "")
+
         try:
             os.makedirs(os.path.dirname(self._cfg_path), exist_ok=True)
             with open(self._cfg_path, "w") as f:
-                json.dump({"cfg": self.cfg,
-                           "fields": {"rate": self.f_rate.text(),
-                                      "vol": self.f_vol.text(),
-                                      "target": self.f_target.text()}}, f, indent=2)
+                json.dump({"cfg_version": self.CFG_VERSION,
+                           "cfg": self.cfg,
+                           "fields": {"rate": _field("f_rate", "rate"),
+                                      "vol": _field("f_vol", "vol"),
+                                      "target": _field("f_target", "target")}}, f, indent=2)
         except Exception:
             pass
 
@@ -577,11 +724,18 @@ class FlowControlTab(QWidget):
             if self.line is not None:
                 self.line.n_syringes = int(new["n"])
                 if diam_changed:
+                    # The setter marks the bore stale; the pump is told on the
+                    # next run command (it ignores settings sent mid-run).
                     self.line.diameter_mm = float(new["diameter"])
-                    self.line._configured = False   # re-push diameter on next action
+            dev = self._apply_dev_mode()
             self._save_cfg()
+            # A running pump keeps the OLD bore until it is re-commanded, so say
+            # so rather than let "saved" read as "the pump is using this now".
+            pending = (" — pump keeps the old Ø until you press Apply/Start"
+                       if diam_changed and self.line is not None and self._steady else "")
             self.status_msg.emit(f"Definitions saved — {int(new['n'])} syringe(s), "
-                                 f"Ø{new['diameter']} mm, {new['direction']}.")
+                                 f"Ø{new['diameter']} mm, {new['direction']}, "
+                                 f"dev mode {'ON' if dev else 'off'}.{pending}")
 
     def _load_experiment(self):
         """Load a text experiment file: apply the pump/flow settings here and set
@@ -768,6 +922,25 @@ class FlowControlTab(QWidget):
                                msg + "\n\nPump/flow settings are applied here. Press ▶ Run experiment to run "
                                "it automatically, or Start Sampling on the Sampling tab.")
 
+    def _dev_widgets(self):
+        """Controls shown only in developer mode.
+
+        Everything here is for authoring/bench work rather than running a plate:
+        a normal run is Connect -> direction -> Start -> (Burst if it clogs), and
+        the plate itself is driven from the Sampling tab.
+        """
+        return [w for w in (self.btn.get("run"), self.btn.get("ramp"),
+                            self.f_vol, getattr(self, "_vol_label", None),
+                            self.btn_loadexp, self.btn_runexp, self.btn_stopexp)
+                if w is not None]
+
+    def _apply_dev_mode(self):
+        """Show or hide the developer-only controls to match cfg['dev_mode']."""
+        dev = bool(self.cfg.get("dev_mode", False))
+        for w in self._dev_widgets():
+            w.setVisible(dev)
+        return dev
+
     def _refresh_actions(self):
         """Enable buttons per connection state: pump-only actions need the pump;
         Ramp/Calibrate/Verify additionally need the flow sensor."""
@@ -820,6 +993,10 @@ class FlowControlTab(QWidget):
                                        require_sensor=False, sensor=None, verbose=False)
                 self.line = line
                 ok = True
+                # New hardware in hand: a previous safe shutdown must not latch
+                # this one out.
+                self._shutdown_done = False
+                self._abort = False
                 self.status_msg.emit(f"Pump connected — {line.pump.port.split('/')[-1]}. "
                                      "Connect the flow sensor too if you have one.")
             except Exception as e:
@@ -829,6 +1006,9 @@ class FlowControlTab(QWidget):
 
     def _after_pump(self, ok):
         self.btn_pump.setEnabled(True)
+        if ok and not self.poll_timer.isActive():
+            self.poll_timer.start(150)   # a previous safe shutdown stopped it
+
         self._set_pill(self.pill_pump, ok, "pump")
         self.btn_pump.setText("Disconnect pump" if ok else "Connect pump")
         self.btn_sensor.setEnabled(ok)          # sensor attaches to a live pump
@@ -912,11 +1092,7 @@ class FlowControlTab(QWidget):
         metabolite file, which separately gets the flow via its flow_uL_min col)."""
         import os
         from datetime import datetime
-        try:
-            from config import FILES
-            folder = FILES.SENSOR_READINGS_FOLDER
-        except Exception:
-            folder = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Sensor_Readings")
+        folder = _sensor_readings_dir()
         try:
             os.makedirs(folder, exist_ok=True)
             ts = datetime.now().strftime("%d_%m_%y_%H_%M")
@@ -1113,7 +1289,7 @@ class FlowControlTab(QWidget):
         fwd = self.cfg["direction"]
         rev = "infuse" if fwd == "withdraw" else "withdraw"
         ch = getattr(self.line, "sensor_channel", 0)
-        folder = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Sensor_Readings")
+        folder = _sensor_readings_dir()
         os.makedirs(folder, exist_ok=True)
         ts = datetime.now().strftime("%d_%m_%y_%H_%M")
         trace_path = os.path.join(folder, f"Burst_Calib_{ts}.csv")
@@ -1470,7 +1646,17 @@ class FlowControlTab(QWidget):
 
         # ---- arming: nothing is judged until flow has actually been established.
         if not self._flow_seen:
-            arm_frac = self._cfgf("clog_arm_frac", 0.8)
+            arm_frac = self._cfgf("clog_arm_frac", 0.5)
+            # Arming AT or BELOW the clog threshold would let a run arm and trip
+            # on the same reading. Definitions is free-text, so enforce the gap
+            # here instead of trusting whatever was typed in.
+            if arm_frac <= frac:
+                arm_frac = frac * 1.25
+                if not getattr(self, "_arm_frac_warned", False):
+                    self._arm_frac_warned = True
+                    self.status_msg.emit(
+                        f"⚠ [clog] arm fraction must sit above the clog fraction "
+                        f"({frac:.0%}) — using {arm_frac:.0%} for this run.")
             if abs(val) >= arm_frac * abs(self._expected):
                 self._flow_seen = True
                 self._clog_since = None
@@ -1483,15 +1669,18 @@ class FlowControlTab(QWidget):
             arm_to = self._cfgf("clog_arm_timeout_s", 120.0)
             if not self._arm_warned and (now - self._steady_since) >= arm_to:
                 self._arm_warned = True
+                bar = arm_frac * abs(self._expected)
                 self.status_msg.emit(
-                    f"⚠ [flow] never reached {abs(self._expected):.1f} µL/min in "
-                    f"{arm_to:g}s (best so far {abs(val):.1f}). NOT calling this a "
-                    "clog — check priming, air in the line, and that the sensor is "
-                    "reading. Clog watch stays disarmed.")
+                    f"⚠ [flow] never reached {arm_frac:.0%} of "
+                    f"{abs(self._expected):.1f} µL/min ({bar:.1f}) in {arm_to:g}s "
+                    f"(best so far {abs(val):.1f}). NOT calling this a clog — check "
+                    "priming, air in the line, and that the sensor is reading. "
+                    "Clog watch stays disarmed.")
                 self._set_clog_ui(True, f"⚠  FLOW NEVER STARTED — still "
-                                        f"{abs(val):.1f} µL/min after {arm_to:g}s at a "
+                                        f"{abs(val):.1f} µL/min after {arm_to:g}s, below "
+                                        f"the {arm_frac:.0%} arm bar ({bar:.1f}) for a "
                                         f"{abs(self._expected):.1f} µL/min setpoint. "
-                                        "Prime the line / check the sensor.")
+                                        "Prime the line / check for air leaks.")
             return
 
         low = abs(val) < frac * abs(self._expected)
@@ -1533,9 +1722,23 @@ class FlowControlTab(QWidget):
                 except Exception:
                     pass
 
+    def _show_plot_cover(self, covered: bool):
+        """Swap the plot area between the live canvas and the cover panel.
+
+        Only touched on a real change, so the stack isn't churned every 150 ms
+        tick. The big readout above the plot keeps updating either way; the
+        cover repeats it so the number stays large once the trace is gone."""
+        idx = 1 if covered else 0
+        if self.plot_stack.currentIndex() != idx:
+            self.plot_stack.setCurrentIndex(idx)
+            if covered:
+                self.lbl_cover_flow.setText(self.lbl_flow.text())
+
     def _poll(self):
         # Nothing to read/plot/log without a flow sensor (pump-only is fine).
         if self.line is None or getattr(self.line, "sensor", None) is None:
+            # No sensor => no trace anywhere, so never leave the cover up.
+            self._show_plot_cover(False)
             return
         # During a burst calibration the worker thread owns the sensor (fast
         # sampling); don't read it here too (concurrent HID reads corrupt data).
@@ -1572,12 +1775,16 @@ class FlowControlTab(QWidget):
                 pass
 
         # Mutual exclusivity: when the metabolite sensor is running, the flow is
-        # drawn on that plot's right axis — don't also draw it here.
+        # drawn on that plot's right axis — don't also draw it here. Cover this
+        # canvas so a frozen trace can't be mistaken for the live one.
         if self._metabolites_running():
+            self._show_plot_cover(True)
+            self.lbl_cover_flow.setText(f"{val:+.2f}")
             self._tick += 1
             if self._tick % 40 == 0:
                 self.lbl_status.setText("Metabolite plot active — flow shown there (right axis).")
             return
+        self._show_plot_cover(False)
 
         # redraw ~ every 300 ms — but only while this tab is actually on screen.
         # Re-rendering a matplotlib canvas behind another tab burned a whole CPU
@@ -2204,14 +2411,105 @@ class FlowControlTab(QWidget):
         return bool(mg and getattr(mg, "sensor_reader", None)
                     and getattr(mg.sensor_reader, "is_running", False))
 
-    def shutdown(self):
+    # --------------------------------------------------------------- shutdown
+    def safe_shutdown(self, reason="") -> list:
+        """Bring the flow hardware to a safe state. Idempotent; never raises.
+
+        Order matters and is the whole point of this method:
+
+        1. Raise the abort flags FIRST. Worker threads (ramp, burst, clog-clear,
+           experiment phases) check them between steps; stopping the pump while
+           one is still running just means it commands flow again a second later.
+           The generation counters kill any in-flight phase ramp / feed-forward
+           resume timer for the same reason.
+        2. Stop the poll timer — no point reading a sensor we are about to close.
+        3. STOP the pump, and keep stopping it: this rig's FTDI link drops
+           commands (see the EMI notes), and a dropped stop leaves syringes
+           driving into a closed line. Sent, given the workers a moment to
+           unwind, then sent again and verified.
+        4. Only then release the sensor and the serial port.
+
+        Returns a list of human-readable lines describing what it did, for the
+        caller to log — a shutdown that silently half-worked is the failure mode
+        this is meant to prevent."""
+        if getattr(self, "_shutdown_done", False):
+            return []
+        self._shutdown_done = True
+        notes = []
+
+        self._abort = True
+        self._abort_clear = True
+        self._steady = False
+        self._bursting = False
+        self._auto_burst = False
+        self._exp_follow = False
+        self._ff_enabled = False
+        self._phase_flow_gen += 1
+        self._ff_gen += 1
+        self._phase = "idle"
+
         try:
             self.poll_timer.stop()
-            if self.line:
-                try:
-                    self.line.stop()
-                except Exception:
-                    pass
-                self.line.close()
         except Exception:
             pass
+
+        if self.line is None:
+            notes.append("pump not connected — nothing to stop")
+            return notes
+
+        # 3. Stop, wait for any worker to notice the abort, stop again.
+        stopped = self._insist_stop()
+        notes.append("pump STOP sent" if stopped else
+                     "pump STOP FAILED — check the pump is off at the front panel")
+        deadline = time.monotonic() + 2.0
+        while self._busy and time.monotonic() < deadline:
+            time.sleep(0.05)
+        if self._busy:
+            notes.append("a flow worker was still running — stop re-sent over it")
+        if self._insist_stop():
+            notes.append("pump confirmed stopped")
+
+        # 4. Release the hardware. close() stops once more on its way out.
+        try:
+            self.line.disconnect_sensor()
+            notes.append("flow sensor released")
+        except Exception as e:
+            notes.append(f"flow sensor release error: {e}")
+        try:
+            self.line.close()
+            notes.append("pump port closed")
+        except Exception as e:
+            notes.append(f"pump close error: {e}")
+        self.line = None
+        self.latest_flow = None
+
+        try:
+            self._set_pill(self.pill_pump, False, "pump")
+            self._set_pill(self.pill_sensor, False, "sensor")
+            self.btn_pump.setText("Connect pump")
+            self.btn_sensor.setText("Connect sensor"); self.btn_sensor.setEnabled(False)
+            self._refresh_actions()
+        except Exception:
+            pass
+
+        if reason:
+            notes.append(f"({reason})")
+        return notes
+
+    def _insist_stop(self, tries=3):
+        """Send STOP up to `tries` times; True once one gets through.
+
+        One dropped write on this link is normal, so a single failed stop is not
+        evidence the pump is still running — but it is not evidence it stopped
+        either, which is why this retries rather than reporting the first error."""
+        for i in range(tries):
+            try:
+                self.line.stop()
+                return True
+            except Exception:
+                time.sleep(0.15)
+        return False
+
+    def shutdown(self):
+        """Back-compat alias — the full sequence, same guarantees."""
+        return self.safe_shutdown()

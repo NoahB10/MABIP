@@ -180,7 +180,7 @@ class ChemyxPump:
                 print(f">>> {full!r}  ->  {reply!r}")
 
             garbled = "not recognized" in reply.lower()
-            if garbled or reply.lower().startswith("error"):
+            if garbled or reply.lower().startswith("error") or self._is_error_code(reply, full):
                 if garbled and _retry and self._safe_to_retry(cmd):
                     time.sleep(0.3)
                     return self.command(cmd, timeout=timeout, _retry=False)
@@ -192,6 +192,23 @@ class ChemyxPump:
             if t is not None:
                 self._last_run_min = t
             return reply
+
+    @staticmethod
+    def _is_error_code(reply, cmd):
+        """True when the pump answered with a bare Chemyx error code.
+
+        A rejected command comes back as a lone negative digit (-1 unrecognised,
+        -2 not accepted in the current state, ...) with no error text, which
+        otherwise reads as a perfectly good reply — that is how a 'set diameter'
+        sent to a running pump used to disappear silently. A command that
+        legitimately carries that number (e.g. 'set volume -2') is exempt, since
+        the pump may simply be echoing the value it took.
+        """
+        import re
+        text = reply.strip()
+        if not re.fullmatch(r"-[1-9]", text):
+            return False
+        return text not in cmd.replace(",", " ").split()
 
     @staticmethod
     def _safe_to_retry(cmd):
