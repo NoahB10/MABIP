@@ -36,6 +36,10 @@ from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as Navigatio
 from matplotlib.figure import Figure
 import matplotlib.pyplot as plt
 
+# Cocoa sizes fonts, toolbar icons and windows differently from the Pi's X11;
+# every call into here is a no-op off macOS.
+import mac_ui
+
 # Serial port listing
 try:
     from serial.tools import list_ports
@@ -488,6 +492,7 @@ class PlotWindow(QWidget):
         
         # Navigation toolbar for zoom/pan
         self.nav_toolbar = NavigationToolbar(self.canvas, self)
+        mac_ui.tune_nav_toolbar(self.nav_toolbar)
 
         # Override the home button action to show full graph from 0
         # Find and disconnect the home action, then reconnect to our custom method
@@ -1673,7 +1678,9 @@ class AsyncAMUZAGUI(QMainWindow):
     def _init_ui(self):
         """Initialize UI"""
         self.setWindowTitle("AMUZA Controller - Async")
-        self.setGeometry(100, 100, UI.MAIN_WINDOW_WIDTH, UI.MAIN_WINDOW_HEIGHT)
+        win_w, win_h = mac_ui.preferred_window_size(
+            UI.MAIN_WINDOW_WIDTH, UI.MAIN_WINDOW_HEIGHT)
+        self.setGeometry(100, 100, win_w, win_h)
         self.setStyleSheet("""
             QMainWindow { background-color: #f1f4f7; }
             QPushButton {
@@ -2214,12 +2221,24 @@ class AsyncAMUZAGUI(QMainWindow):
             if await self.connection.connect():
                 await self.app_state.set_connection(self.connection)
 
-                self.status_label.setText(f"AMUZA: {selected_machine}")
+                # connect() falls back to a simulated socket when PyBluez is
+                # missing (always the case on macOS), and that path otherwise
+                # looks identical to a real connection.
+                simulated = getattr(self.connection, "use_mock", False)
+                suffix = "  [SIMULATED]" if simulated else ""
+
+                self.status_label.setText(f"AMUZA: {selected_machine}{suffix}")
                 self.connect_btn.setText("Disconnect")
                 self.connect_btn.setEnabled(True)
                 self._refresh_run_buttons()
-                self.add_to_display(f"Connected to {selected_machine}.")
-                logger.info(f"Connected to AMUZA ({selected_machine}, device={device_name})")
+                if simulated:
+                    self.add_to_display(
+                        f"Connected to {selected_machine} in SIMULATION — no "
+                        "Bluetooth on this machine, so no command reaches the rig.")
+                else:
+                    self.add_to_display(f"Connected to {selected_machine}.")
+                logger.info(f"Connected to AMUZA ({selected_machine}, device={device_name}, "
+                            f"simulated={simulated})")
             else:
                 self.status_label.setText("AMUZA: Connection Failed")
                 self.connect_btn.setText("Reconnect")
@@ -3821,7 +3840,8 @@ def main():
     
     # Create Qt application
     app = QApplication(sys.argv)
-    
+    mac_ui.apply(app)          # base font / font aliases; no-op off macOS
+
     # Create async event loop with qasync
     loop = QEventLoop(app)
     asyncio.set_event_loop(loop)

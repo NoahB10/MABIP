@@ -446,6 +446,15 @@ class AsyncAmuzaConnection:
         """Blocking connection (run in thread pool)"""
         try:
             if self.use_mock or not BLUETOOTH_AVAILABLE:
+                if not self.use_mock:
+                    # No PyBluez (every Mac, and any Pi where the wheel failed
+                    # to build). Record it on the connection so the GUI can say
+                    # "SIMULATED" instead of reporting a live rig that is not
+                    # there — a silent mock reads exactly like a real connect.
+                    self.use_mock = True
+                    logger.warning(
+                        "PyBluez unavailable — AMUZA running SIMULATED, "
+                        "no commands reach real hardware.")
                 self.socket = MockBluetoothSocket()
                 self.socket.connect(self.device_address)
                 return True

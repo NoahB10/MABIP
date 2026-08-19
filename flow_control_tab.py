@@ -567,7 +567,10 @@ class FlowControlTab(QWidget):
         self.console.setFixedHeight(150)
         self.console.setStyleSheet(
             "QPlainTextEdit{background:#11151c;color:#cfe3ff;border:1px solid #2a3340;"
-            "font-family:monospace;font-size:11px;}")
+            # Name real families first: Cocoa has no "monospace" alias, and Qt
+            # walks the whole font list to discover that on every launch.
+            "font-family:Menlo,'DejaVu Sans Mono',Consolas,monospace;"
+            "font-size:11px;}")
         self.console.setPlaceholderText("Activity log — connect, load an experiment, press Run…")
         right.addWidget(self.console)
         outer.addLayout(right, 1)
