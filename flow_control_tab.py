@@ -122,15 +122,17 @@ class FlowDefinitionsDialog(QDialog):
         ("exp_settle_timeout", "Settle timeout (s)"), ("exp_settle_bump", "Settle raise step (%)"),
     ]
 
+    # What an operator needs to set up and run the rig. Everything else in
+    # _FIELDS is a bench-tuning constant — burst shapes, clog thresholds,
+    # feed-forward timings, the ramp/prime numbers — and those stay behind
+    # developer mode so this dialog is readable at a glance.
+    _BASIC_FIELDS = ("window",)
+
     def __init__(self, cfg, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Flow — Definitions / Settings")
-        self.setMinimumWidth(660)
         self.cfg = dict(cfg); self.w = {}
         lay = QVBoxLayout(self); lay.setContentsMargins(16, 16, 16, 16); lay.setSpacing(8)
-        cols = QHBoxLayout(); cols.setSpacing(24)
-        form_l = QFormLayout(); form_l.setVerticalSpacing(7)
-        form_r = QFormLayout(); form_r.setVerticalSpacing(7)
 
         self.w["port"] = QLineEdit(str(cfg["port"]))
         self.w["diameter"] = QLineEdit(str(cfg["diameter"]))
@@ -144,20 +146,19 @@ class FlowDefinitionsDialog(QDialog):
             self._syr_group.addButton(b); sh.addWidget(b); self._syr[n] = b
         sh.addStretch(1)
 
-        # All rows in order, then split across two columns so the dialog stays
-        # short enough that the OK/Cancel buttons remain on-screen.
-        rows = [("Pump port", self.w["port"]),
-                ("Syringe Ø (mm)", self.w["diameter"]),
-                ("# syringes", seg)]
+        # Basics: the hardware the pump is plumbed with, plus how much history
+        # the plot shows. One column — there are few enough to read at a glance.
+        form_basic = QFormLayout(); form_basic.setVerticalSpacing(7)
+        form_basic.addRow("Pump port", self.w["port"])
+        form_basic.addRow("Syringe Ø (mm)", self.w["diameter"])
+        form_basic.addRow("# syringes", seg)
+        # Every field is built either way, so hiding one never drops its saved
+        # value: values() still reads the whole of self.w.
         for key, label in self._FIELDS:
             self.w[key] = QLineEdit(str(cfg[key]))
-            rows.append((label, self.w[key]))
-        half = (len(rows) + 1) // 2
-        for i, (label, widget) in enumerate(rows):
-            (form_l if i < half else form_r).addRow(label, widget)
-
-        cols.addLayout(form_l); cols.addLayout(form_r)
-        lay.addLayout(cols)
+            if key in self._BASIC_FIELDS:
+                form_basic.addRow(label, self.w[key])
+        lay.addLayout(form_basic)
 
         # Sensor sign: a tick box, not a +1/-1 field, so which way is "positive"
         # is a yes/no question rather than a number to get wrong.
@@ -174,17 +175,47 @@ class FlowDefinitionsDialog(QDialog):
 
         # Dev mode: the one switch on this dialog that changes what the TAB shows,
         # so it sits apart from the numeric fields rather than lost among them.
-        self.chk_dev = QCheckBox("Developer mode — show bench controls "
-                                 "(Run volume, Ramp, load/run/stop experiment)")
-        self.chk_dev.setToolTip("Off: only the controls used for a normal run. "
-                                "On: adds the experiment-authoring and bench-test buttons.")
+        # Kept short on purpose: this label sets the dialog's width, and the
+        # basics-only view is otherwise narrow.
+        self.chk_dev = QCheckBox("Developer mode — bench controls + tuning settings")
+        self.chk_dev.setToolTip("Off: only the controls and settings used for a normal run. "
+                                "On: adds the experiment-authoring and bench-test buttons, "
+                                "and reveals the tuning constants on this dialog.")
         self.chk_dev.setChecked(bool(cfg.get("dev_mode", False)))
         self.chk_dev.setStyleSheet("QCheckBox{font-weight:600;padding-top:6px;}")
         lay.addWidget(self.chk_dev)
 
+        # Advanced block, revealed by the checkbox directly above it. Two
+        # columns so the ~40 rows stay short enough to leave OK/Cancel onscreen.
+        self._adv = QGroupBox("Advanced — bench tuning")
+        adv_cols = QHBoxLayout(self._adv); adv_cols.setSpacing(24)
+        form_l = QFormLayout(); form_l.setVerticalSpacing(7)
+        form_r = QFormLayout(); form_r.setVerticalSpacing(7)
+        adv_rows = [(label, self.w[key]) for key, label in self._FIELDS
+                    if key not in self._BASIC_FIELDS]
+        half = (len(adv_rows) + 1) // 2
+        for i, (label, widget) in enumerate(adv_rows):
+            (form_l if i < half else form_r).addRow(label, widget)
+        adv_cols.addLayout(form_l); adv_cols.addLayout(form_r)
+        lay.addWidget(self._adv)
+
+        self.chk_dev.toggled.connect(self._toggle_advanced)
+        self._toggle_advanced(self.chk_dev.isChecked())
+
         bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         bb.accepted.connect(self.accept); bb.rejected.connect(self.reject)
         lay.addWidget(bb)
+
+    def _toggle_advanced(self, on):
+        """Show or hide the tuning block as developer mode is switched, without
+        closing the dialog. Qt keeps the larger height once the block has been
+        shown, so the minimum has to be relaxed before adjustSize() can shrink
+        the window back down to the basics."""
+        self._adv.setVisible(bool(on))
+        self.setMinimumWidth(660 if on else 380)
+        self.setMinimumHeight(0)
+        self.resize(self.minimumWidth(), self.sizeHint().height())
+        self.adjustSize()
 
     def values(self):
         out = dict(self.cfg)
@@ -397,6 +428,7 @@ class FlowControlTab(QWidget):
         left.addWidget(self.chk_pull)
 
         grid = QGridLayout(); grid.setSpacing(6); self.btn = {}
+        self._btn_grid = grid          # _apply_dev_mode re-spans Burst on this
         def mk(key, text, r, c, slot, style=""):
             b = QPushButton(text); b.clicked.connect(slot)
             if style:
@@ -933,6 +965,7 @@ class FlowControlTab(QWidget):
         the plate itself is driven from the Sampling tab.
         """
         return [w for w in (self.btn.get("run"), self.btn.get("ramp"),
+                            self.btn.get("prime"),
                             self.f_vol, getattr(self, "_vol_label", None),
                             self.btn_loadexp, self.btn_runexp, self.btn_stopexp)
                 if w is not None]
@@ -942,6 +975,15 @@ class FlowControlTab(QWidget):
         dev = bool(self.cfg.get("dev_mode", False))
         for w in self._dev_widgets():
             w.setVisible(dev)
+
+        # Burst shares its row with Prime. With Prime hidden it would sit at
+        # half width beside an empty cell, so give it the whole row back.
+        grid = getattr(self, "_btn_grid", None)
+        burst = self.btn.get("burst")
+        if grid is not None and burst is not None:
+            grid.removeWidget(burst)
+            grid.addWidget(burst, 2, 0, 1, 1 if dev else 2)
+            burst.setVisible(True)
         return dev
 
     def _refresh_actions(self):
