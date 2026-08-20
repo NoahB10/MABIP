@@ -1,5 +1,5 @@
 # COMPLETE A–D experiment — all runs in ONE file, run back-to-back automatically.
-# 📂 Load experiment → ▶ Run experiment. Keep "Flow follows wells" OFF.
+# 📂 Load experiment → ▶ Run experiment.
 # Data from every run lands in one flow log, tagged run_Baseline / run_A / ...
 # ---- shared (every run inherits these) ----
 wells: A1, A2, A3, A4, A5

@@ -10,7 +10,7 @@
 #
 # Note: the 3 wells are revisited once per run (4x total), so later runs sample
 # an already-drawn well — keep that in mind vs the fresh-well version.
-# Keep "Flow follows wells" OFF (constant 80 µL/min per run).
+# Every run holds a constant 80 µL/min.
 
 # ---- shared (every run inherits these) ----
 wells: A1, A2, A3      # same 3 wells for every run

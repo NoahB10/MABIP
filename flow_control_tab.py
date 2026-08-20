@@ -114,8 +114,6 @@ class FlowDefinitionsDialog(QDialog):
         ("rev_attempts", "Clear: max reverse attempts"), ("clear_settle_s", "Clear: recheck settle (s)"),
         ("prime_pull_vol", "Prime pull vol (µL)"), ("prime_pull_rate", "Prime pull rate (µL/min)"),
         ("prime_push_vol", "Prime push vol (µL)"), ("prime_push_rate", "Prime push rate (µL/min)"),
-        ("exp_buffer_rate", "Well-flow: buffer rate"), ("exp_well_rate", "Well-flow: well rate"),
-        ("exp_approach_ramp", "Well-flow: ramp→well (s)"), ("exp_recover_ramp", "Well-flow: ramp→buffer (s)"),
         ("ff_pause_s", "Feed-fwd: pause after move (s)"), ("ff_resume_s", "Feed-fwd: resume after move (s)"),
         ("ff_resume_ramp", "Feed-fwd: resume ramp (s)"),
         ("exp_settle_max_var", "Max flow variation (µL/min)"), ("exp_settle_hold", "Settle hold (s)"),
@@ -353,7 +351,6 @@ class FlowControlTab(QWidget):
         self._burst_done = False         # one auto-burst per buffer entry
         self._bursting = False
         self._burst_settled = True        # last burst confirmed back at baseline
-        self._exp_follow = False         # pump follows well/buffer phases
         self._phase_flow_rate = None     # last commanded phase-flow line rate
         self._phase_flow_gen = 0         # cancels a running phase ramp
         self._ff_enabled = False         # feed-forward pause/resume across moves
@@ -417,9 +414,6 @@ class FlowControlTab(QWidget):
             "b_fit_margin_s": 3.0,                                # safety gap left in the buffer
             "prime_pull_vol": 600.0, "prime_pull_rate": 1000.0,   # 1 mL/min
             "prime_push_vol": 600.0, "prime_push_rate": 200.0,
-            # flow-follows-wells (combined line rates + ramp seconds)
-            "exp_buffer_rate": 20.0, "exp_well_rate": 50.0,
-            "exp_approach_ramp": 5.0, "exp_recover_ramp": 5.0,
             # feed-forward pause/resume across a move (calibrated 2026-07-15)
             "ff_pause_s": 0.45, "ff_resume_s": 10.0, "ff_resume_ramp": 0.0,
             # closed-loop settle: reach the specified flow (sensor) before a run starts
@@ -556,12 +550,6 @@ class FlowControlTab(QWidget):
         self.chk_settle.setChecked(bool(self.cfg.get("exp_settle", True)))
         self.chk_settle.toggled.connect(lambda v: self.cfg.__setitem__("exp_settle", bool(v)))
         left.addWidget(self.chk_settle)
-        self.chk_follow = QCheckBox("Flow follows wells")
-        self.chk_follow.setToolTip("During a well-plate run, drive the pump to the buffer-rate and "
-                                   "well-rate (with ramps) from Definitions, instead of a single Start rate. "
-                                   "Ramps happen on each buffer→well and well→buffer transition.")
-        self.chk_follow.toggled.connect(lambda v: setattr(self, "_exp_follow", bool(v)))
-        left.addWidget(self.chk_follow)
         self.chk_auto = QCheckBox("Auto-burst in buffer")
         self.chk_auto.setToolTip("Automatically fire one Burst each time the run enters the buffer "
                                  "(needs ≥1 well). Bursts NEVER fire mid-well — the buffer is the "
@@ -995,8 +983,8 @@ class FlowControlTab(QWidget):
                           "Each run repeats the same wells with its own flow settings; ")
             QMessageBox.information(self, "Experiment loaded",
                                    msg + "\n\n" + wells_note + "all runs are tagged per-run in the flow "
-                                   "log so you can analyze them together. Keep 'Flow follows wells' OFF "
-                                   "for a constant rate per run.")
+                                   "log so you can analyze them together. Each run holds a constant "
+                                   "flow rate.")
             return
 
         applied = []
@@ -1996,7 +1984,7 @@ class FlowControlTab(QWidget):
 
     def set_experiment_phase(self, phase, n_wells=0):
         """Called by MABIP: phase in {'idle','buffer','well'} with well count.
-        Drives flow-follows-wells (ramp to per-phase rate) and auto-burst."""
+        Drives auto-burst and holds the run's baseline rate through each well."""
         prev = self._phase
         self._phase = phase
         self._n_wells = int(n_wells)
@@ -2004,14 +1992,6 @@ class FlowControlTab(QWidget):
             self.lbl_phase.setText(f"phase: {phase}  (wells={n_wells})")
         except Exception:
             pass
-        # flow-follows-wells: ramp the pump to the per-phase rate on a transition
-        if self._exp_follow and self.line is not None and phase != prev:
-            if phase == "buffer":
-                self._apply_phase_flow(float(self.cfg.get("exp_buffer_rate", 20.0)),
-                                       float(self.cfg.get("exp_recover_ramp", 0.0)), "→buffer")
-            elif phase == "well":
-                self._apply_phase_flow(float(self.cfg.get("exp_well_rate", 50.0)),
-                                       float(self.cfg.get("exp_approach_ramp", 0.0)), "→well")
         # auto-burst once per buffer entry
         if phase == "buffer" and self._n_wells >= 1 and self._auto_burst \
                 and self.line is not None and not self._busy and not self._burst_done:
@@ -2029,10 +2009,10 @@ class FlowControlTab(QWidget):
                     "not be at baseline. Increase buffer_time or shorten the burst.")
         # hold the run's baseline flow (e.g. 80 µL/min) through the whole well, so
         # recording always happens at the set rate even if a buffer burst left the
-        # flow slightly off. Skipped when flow-follows-wells or feed-forward is
-        # already driving the pump. Fires once per well entry (prev != "well").
+        # flow slightly off. Skipped when feed-forward is already driving the
+        # pump. Fires once per well entry (prev != "well").
         if phase == "well" and prev != "well" and self.line is not None \
-                and not self._exp_follow and not self._ff_enabled:
+                and not self._ff_enabled:
             rate = self._num(self.f_rate, 0.0)
             if rate > 0:
                 try:
@@ -2578,7 +2558,6 @@ class FlowControlTab(QWidget):
         self._steady = False
         self._bursting = False
         self._auto_burst = False
-        self._exp_follow = False
         self._ff_enabled = False
         self._phase_flow_gen += 1
         self._ff_gen += 1
