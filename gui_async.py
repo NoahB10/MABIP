@@ -1991,7 +1991,7 @@ class AsyncAMUZAGUI(QMainWindow):
         if tab is None or tab.line is None or target_line <= 0:
             return True
         cfg = tab.cfg
-        if not cfg.get("exp_settle", True):
+        if not cfg.get("exp_settle", False):
             return True
 
         def _f(k, d):

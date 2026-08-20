@@ -423,7 +423,7 @@ class FlowControlTab(QWidget):
             # feed-forward pause/resume across a move (calibrated 2026-07-15)
             "ff_pause_s": 0.45, "ff_resume_s": 10.0, "ff_resume_ramp": 0.0,
             # closed-loop settle: reach the specified flow (sensor) before a run starts
-            "exp_settle": True, "exp_settle_max_var": 5.0, "exp_settle_hold": 5.0,
+            "exp_settle": False, "exp_settle_max_var": 5.0, "exp_settle_hold": 5.0,
             "exp_settle_timeout": 120.0, "exp_settle_bump": 5.0,
             # Dev mode reveals the bench/experiment-authoring controls (Run
             # volume, Ramp, and the load/run/stop experiment buttons). Day-to-day
@@ -432,7 +432,7 @@ class FlowControlTab(QWidget):
             "dev_mode": False,
             # One burst per buffer entry during a run, on by default. Bursts are
             # phase-gated regardless of this switch — never mid-well.
-            "auto_burst": True,
+            "auto_burst": False,
         }
         self._load_cfg()   # restore saved definitions/fields over the defaults
 
@@ -553,7 +553,7 @@ class FlowControlTab(QWidget):
                                    "start the wells. The pump rate that got there is written back into "
                                    "Flow rate, since it is usually not the target itself. "
                                    "Needs the flow sensor connected. (Definitions: tolerance/hold/timeout.)")
-        self.chk_settle.setChecked(bool(self.cfg.get("exp_settle", True)))
+        self.chk_settle.setChecked(bool(self.cfg.get("exp_settle", False)))
         self.chk_settle.toggled.connect(lambda v: self.cfg.__setitem__("exp_settle", bool(v)))
         left.addWidget(self.chk_settle)
         self.chk_follow = QCheckBox("Flow follows wells")
@@ -566,7 +566,7 @@ class FlowControlTab(QWidget):
         self.chk_auto.setToolTip("Automatically fire one Burst each time the run enters the buffer "
                                  "(needs ≥1 well). Bursts NEVER fire mid-well — the buffer is the "
                                  "only window where one can't spoil a reading.")
-        self.chk_auto.setChecked(bool(self.cfg.get("auto_burst", True)))
+        self.chk_auto.setChecked(bool(self.cfg.get("auto_burst", False)))
         self._auto_burst = self.chk_auto.isChecked()
         self.chk_auto.toggled.connect(self._on_auto_burst_toggled)
         left.addWidget(self.chk_auto)
@@ -752,7 +752,7 @@ class FlowControlTab(QWidget):
     # ------------------------------------------------------- persist settings
     # Bump when a default changes in a way that must reach machines whose saved
     # settings already pin the old value (see _migrate_cfg).
-    CFG_VERSION = 2
+    CFG_VERSION = 3
 
     def _load_cfg(self):
         """Restore saved definitions + run params over the defaults, so nothing
@@ -788,6 +788,17 @@ class FlowControlTab(QWidget):
             self.cfg["clog_arm_frac"] = 0.5
             notes.append("clog arm threshold 80% -> 50% of setpoint "
                          "(air leaks keep this rig below 80%)")
+        if saved_version < 3:
+            # Both of these used to arrive pre-ticked, so a run could settle or
+            # fire bursts on its own before anyone asked for it. They start off
+            # now. Unlike a number, a bool cannot say whether True was chosen or
+            # merely inherited, so this does clear a deliberate tick once — the
+            # note below is there to say so rather than let it look like a bug.
+            for key, label in (("exp_settle", "Settle to target rate"),
+                               ("auto_burst", "Auto-burst in buffer")):
+                if bool(self.cfg.get(key)):
+                    self.cfg[key] = False
+                    notes.append(f"'{label}' now starts unticked — re-tick it if you want it")
         self._migration_notes = notes
         # Stamp the version even with nothing to change, so this runs once.
         self._save_cfg()
