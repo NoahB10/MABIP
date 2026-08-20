@@ -39,7 +39,7 @@ from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QFormLayout, QGroupBox,
     QPushButton, QLineEdit, QLabel, QComboBox, QFrame, QCheckBox,
     QDialog, QDialogButtonBox, QButtonGroup, QMessageBox, QFileDialog, QPlainTextEdit,
-    QStackedWidget)
+    QStackedWidget, QScrollArea, QApplication)
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
@@ -128,6 +128,24 @@ class FlowDefinitionsDialog(QDialog):
     # developer mode so this dialog is readable at a glance.
     _BASIC_FIELDS = ("window",)
 
+    # Value boxes are sized to their contents — 3-6 characters for the tuning
+    # numbers, a bit more for a port name. Left to stretch they take the whole
+    # column width, which reads as a form full of empty boxes.
+    _VALUE_W = 96
+    _BASIC_VALUE_W = 130
+
+    # Nobody reads a bore off a syringe barrel — they read "20 mL" off the
+    # wrapper. The pump still needs the inner diameter, so pick the syringe and
+    # convert here. Values are the BD Plastipak / Luer-Lok bores, the same table
+    # syringe-pump firmware ships (NE-1000, Chemyx); other brands differ by a
+    # few tenths, which is what Custom is for.
+    _SYRINGES = [
+        ("10 mL", 10.0, 14.50),
+        ("20 mL", 20.0, 19.13),
+        ("30 mL", 30.0, 21.70),
+        ("50 / 60 mL", 60.0, 26.70),
+    ]
+
     def __init__(self, cfg, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Flow — Definitions / Settings")
@@ -135,7 +153,33 @@ class FlowDefinitionsDialog(QDialog):
         lay = QVBoxLayout(self); lay.setContentsMargins(16, 16, 16, 16); lay.setSpacing(8)
 
         self.w["port"] = QLineEdit(str(cfg["port"]))
-        self.w["diameter"] = QLineEdit(str(cfg["diameter"]))
+
+        # Syringe size -> bore. A diameter already in cfg that matches no known
+        # syringe is kept as a Custom entry rather than being rounded onto the
+        # nearest standard one: it may have been measured against this rig.
+        self._size = QComboBox()
+        saved_d = float(cfg.get("diameter", 19.13))
+        for label, ml, bore in self._SYRINGES:
+            self._size.addItem(label, bore)
+        match = next((i for i, (_l, _ml, bore) in enumerate(self._SYRINGES)
+                      if abs(bore - saved_d) < 0.005), None)
+        if match is None:
+            self._size.addItem(f"Custom — {saved_d:g} mm", saved_d)
+            match = self._size.count() - 1
+        self._size.setCurrentIndex(match)
+        self._size.setFixedWidth(self._BASIC_VALUE_W)
+
+        # Show the bore the pump will actually be given. The conversion is the
+        # whole point of the dropdown, so it should not be invisible.
+        self._bore_lbl = QLabel()
+        self._bore_lbl.setStyleSheet(f"color:{MUTED};")
+        self._size.currentIndexChanged.connect(self._show_bore)
+        self._show_bore()
+
+        size_row = QWidget()
+        srh = QHBoxLayout(size_row); srh.setContentsMargins(0, 0, 0, 0); srh.setSpacing(8)
+        srh.addWidget(self._size); srh.addWidget(self._bore_lbl); srh.addStretch(1)
+
         seg = QWidget(); sh = QHBoxLayout(seg); sh.setContentsMargins(0, 0, 0, 0); sh.setSpacing(6)
         self._syr = {}
         self._syr_group = QButtonGroup(seg); self._syr_group.setExclusive(True)
@@ -149,14 +193,17 @@ class FlowDefinitionsDialog(QDialog):
         # Basics: the hardware the pump is plumbed with, plus how much history
         # the plot shows. One column — there are few enough to read at a glance.
         form_basic = QFormLayout(); form_basic.setVerticalSpacing(7)
+        form_basic.setFieldGrowthPolicy(QFormLayout.FieldsStayAtSizeHint)
+        self.w["port"].setFixedWidth(self._BASIC_VALUE_W)
         form_basic.addRow("Pump port", self.w["port"])
-        form_basic.addRow("Syringe Ø (mm)", self.w["diameter"])
+        form_basic.addRow("Syringe size", size_row)
         form_basic.addRow("# syringes", seg)
         # Every field is built either way, so hiding one never drops its saved
         # value: values() still reads the whole of self.w.
         for key, label in self._FIELDS:
             self.w[key] = QLineEdit(str(cfg[key]))
             if key in self._BASIC_FIELDS:
+                self.w[key].setFixedWidth(self._BASIC_VALUE_W)
                 form_basic.addRow(label, self.w[key])
         lay.addLayout(form_basic)
 
@@ -189,15 +236,34 @@ class FlowDefinitionsDialog(QDialog):
         # columns so the ~40 rows stay short enough to leave OK/Cancel onscreen.
         self._adv = QGroupBox("Advanced — bench tuning")
         adv_cols = QHBoxLayout(self._adv); adv_cols.setSpacing(24)
-        form_l = QFormLayout(); form_l.setVerticalSpacing(7)
-        form_r = QFormLayout(); form_r.setVerticalSpacing(7)
+        form_l = QFormLayout(); form_r = QFormLayout()
+        for _f in (form_l, form_r):
+            _f.setVerticalSpacing(7)
+            _f.setFieldGrowthPolicy(QFormLayout.FieldsStayAtSizeHint)
         adv_rows = [(label, self.w[key]) for key, label in self._FIELDS
                     if key not in self._BASIC_FIELDS]
         half = (len(adv_rows) + 1) // 2
         for i, (label, widget) in enumerate(adv_rows):
+            widget.setFixedWidth(self._VALUE_W)
+            # Without a floor, a dialog taller than the screen is resolved by
+            # shrinking every row below the font's height, which clips the
+            # digits' descenders — the squashed boxes.
+            widget.setMinimumHeight(widget.sizeHint().height())
             (form_l if i < half else form_r).addRow(label, widget)
         adv_cols.addLayout(form_l); adv_cols.addLayout(form_r)
-        lay.addWidget(self._adv)
+
+        # 40-odd rows will outgrow a short screen. Scroll them rather than let
+        # the layout compress the rows to fit.
+        self._adv_scroll = QScrollArea()
+        self._adv_scroll.setWidgetResizable(True)
+        self._adv_scroll.setFrameShape(QFrame.NoFrame)
+        self._adv_scroll.setWidget(self._adv)
+        lay.addWidget(self._adv_scroll, 1)
+
+        # Never open taller than the screen; the scroll area absorbs the rest.
+        screen = QApplication.primaryScreen()
+        if screen is not None:
+            self.setMaximumHeight(max(320, screen.availableGeometry().height() - 80))
 
         self.chk_dev.toggled.connect(self._toggle_advanced)
         self._toggle_advanced(self.chk_dev.isChecked())
@@ -211,11 +277,25 @@ class FlowDefinitionsDialog(QDialog):
         closing the dialog. Qt keeps the larger height once the block has been
         shown, so the minimum has to be relaxed before adjustSize() can shrink
         the window back down to the basics."""
-        self._adv.setVisible(bool(on))
-        self.setMinimumWidth(660 if on else 380)
+        self._adv_scroll.setVisible(bool(on))
+        self.setMinimumWidth(920 if on else 380)
         self.setMinimumHeight(0)
+
+        if on:
+            # A QScrollArea's own sizeHint is small, so adjustSize() alone would
+            # open the dialog a couple of rows tall with everything behind a
+            # scrollbar. Ask for the full block, capped by what the screen has.
+            screen = QApplication.primaryScreen()
+            avail = screen.availableGeometry().height() if screen else 900
+            chrome = 280        # basics + the two checkboxes + OK/Cancel + title
+            self._adv_scroll.setMinimumHeight(
+                min(self._adv.sizeHint().height() + 8, max(240, avail - chrome)))
+
         self.resize(self.minimumWidth(), self.sizeHint().height())
         self.adjustSize()
+
+    def _show_bore(self, *_):
+        self._bore_lbl.setText(f"→ {float(self._size.currentData()):g} mm bore")
 
     def values(self):
         out = dict(self.cfg)
@@ -227,6 +307,10 @@ class FlowDefinitionsDialog(QDialog):
                     out[k] = float(w.text())
                 except ValueError:
                     pass
+        # The pump is still driven by bore; the dropdown only chooses it.
+        out["diameter"] = float(self._size.currentData())
+        out["syringe_ml"] = next((ml for _l, ml, bore in self._SYRINGES
+                                  if abs(bore - out["diameter"]) < 0.005), None)
         out["flow_sign"] = -1.0 if self.chk_flip.isChecked() else 1.0
         out["dev_mode"] = bool(self.chk_dev.isChecked())
         out["n"] = 2 if self._syr[2].isChecked() else 1
@@ -292,7 +376,10 @@ class FlowControlTab(QWidget):
         self.v = deque(maxlen=36000)
 
         self.cfg = {
-            "port": "auto", "diameter": 19.13, "n": 1, "direction": "withdraw",
+            # diameter is the bore the pump is driven with; syringe_ml records
+            # which syringe it came from, for the status line and the dialog.
+            "port": "auto", "diameter": 19.13, "syringe_ml": 20.0,
+            "n": 1, "direction": "withdraw",
             "settle": 30.0, "measure": 15.0, "window": 120.0,
             "r_start": 5.0, "r_max": 60.0, "r_step": 5.0, "r_dwell": 20.0, "r_tol": 5.0,
             # +1: the sensor already reads positive when flowing forward. -1: it is
@@ -768,8 +855,10 @@ class FlowControlTab(QWidget):
             # so rather than let "saved" read as "the pump is using this now".
             pending = (" — pump keeps the old Ø until you press Apply/Start"
                        if diam_changed and self.line is not None and self._steady else "")
-            self.status_msg.emit(f"Definitions saved — {int(new['n'])} syringe(s), "
-                                 f"Ø{new['diameter']} mm, {new['direction']}, "
+            ml = new.get("syringe_ml")
+            syr = f"{ml:g} mL (Ø{new['diameter']:g} mm)" if ml else f"Ø{new['diameter']:g} mm"
+            self.status_msg.emit(f"Definitions saved — {int(new['n'])} × {syr}, "
+                                 f"{new['direction']}, "
                                  f"dev mode {'ON' if dev else 'off'}.{pending}")
 
     def _load_experiment(self):
