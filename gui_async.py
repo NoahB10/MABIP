@@ -1156,10 +1156,13 @@ class PlotWindow(QWidget):
         if not file_path:
             return
         
-        if not file_path.endswith(".txt"):
-            QMessageBox.warning(self, "Warning", "Please use a .txt extension to save the data.")
-            return
-        
+        # Typing a bare name used to be refused with "please use a .txt
+        # extension" — a dead end for anyone who did not know the file format.
+        # The dialog already filters on *.txt, so supply the extension instead
+        # of asking for it. Only a name that is already .txt is left alone.
+        if not file_path.lower().endswith(".txt"):
+            file_path += ".txt"
+
         try:
             # If we have a sensor file connected, copy it
             if self.data_file and Path(self.data_file).exists():

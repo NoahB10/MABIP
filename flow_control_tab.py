@@ -1275,6 +1275,8 @@ class FlowControlTab(QWidget):
         path, _ = QFileDialog.getSaveFileName(
             self, "Save flow log", os.path.basename(self._flow_log_path), "CSV (*.csv)")
         if path:
+            if not path.lower().endswith(".csv"):   # supply the extension, don't demand it
+                path += ".csv"
             try:
                 shutil.copyfile(self._flow_log_path, path)
                 self.status_msg.emit(f"Flow log saved → {path}")
