@@ -546,11 +546,13 @@ class FlowControlTab(QWidget):
                                "kills the air surge. Runs at the Flow rate; calibrated, needs NO sensor.")
         self.chk_ff.toggled.connect(lambda v: setattr(self, "_ff_enabled", bool(v)))
         left.addWidget(self.chk_ff)
-        self.chk_settle = QCheckBox("Settle to rate before run")
-        self.chk_settle.setToolTip("Before an experiment run starts, command the pump to the run's flow "
-                                   "rate and wait for the SENSOR to actually reach it — if the measured "
-                                   "flow is low, raise the pump until it hits the target, then start the "
-                                   "wells. Needs the flow sensor connected. (Definitions: tolerance/hold/timeout.)")
+        self.chk_settle = QCheckBox("Settle to target rate")
+        self.chk_settle.setToolTip("Before an experiment run starts, treat the run's flow rate as a TARGET "
+                                   "at the sensor and wait for the sensor to actually read it — if the "
+                                   "measured flow is low, raise the pump until it holds the target, then "
+                                   "start the wells. The pump rate that got there is written back into "
+                                   "Flow rate, since it is usually not the target itself. "
+                                   "Needs the flow sensor connected. (Definitions: tolerance/hold/timeout.)")
         self.chk_settle.setChecked(bool(self.cfg.get("exp_settle", True)))
         self.chk_settle.toggled.connect(lambda v: self.cfg.__setitem__("exp_settle", bool(v)))
         left.addWidget(self.chk_settle)

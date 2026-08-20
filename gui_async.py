@@ -1963,10 +1963,30 @@ class AsyncAMUZAGUI(QMainWindow):
         self._exp_log("⏹ Stop experiment requested — will finish the current well then halt.")
         self.app_state.stop_event.set()   # asyncio.Event.set() is synchronous
 
+    def _publish_settled_rate(self, tab, commanded, target_line, measured):
+        """Write the pump rate that actually holds the target into Flow rate.
+
+        Silent when the pump never had to be raised — rewriting the box with the
+        number already in it would log a change that did not happen."""
+        if abs(commanded - target_line) <= 0.05:
+            return
+        try:
+            tab.f_rate.setText(f"{commanded:g}")
+            tab._save_cfg()
+        except Exception as e:                       # never abort a run over the UI
+            self._exp_log(f"settle: could not update the Flow rate box ({e}).")
+            return
+        self._exp_log(f"settle: pumping rate updated to {commanded:g} µL/min (line) — "
+                      f"the rate that holds {measured:.1f} at the sensor "
+                      f"(target {target_line:g}).")
+
     async def _settle_flow_to(self, target_line, label=""):
-        """Command the pump to `target_line` µL/min and wait until the SENSOR actually
-        reads it (raising the pump if the measured flow is low) before returning True.
-        Returns False if STOP was pressed. No-ops (True) if disabled / no pump."""
+        """Hold `target_line` µL/min AT THE SENSOR before returning True.
+
+        `target_line` is a target for the measured flow, not a pump setting: the
+        pump starts there, is raised while the sensor reads low, and the rate
+        that finally holds the target is written back to Flow rate. Returns
+        False if STOP was pressed. No-ops (True) if disabled / no pump."""
         tab = getattr(self, "flow_tab", None)
         if tab is None or tab.line is None or target_line <= 0:
             return True
@@ -2018,6 +2038,13 @@ class AsyncAMUZAGUI(QMainWindow):
                 if stable_since is None:
                     stable_since = now
                 if now - stable_since >= hold_s:
+                    # `target_line` is what the SENSOR should read; `commanded`
+                    # is what the pump had to be driven at to hold it, and dead
+                    # volume and tubing compliance make those differ. Publish
+                    # the rate that actually worked, so Flow rate shows what the
+                    # line is really being driven at and every later Start /
+                    # Burst / phase change inherits it instead of the guess.
+                    self._publish_settled_rate(tab, commanded, target_line, mval)
                     self._exp_log(f"✓ Flow at {mval:.1f} µL/min (target {target_line:g}) — starting {label}.")
                     return True
             else:
