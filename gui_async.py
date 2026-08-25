@@ -432,11 +432,14 @@ class PlotWindow(QWidget):
             "sections, no flow column) for the BioMon software.")
         self.biomon_btn.clicked.connect(self._on_export_biomon)
         data_v.addWidget(self.biomon_btn)
+        # Not needed day to day — hidden, the action stays wired for later.
+        self.biomon_btn.hide()
 
         self.export_btn = QPushButton("Export CSV")
         self.export_btn.setToolTip("Export the plotted metabolite traces as CSV.")
         self.export_btn.clicked.connect(self._on_export_data)
         data_v.addWidget(self.export_btn)
+        self.export_btn.hide()   # same: hidden, not removed
 
         left.addWidget(data_box)
 
