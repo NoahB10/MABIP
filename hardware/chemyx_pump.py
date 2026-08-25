@@ -123,16 +123,36 @@ class ChemyxPump:
     SETTLE = 0.2
 
     def open(self):
-        """Open the serial connection (idempotent)."""
+        """Open the serial connection and prove a pump is answering (idempotent).
+
+        An open port alone proves nothing: the FTDI adapter is powered by the
+        USB bus, so /dev/ttyUSB* opens perfectly well with the pump switched
+        off. Probe it, and release the port if nothing answers.
+        """
         with self._lock:
             if self.ser and self.ser.is_open:
-                return
+                return self
             self.ser = serial.Serial(self.port, self.baud,
                                      timeout=self.timeout, write_timeout=2.0)
             time.sleep(0.2)
             self.ser.reset_input_buffer()
             self.ser.reset_output_buffer()
+            try:
+                self.ping()
+            except Exception:
+                self.ser.close()
+                self.ser = None
+                raise
         return self
+
+    def ping(self):
+        """Round-trip a harmless query; raises PumpError unless a pump answers."""
+        import re
+        reply = self.command("read limit parameter")
+        if not re.search(r"\d", reply):
+            raise PumpError(f"Garbled reply from {self.port} ({reply!r}) — "
+                            "is the pump powered on and set to this baud rate?")
+        return reply
 
     def close(self):
         """Close the serial connection."""
@@ -175,6 +195,10 @@ class ChemyxPump:
             self.ser.flush()                 # push all bytes out before reading
             time.sleep(self.SETTLE)          # let the full echo + reply arrive
             raw = self._read_until_prompt(timeout or self.timeout)
+            if not raw:
+                # The pump always echoes and prompts; total silence means no
+                # pump on the line, not an empty answer.
+                raise PumpError(f"No reply from pump on {self.port} — is it powered on?")
             reply = self._parse(raw, full)
             if self.verbose:
                 print(f">>> {full!r}  ->  {reply!r}")
