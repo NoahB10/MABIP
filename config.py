@@ -154,7 +154,8 @@ class FileConfig:
     SETTINGS_FOLDER: str = ".mabip"  # In user home directory
 
     # File formats
-    SENSOR_FILENAME_FORMAT: str = "Sensor_readings_{timestamp}.txt"
+    # ONE file per sensor session: sampling rows + well log + flow log (see run_file.py)
+    SENSOR_FILENAME_FORMAT: str = "MABIP_Run_{timestamp}.txt"
     AMUZA_LOG_FORMAT: str = "AMUZA-{timestamp}.log"
     TIMESTAMP_FORMAT: str = "%d_%m_%y_%H_%M"
     LOG_TIMESTAMP_FORMAT: str = "%Y-%m-%d_%H-%M-%S"

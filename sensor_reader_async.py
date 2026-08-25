@@ -121,17 +121,23 @@ class AsyncPotentiostatReader:
         baudrate: int = HARDWARE.SERIAL_BAUD_RATE,
         output_file: str = None,
         use_mock: bool = False,
-        data_callback: Callable[[SensorReading], None] = None
+        data_callback: Callable[[SensorReading], None] = None,
+        sink=None,
     ):
         self.port = port
         self.baudrate = baudrate
         self.use_mock = use_mock
         self.data_callback = data_callback  # Optional callback for real-time GUI updates
         self.flow_provider = None  # Optional callable -> (flow_uL_min, clog)
+        # A run_file.RunFile: when set, header and rows go through it, so the
+        # sampling shares ONE file with the well log and flow log.
+        self.sink = sink
 
         # Generate output file path with timestamp
         if output_file:
             self.output_file = output_file
+        elif sink is not None:
+            self.output_file = str(sink.path)
         else:
             timestamp = datetime.now().strftime(FILES.TIMESTAMP_FORMAT)
             self.output_file = str(
@@ -287,28 +293,30 @@ class AsyncPotentiostatReader:
             self.is_running = False
             logger.info("Sensor reading loop stopped")
 
+    def _header_text(self) -> str:
+        """The legacy (BioMon) 3-line header: Created, column names, Start."""
+        stamp = self.start_time.strftime("%m/%d/%Y\t%I:%M:%S %p")
+        header_cols = ["counter", "t[min]"] + self.channel_names
+        # Add X(Fit) columns
+        header_cols += [f"X(Fit{k})" for k in range(1, 65)]
+        # Add Fit coefficient columns
+        header_cols += [f"Fit{k}a{i}" for k in range(1, 65) for i in range(1, 5)]
+        # Fluigent flow rate — TRAILING column. Rows already carry the 320 fit
+        # values, so this aligns with the value appended by _line_with_flow and
+        # leaves every existing column exactly where downstream parsers expect.
+        header_cols += ["flow_uL_min"]
+        return (f"Created: {stamp}\n"
+                + "\t".join(header_cols) + "\n"
+                + f"Start: {stamp}\n")
+
     async def _write_file_header(self):
         """Write legacy format header to output file"""
-        async with aiofiles.open(self.output_file, 'w') as f:
-            # Created timestamp
-            created_time = self.start_time.strftime("%m/%d/%Y\t%I:%M:%S %p")
-            await f.write(f"Created: {created_time}\n")
-
-            # Column headers
-            header_cols = ["counter", "t[min]"] + self.channel_names
-            # Add X(Fit) columns
-            header_cols += [f"X(Fit{k})" for k in range(1, 65)]
-            # Add Fit coefficient columns
-            header_cols += [f"Fit{k}a{i}" for k in range(1, 65) for i in range(1, 5)]
-            # Fluigent flow rate — TRAILING column. Rows already carry the 320 fit
-            # values, so this aligns with the value appended by _line_with_flow and
-            # leaves every existing column exactly where downstream parsers expect.
-            header_cols += ["flow_uL_min"]
-            await f.write("\t".join(header_cols) + "\n")
-
-            # Start timestamp
-            start_time = self.start_time.strftime("%m/%d/%Y\t%I:%M:%S %p")
-            await f.write(f"Start: {start_time}\n")
+        text = self._header_text()
+        if self.sink is not None:
+            await asyncio.to_thread(self.sink.write_header, text)
+        else:
+            async with aiofiles.open(self.output_file, 'w') as f:
+                await f.write(text)
 
         logger.info(f"File header written to {self.output_file}")
 
@@ -317,12 +325,18 @@ class AsyncPotentiostatReader:
         if not self.write_buffer:
             return
 
+        buffered, self.write_buffer = self.write_buffer, []
+        text = ''.join(buffered)
         try:
-            async with aiofiles.open(self.output_file, 'a') as f:
-                await f.write(''.join(self.write_buffer))
-            self.write_buffer.clear()
+            if self.sink is not None:
+                await asyncio.to_thread(self.sink.append, text)
+            else:
+                async with aiofiles.open(self.output_file, 'a') as f:
+                    await f.write(text)
             self.last_flush_time = asyncio.get_event_loop().time()
         except Exception as e:
+            # Keep the rows for the next attempt rather than dropping them.
+            self.write_buffer = buffered + self.write_buffer
             logger.error(f"Error flushing write buffer: {e}")
 
     async def _maybe_flush_buffer(self):

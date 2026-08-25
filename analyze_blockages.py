@@ -1,38 +1,47 @@
 #!/usr/bin/env python3
-"""Scan a saved Sensor_readings_*.txt for flow blockages, offline.
+"""Scan a saved run file (MABIP_Run_*.txt, or an old Sensor_readings_*.txt) for
+flow blockages, offline.
 
 Replays the file through the same BlockageDetector the GUI runs live, so what it
 reports here is exactly what would have been alarmed at the bench. Useful for
 re-reading past experiments and for re-tuning against a run with known clogs.
 
-    python analyze_blockages.py Sensor_Readings/Sensor_readings_14_07_26_15_00.txt
+    python analyze_blockages.py Sensor_Readings/MABIP_Run_25_08_26_16_27.txt
     python analyze_blockages.py <file> --cycle-min 2.95 --plot out.png
 
-If a matching Well_Log_*.csv sits next to the sensor file, the true well cycle is
-measured from it rather than assumed.
+The true well cycle is measured from the well log rather than assumed: the run
+file carries its own; for an old Sensor_readings file the sibling Well_Log_*.csv
+is used when present.
 """
 
 from __future__ import annotations
 
 import argparse
+import functools
 import re
 import sys
 from pathlib import Path
 
 from blockage_detector import BlockageDetector, DetectorConfig
+from run_file import parse as parse_run
 
 CH = [f"#1ch{i}" for i in range(1, 7)]
+
+
+@functools.lru_cache(maxsize=4)
+def _parsed(path: Path):
+    return parse_run(path)
 
 
 def load(path: Path):
     """Return (t_seconds[], channels[][6], flow[] or None).
 
-    The sensor file is a wide tab-separated table (~386 columns) with a 3-line
-    header: 'Created:', the column names, then 'Start:'.
+    Reads the single run file (sampling + well log + flow log, live or finalized)
+    as well as an old Sensor_readings_*.txt; only the wide sampling table is used
+    here, its columns taken from the header line.
     """
-    with open(path) as f:
-        lines = f.readlines()
-    header = lines[1].rstrip("\n").split("\t")
+    run = _parsed(path)
+    header = run.columns
     try:
         idx = [header.index(c) for c in CH]
         t_i = header.index("t[min]")
@@ -41,8 +50,8 @@ def load(path: Path):
     flow_i = header.index("flow_uL_min") if "flow_uL_min" in header else None
 
     ts, chans, flow = [], [], []
-    for ln in lines[3:]:
-        p = ln.rstrip("\n").split("\t")
+    for ln in run.sensor:
+        p = ln.split("\t")
         if len(p) <= max(idx):
             continue
         try:
@@ -55,14 +64,14 @@ def load(path: Path):
     return ts, chans, (flow or None)
 
 
-def well_cycle_s(sensor_path: Path):
-    """Median gap between well completions in the sibling Well_Log, or None."""
+def _legacy_well_minutes(sensor_path: Path):
+    """Completion times from the sibling Well_Log_*.csv of an OLD run."""
     m = re.search(r"Sensor_readings_(.+)\.txt$", sensor_path.name)
     if not m:
-        return None
+        return []
     wl = sensor_path.with_name(f"Well_Log_{m.group(1)}.csv")
     if not wl.exists():
-        return None
+        return []
     # Skip comment lines and the column header; the number of comment lines has
     # grown over time, so match on content rather than a fixed offset.
     mins = []
@@ -75,6 +84,20 @@ def well_cycle_s(sensor_path: Path):
                 mins.append(float(p[2]))
             except ValueError:
                 pass
+    return mins
+
+
+def well_cycle_s(sensor_path: Path):
+    """Median gap between well completions, from the run file's own well log
+    (or, for an old run, the sibling Well_Log). None if there are too few."""
+    mins = []
+    for row in _parsed(sensor_path).wells:
+        try:
+            mins.append(float(row[2]))
+        except (ValueError, IndexError):
+            pass
+    if len(mins) < 3:
+        mins = _legacy_well_minutes(sensor_path)
     if len(mins) < 3:
         return None
     gaps = sorted(b - a for a, b in zip(mins[:-1], mins[1:]) if 0 < b - a < 60)
@@ -88,7 +111,7 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("file", type=Path)
     ap.add_argument("--cycle-min", type=float, default=None,
-                    help="well cycle in minutes (default: from Well_Log, else 2.95)")
+                    help="well cycle in minutes (default: from the well log, else 2.95)")
     ap.add_argument("--flat-frac", type=float, default=DetectorConfig.flat_frac)
     ap.add_argument("--confirm-s", type=float, default=DetectorConfig.confirm_s)
     ap.add_argument("--plot", type=Path, default=None, help="write a PNG overview")
@@ -102,7 +125,7 @@ def main():
         cycle_s, src = args.cycle_min * 60.0, "command line"
     else:
         measured = well_cycle_s(args.file)
-        cycle_s, src = (measured, "Well_Log") if measured else (177.0, "default")
+        cycle_s, src = (measured, "well log") if measured else (177.0, "default")
 
     det = BlockageDetector(config=DetectorConfig(
         cycle_s=cycle_s, flat_frac=args.flat_frac, confirm_s=args.confirm_s))

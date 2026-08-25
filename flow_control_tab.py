@@ -363,7 +363,9 @@ class FlowControlTab(QWidget):
         self._abort_clear = False        # STOP / resume flag that unwinds the escalation
         self._last_clear_method = None   # "forward burst" | "reverse push" | None(failed)
         self._clear_baseline = 0.0       # line rate to restore after clearing
-        self._flow_log_path = None       # own continuous flow-rate log file
+        self._flow_log_path = None       # own Flow_Log_*.csv (only when MABIP's run file isn't live)
+        self._flow_log_armed = False     # logging on (sensor present)
+        self._flow_sink_name = None      # run file currently receiving flow rows
         self._flow_log_last = 0.0
         self._seg_label = ""             # tags flow-log rows during an experiment
         self._exp_sweep = None           # loaded flow-sweep config
@@ -584,9 +586,9 @@ class FlowControlTab(QWidget):
         left.addWidget(self.lbl_phase)
 
         self.btn_savelog = QPushButton("💾  Save flow log…")
-        self.btn_savelog.setToolTip("Save a copy of this run's flow-rate log (elapsed, flow, air) "
-                                    "to a file you choose. Also auto-logs to Sensor_Readings/, and "
-                                    "appends to the metabolite file when the sensor is recording.")
+        self.btn_savelog.setToolTip("Save the flow-rate log (elapsed, flow, clog, air) to a file you "
+                                    "choose. While the metabolite sensor records, the flow log lives "
+                                    "inside MABIP's single run file, so that whole file is saved.")
         self.btn_savelog.clicked.connect(self._save_log)
         left.addWidget(self.btn_savelog)
 
@@ -646,35 +648,7 @@ class FlowControlTab(QWidget):
         (self.trace,) = self.ax.plot([], [], color=ACCENT, lw=1.6)
         self.hline = self.ax.axhline(0.0, color=RED, ls="--", lw=1.0)
 
-        # While the metabolite sensor runs, the flow trace is drawn on the
-        # Plotting tab's right axis and this canvas is frozen (see _poll). A dead
-        # plot that still looks live is worse than no plot, so cover it with a
-        # panel that says where the trace went and keeps the live number visible.
-        cover = QWidget()
-        cover.setStyleSheet("background:#11151c;border:1px solid #2a3340;border-radius:6px;")
-        cl = QVBoxLayout(cover); cl.setContentsMargins(24, 24, 24, 24); cl.setSpacing(4)
-        cl.addStretch(1)
-        cap = QLabel("CURRENT FLOW"); cap.setAlignment(Qt.AlignCenter)
-        cap.setStyleSheet(f"color:{MUTED};font-size:12px;font-weight:700;"
-                          "letter-spacing:2px;border:none;")
-        self.lbl_cover_flow = QLabel("—"); self.lbl_cover_flow.setAlignment(Qt.AlignCenter)
-        self.lbl_cover_flow.setStyleSheet(
-            f"color:{ACCENT};font-size:56px;font-weight:700;border:none;")
-        cunit = QLabel("µL/min (combined)"); cunit.setAlignment(Qt.AlignCenter)
-        cunit.setStyleSheet(f"color:{MUTED};font-size:13px;border:none;")
-        msg = QLabel("Live flow plotting is on the <b>Plotting</b> tab —\n"
-                     "the trace is drawn there on the right-hand axis "
-                     "while the metabolite sensor is recording.")
-        msg.setAlignment(Qt.AlignCenter); msg.setWordWrap(True)
-        msg.setStyleSheet("color:#cfe3ff;font-size:14px;padding-top:18px;border:none;")
-        for wdg in (cap, self.lbl_cover_flow, cunit, msg):
-            cl.addWidget(wdg)
-        cl.addStretch(1)
-
-        self.plot_stack = QStackedWidget()
-        self.plot_stack.addWidget(self.canvas)   # 0 = live plot
-        self.plot_stack.addWidget(cover)         # 1 = "see the Plotting tab"
-        right.addWidget(self.plot_stack, 1)
+        right.addWidget(self.canvas, 1)
 
         self.lbl_status = QLabel("Not connected. Press Connect to plot the Fluigent sensor.")
         self.lbl_status.setStyleSheet(f"color:{MUTED};")
@@ -1176,7 +1150,8 @@ class FlowControlTab(QWidget):
                 self.line.close()
         except Exception:
             pass
-        self.line = None; self.latest_flow = None; self._flow_log_path = None
+        self.line = None; self.latest_flow = None
+        self._flow_log_path = None; self._flow_log_armed = False
         self._set_pill(self.pill_pump, False, "pump")
         self._set_pill(self.pill_sensor, False, "sensor")
         self.btn_pump.setText("Connect pump")
@@ -1228,30 +1203,49 @@ class FlowControlTab(QWidget):
                 self.line.disconnect_sensor()
         except Exception:
             pass
-        self.latest_flow = None; self._flow_log_path = None
+        self.latest_flow = None
+        self._flow_log_path = None; self._flow_log_armed = False
         self._set_pill(self.pill_sensor, False, "sensor")
         self.btn_sensor.setText("Connect sensor")
         self._refresh_actions()
         self.status_msg.emit("Flow sensor disconnected (pump still connected).")
 
     def _start_flow_log(self):
-        """Create the flow tab's OWN continuous log file (independent of the
-        metabolite file, which separately gets the flow via its flow_uL_min col)."""
+        """Arm flow logging. Rows go into MABIP's run file while the metabolite
+        sensor records (ONE file per session: sampling + wells + flow); otherwise
+        into this tab's own Flow_Log_*.csv, created on the first sample so a
+        session that only ever logged into the run file leaves no empty stub."""
+        self._flow_log_path = None
+        self._flow_log_armed = True
+        self._flow_sink_name = None
+        self._flow_log_last = 0.0
+
+    def _run_sink(self):
+        """MABIP's live run file (run_file.RunFile), or None when the metabolite
+        sensor is idle."""
+        mg = self.main_gui
+        return getattr(mg, "run_file", None) if mg is not None else None
+
+    def _own_flow_log(self):
+        """The standalone Flow_Log_*.csv, created on demand. None if it can't be."""
+        if self._flow_log_path is not None:
+            return self._flow_log_path
         import os
         from datetime import datetime
         folder = _sensor_readings_dir()
         try:
             os.makedirs(folder, exist_ok=True)
             ts = datetime.now().strftime("%d_%m_%y_%H_%M")
-            self._flow_log_path = os.path.join(folder, f"Flow_Log_{ts}.csv")
-            with open(self._flow_log_path, "w") as f:
+            path = os.path.join(folder, f"Flow_Log_{ts}.csv")
+            with open(path, "w") as f:
                 f.write(f"# Flow rate log — started {datetime.now():%Y-%m-%d %H:%M:%S}\n")
                 f.write("elapsed_s,timestamp,flow_uL_min,clog,air_bubble,segment\n")
-            self._flow_log_last = 0.0
-            self.status_msg.emit(f"Flow log → {os.path.basename(self._flow_log_path)}")
+            self._flow_log_path = path
+            self.status_msg.emit(f"Flow log → {os.path.basename(path)}")
         except Exception as e:
-            self._flow_log_path = None
+            self._flow_log_armed = False
             self.status_msg.emit(f"Flow log not started: {e}")
+        return self._flow_log_path
 
     def _console_log(self, msg):
         """Append a timestamped line to the activity console under the graph."""
@@ -1267,14 +1261,29 @@ class FlowControlTab(QWidget):
         self.status_msg.emit(msg)
 
     def _save_log(self):
-        """Save a copy of the current flow log wherever you choose."""
+        """Save the flow log wherever you choose. While the metabolite sensor
+        records, the flow lives inside MABIP's run file, so that whole file
+        (sampling + wells + flow) is what gets saved — one file, .txt added."""
         import os, shutil
+        sink = self._run_sink()
+        if sink is not None and sink.path.exists():
+            path, _ = QFileDialog.getSaveFileName(
+                self, "Save run file", sink.name, "Text (*.txt);;All files (*)")
+            if path:
+                try:
+                    out = sink.snapshot_to(path)
+                    self.status_msg.emit(f"Run file saved → {out}")
+                except Exception as e:
+                    self.status_msg.emit(f"Save failed: {e}")
+            return
         if not self._flow_log_path or not os.path.exists(self._flow_log_path):
             self.status_msg.emit("No flow log yet — connect and let it record first.")
             return
         path, _ = QFileDialog.getSaveFileName(
             self, "Save flow log", os.path.basename(self._flow_log_path), "CSV (*.csv)")
         if path:
+            if not os.path.splitext(path)[1]:
+                path += ".csv"
             try:
                 shutil.copyfile(self._flow_log_path, path)
                 self.status_msg.emit(f"Flow log saved → {path}")
@@ -1368,7 +1377,7 @@ class FlowControlTab(QWidget):
             return
         n = self._nsyr()
         direction = self.cfg["direction"]
-        if self._flow_log_path is None:
+        if not self._flow_log_armed:
             self.status_msg.emit("⚠ No flow log — connect the SENSOR first so the decay is recorded.")
         self._abort = False
         self.exp_running.emit(True)
@@ -1869,23 +1878,9 @@ class FlowControlTab(QWidget):
                 except Exception:
                     pass
 
-    def _show_plot_cover(self, covered: bool):
-        """Swap the plot area between the live canvas and the cover panel.
-
-        Only touched on a real change, so the stack isn't churned every 150 ms
-        tick. The big readout above the plot keeps updating either way; the
-        cover repeats it so the number stays large once the trace is gone."""
-        idx = 1 if covered else 0
-        if self.plot_stack.currentIndex() != idx:
-            self.plot_stack.setCurrentIndex(idx)
-            if covered:
-                self.lbl_cover_flow.setText(self.lbl_flow.text())
-
     def _poll(self):
         # Nothing to read/plot/log without a flow sensor (pump-only is fine).
         if self.line is None or getattr(self.line, "sensor", None) is None:
-            # No sensor => no trace anywhere, so never leave the cover up.
-            self._show_plot_cover(False)
             return
         # During a burst calibration the worker thread owns the sensor (fast
         # sampling); don't read it here too (concurrent HID reads corrupt data).
@@ -1909,29 +1904,31 @@ class FlowControlTab(QWidget):
         # pumping). If the pump isn't pumping, no flow is expected, so nothing to do.
         self._clog_watch(val)
 
-        # own flow-rate log file (independent of the metabolite file), ~1 Hz
-        if self._flow_log_path and (now - self._flow_log_last) >= 1.0:
+        # flow-rate log, ~1 Hz: into MABIP's run file while the metabolite
+        # sensor records (one file per session), else this tab's own file.
+        if self._flow_log_armed and (now - self._flow_log_last) >= 1.0:
             self._flow_log_last = now
             try:
                 from datetime import datetime
-                with open(self._flow_log_path, "a") as _lf:
-                    _lf.write(f"{now:.2f},{datetime.now():%Y-%m-%d %H:%M:%S},{val:.3f},"
-                              f"{1 if self.is_clogged else 0},{1 if self._last_air else 0},"
-                              f"{self._seg_label}\n")
+                sink = self._run_sink()
+                if sink is not None:
+                    if self._flow_sink_name != sink.name:
+                        self._flow_sink_name = sink.name
+                        self.status_msg.emit(f"Flow log → {sink.name} (MABIP run file)")
+                    sink.log_flow(now, datetime.now(), val, bool(self.is_clogged),
+                                  bool(self._last_air), self._seg_label)
+                else:
+                    path = self._own_flow_log()
+                    if path:
+                        with open(path, "a") as _lf:
+                            _lf.write(f"{now:.2f},{datetime.now():%Y-%m-%d %H:%M:%S},{val:.3f},"
+                                      f"{1 if self.is_clogged else 0},{1 if self._last_air else 0},"
+                                      f"{self._seg_label}\n")
             except Exception:
                 pass
 
-        # Mutual exclusivity: when the metabolite sensor is running, the flow is
-        # drawn on that plot's right axis — don't also draw it here. Cover this
-        # canvas so a frozen trace can't be mistaken for the live one.
-        if self._metabolites_running():
-            self._show_plot_cover(True)
-            self.lbl_cover_flow.setText(f"{val:+.2f}")
-            self._tick += 1
-            if self._tick % 40 == 0:
-                self.lbl_status.setText("Metabolite plot active — flow shown there (right axis).")
-            return
-        self._show_plot_cover(False)
+        # The Plotting tab draws the flow on its right axis too while the
+        # metabolite sensor records — fine: this graph keeps running as well.
 
         # redraw ~ every 300 ms — but only while this tab is actually on screen.
         # Re-rendering a matplotlib canvas behind another tab burned a whole CPU

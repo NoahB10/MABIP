@@ -62,6 +62,8 @@ except ImportError:
 
 # Import our async modules
 from config import HARDWARE, UI, SENSOR, FILES, ASYNC_CONFIG
+from run_file import (RunFile, ensure_txt, export_biomon, biomon_name_for,
+                      tidy_folder, parse as parse_run_file)
 from app_state import AppState
 from async_utils import AsyncTaskManager, interruptible_sleep
 from amuza_async import AsyncAmuzaConnection, Method, Sequence
@@ -397,21 +399,15 @@ class PlotWindow(QWidget):
         self.sensor_status_label.setStyleSheet("QLabel { font-weight: 600; color: #555; }")
         sensor_v.addWidget(self.sensor_status_label)
 
-        self.connect_sensor_btn = QPushButton("Connect Sensor")
-        self.connect_sensor_btn.setToolTip(
-            "Connect the metabolite (SIX) sensor and start recording. "
-            "Auto-picks the CP210x transmitter port.")
-        self.connect_sensor_btn.setStyleSheet(
-            "QPushButton { background:#2e7d32; color:white; font-weight:700; }"
-            "QPushButton:hover { background:#276b2a; }")
-        self.connect_sensor_btn.clicked.connect(self._on_connect_sensor)
-        sensor_v.addWidget(self.connect_sensor_btn)
-
-        self.disconnect_sensor_btn = QPushButton("Disconnect Sensor")
-        self.disconnect_sensor_btn.setToolTip("Stop recording and release the sensor port.")
-        self.disconnect_sensor_btn.setEnabled(False)
-        self.disconnect_sensor_btn.clicked.connect(self._on_disconnect_sensor)
-        sensor_v.addWidget(self.disconnect_sensor_btn)
+        # One button, like the pump and flow-sensor ones: Connect <-> Disconnect.
+        self.sensor_btn = QPushButton("Connect Sensor")
+        self.sensor_btn.setToolTip(
+            "Connect the metabolite (SIX) sensor and start recording "
+            "(auto-picks the CP210x transmitter port). Press again to stop "
+            "recording and release the port.")
+        self.sensor_btn.clicked.connect(self._on_toggle_sensor)
+        sensor_v.addWidget(self.sensor_btn)
+        self._style_sensor_btn(False)
         left.addWidget(sensor_box)
 
         data_box = QGroupBox("Data")
@@ -424,9 +420,18 @@ class PlotWindow(QWidget):
         data_v.addWidget(self.load_btn)
 
         self.save_btn = QPushButton("💾  Save As…")
-        self.save_btn.setToolTip("Write the collected data to a file you choose (legacy tab format).")
+        self.save_btn.setToolTip(
+            "Save this run — sampling, well log and flow log — as ONE .txt file "
+            "wherever you choose (.txt is added for you).")
         self.save_btn.clicked.connect(self._on_save_file)
         data_v.addWidget(self.save_btn)
+
+        self.biomon_btn = QPushButton("Export for BioMon…")
+        self.biomon_btn.setToolTip(
+            "Write just the sampling table in the legacy BioMon layout (no well/flow "
+            "sections, no flow column) for the BioMon software.")
+        self.biomon_btn.clicked.connect(self._on_export_biomon)
+        data_v.addWidget(self.biomon_btn)
 
         self.export_btn = QPushButton("Export CSV")
         self.export_btn.setToolTip("Export the plotted metabolite traces as CSV.")
@@ -1098,94 +1103,74 @@ class PlotWindow(QWidget):
         self.full_data = self.cached_data.copy()
     
     def _load_txt_file(self, file_path: str):
-        """Load TXT file (original tab-separated format)"""
-        with open(file_path, "r", newline="", encoding='utf-8') as file:
-            lines = file.readlines()
-        
-        if len(lines) < 4:
-            raise ValueError("Insufficient data in file")
-        
-        # Parse tab-separated data
-        data = [line.strip().split("\t") for line in lines]
-        
-        # Clean data like original: take first 9 columns (0-8), skip first 3 rows
-        df = pd.DataFrame(data)
-        # Use iloc for positional indexing - take first 9 columns
-        df = df.iloc[:, :9]
-        # Skip first 3 rows (Created, header, Start lines)
-        df = df.iloc[3:]
-        # Reset index after slicing
-        df = df.reset_index(drop=True)
-        # Set column names
-        df.columns = ['counter', 't[min]', '#1ch1', '#1ch2', '#1ch3', '#1ch4', '#1ch5', '#1ch6', '#1ch7']
-        
-        # Remove comments at the end if they appear
-        end_idx = len(df)
-        for i in range(len(df)):
-            a = str(df.iloc[i]['counter'])
-            if not a.isdigit():
-                end_idx = i
-                break
-        
-        if end_idx < len(df):
-            df = df.iloc[:end_idx]
-        
-        # Convert to numeric
-        df = df.apply(pd.to_numeric, errors="coerce")
-        
-        # Convert to our internal format for plotting
+        """Load a run file (single-file layout, live or finalized) or a legacy
+        BioMon / Sensor_readings file. Only the sampling table is plotted."""
+        import numpy as np
+        run = parse_run_file(file_path)
+        values = run.sensor_values(7)
+        if not values:
+            raise ValueError("No sampling rows found in file")
+        arr = np.array(values, dtype=float)
+
         self.cached_data = pd.DataFrame()
         self.full_data = pd.DataFrame()
-        
-        time_values = df['t[min]'].values * 60  # Convert minutes to seconds
-        
-        plot_data = {'Time': time_values}
+        plot_data = {'Time': arr[:, 0] * 60}   # minutes -> seconds
         for ch in range(1, 8):
-            col_name = f'#1ch{ch}'
-            if col_name in df.columns:
-                plot_data[f'Channel {ch}'] = df[col_name].values
-        
+            plot_data[f'Channel {ch}'] = arr[:, ch]
         self.cached_data = pd.DataFrame(plot_data)
         self.full_data = self.cached_data.copy()
-    
+        logger.info(f"Loaded {len(values)} sampling rows, {len(run.wells)} well-log rows, "
+                    f"{len(run.flows)} flow rows from {file_path}")
+
     def _on_save_file(self):
-        """Save a copy of the current data file to a specified location (like original)"""
+        """Save the whole run — sampling rows, well log, flow log — as ONE file."""
+        src = self._current_run_source()
+        if src is None and self.full_data.empty:
+            QMessageBox.warning(self, "Warning", "No data is available to save.")
+            return
+        suggested = Path(src).name if src else "MABIP_Run.txt"
         file_path, _ = QFileDialog.getSaveFileName(
-            self, "Save File", "", "Text Files (*.txt)"
-        )
+            self, "Save run as", suggested, "Text Files (*.txt);;All Files (*)")
         if not file_path:
             return
-        
-        if not file_path.endswith(".txt"):
-            QMessageBox.warning(self, "Warning", "Please use a .txt extension to save the data.")
-            return
-        
+        file_path = ensure_txt(file_path)   # nobody should have to type .txt
         try:
-            # If we have a sensor file connected, copy it
-            if self.data_file and Path(self.data_file).exists():
-                with open(self.data_file, "r", encoding='utf-8') as source_file:
-                    with open(file_path, "w", encoding='utf-8') as dest_file:
-                        dest_file.write(source_file.read())
-                QMessageBox.information(self, "Success", f"Data successfully saved to {file_path}")
-                logger.info(f"Saved sensor data to {file_path}")
-            # If we loaded a file, save that
-            elif self.loaded_file_path and Path(self.loaded_file_path).exists():
-                with open(self.loaded_file_path, "r", encoding='utf-8') as source_file:
-                    with open(file_path, "w", encoding='utf-8') as dest_file:
-                        dest_file.write(source_file.read())
-                QMessageBox.information(self, "Success", f"Data successfully saved to {file_path}")
-                logger.info(f"Saved loaded file to {file_path}")
-            # Otherwise generate from full_data
-            elif not self.full_data.empty:
-                self._save_data_to_file(file_path, self.full_data)
-                QMessageBox.information(self, "Success", f"Data successfully saved to {file_path}")
-                logger.info(f"Generated and saved data to {file_path}")
+            if src is not None:
+                RunFile(src).snapshot_to(file_path)
             else:
-                QMessageBox.warning(self, "Warning", "No data is available to save.")
+                self._save_data_to_file(file_path, self.full_data)
+            QMessageBox.information(self, "Saved", f"Run saved to {file_path}")
+            logger.info(f"Run saved to {file_path}")
         except Exception as e:
             logger.error(f"Error saving file: {e}")
             QMessageBox.critical(self, "Error", f"Failed to save file: {e}")
-    
+
+    def _current_run_source(self) -> Optional[str]:
+        """The file holding what is on screen: the session's run file (live or
+        just finished), else the file that was loaded."""
+        for cand in (self.data_file, self.loaded_file_path):
+            if cand and Path(cand).exists():
+                return cand
+        return None
+
+    def _on_export_biomon(self):
+        """Write the legacy BioMon file (sampling table only) for this run."""
+        src = self._current_run_source()
+        if src is None:
+            QMessageBox.warning(self, "No Data", "Connect the sensor or load a run file first.")
+            return
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "Export for BioMon", biomon_name_for(src), "Text Files (*.txt);;All Files (*)")
+        if not file_path:
+            return
+        try:
+            out = export_biomon(src, file_path)
+            QMessageBox.information(self, "Exported", f"BioMon file written to {out}")
+            logger.info(f"BioMon export: {src} -> {out}")
+        except Exception as e:
+            logger.error(f"BioMon export failed: {e}")
+            QMessageBox.critical(self, "Error", f"Export failed: {e}")
+
     def _save_data_to_file(self, file_path: str, data: pd.DataFrame):
         """Save data in original tab-separated format"""
         with open(file_path, 'w', encoding='utf-8') as f:
@@ -1219,17 +1204,10 @@ class PlotWindow(QWidget):
                 
                 f.write('\t'.join(values) + '\n')
     
-    def _on_connect_sensor(self):
-        """Handle sensor connect from menu - delegates to main GUI"""
+    def _on_toggle_sensor(self):
+        """Connect when idle, disconnect when recording (the main GUI knows which)."""
         if self.main_gui:
             self.main_gui._on_sensor_connect()
-        else:
-            QMessageBox.warning(self, "Error", "No main GUI reference available")
-
-    def _on_disconnect_sensor(self):
-        """Handle sensor disconnect from menu - delegates to main GUI"""
-        if self.main_gui:
-            asyncio.create_task(self.main_gui._disconnect_sensor())
         else:
             QMessageBox.warning(self, "Error", "No main GUI reference available")
 
@@ -1250,20 +1228,31 @@ class PlotWindow(QWidget):
             logger.info(f"Calibration updated from PlotWindow: {values}")
 
     def update_sensor_status(self, connected: bool, port: str = None, detail: str = ""):
-        """Update the sensor buttons and status label together."""
+        """Update the sensor button and status label together."""
+        self._style_sensor_btn(connected)
         if connected:
-            self.connect_sensor_btn.setEnabled(False)
-            self.disconnect_sensor_btn.setEnabled(True)
             text = f"Sensor: {port}" + (f" — {detail}" if detail else "")
             self.sensor_status_label.setText(text)
             self.sensor_status_label.setStyleSheet(
                 "QLabel { font-weight: 600; color: #2e7d32; }")
         else:
-            self.connect_sensor_btn.setEnabled(True)
-            self.disconnect_sensor_btn.setEnabled(False)
             self.sensor_status_label.setText("Sensor: Not Connected" + (f" — {detail}" if detail else ""))
             self.sensor_status_label.setStyleSheet(
                 "QLabel { font-weight: 600; color: #555; }")
+
+    def _style_sensor_btn(self, connected: bool):
+        """Green 'Connect' when idle, red 'Disconnect' while recording — the same
+        convention as the pump and flow-sensor buttons on the Flow Control tab."""
+        if connected:
+            self.sensor_btn.setText("Disconnect Sensor")
+            self.sensor_btn.setStyleSheet(
+                "QPushButton { background:#c62828; color:white; font-weight:700; }"
+                "QPushButton:hover { background:#b71c1c; }")
+        else:
+            self.sensor_btn.setText("Connect Sensor")
+            self.sensor_btn.setStyleSheet(
+                "QPushButton { background:#2e7d32; color:white; font-weight:700; }"
+                "QPushButton:hover { background:#276b2a; }")
 
     def set_sensor_detail(self, detail: str, warn: bool = False):
         """Append a live diagnostic (packet/byte counts) to the sensor status."""
@@ -1668,8 +1657,8 @@ class AsyncAMUZAGUI(QMainWindow):
 
         # Well completion log (synchronized with sensor log)
         self.sensor_log_start_time: Optional[datetime] = None  # When sensor started logging
-        self.well_log_file: Optional[Path] = None  # Path to well completion log
-        self.well_log_initialized = False  # Whether header has been written
+        # This session's ONE file: sampling rows + well log + flow log (run_file.py)
+        self.run_file: Optional[RunFile] = None
 
         self._init_ui()
         
@@ -3125,37 +3114,21 @@ class AsyncAMUZAGUI(QMainWindow):
         self._refresh_run_buttons()
 
     def _init_well_log(self):
-        """Initialize well completion log file with header (only when sensor is logging)"""
-        if not self.sensor_log_start_time:
+        """Wells are journaled into the session's run file — the same file the
+        sampling rows go to — so there is nothing to create here."""
+        if not self.sensor_log_start_time or self.run_file is None:
             return
-
-        # Create well log file with same timestamp pattern as sensor log
-        timestamp = self.sensor_log_start_time.strftime("%d_%m_%y_%H_%M")
-        self.well_log_file = Path(FILES.SENSOR_READINGS_FOLDER) / f"Well_Log_{timestamp}.csv"
-
-        # Ensure directory exists
-        self.well_log_file.parent.mkdir(parents=True, exist_ok=True)
-
-        # Write header
-        with open(self.well_log_file, 'w') as f:
-            f.write(f"# Well completion log - Sensor started: {self.sensor_log_start_time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write("# blocked=1: sampled through a blockage, reading is stale - discard.\n")
-            f.write("# use=1: the reading to take for this well (its last un-blocked attempt).\n")
-            f.write("# A well may appear twice: the spoiled attempt, then its re-run.\n")
-            f.write("well_id,completed_at,sensor_elapsed_min,sequence_name,blocked,use\n")
-
-        self.well_log_initialized = True
-        self.add_to_display(f"Well log started: {self.well_log_file.name}")
-        logger.info(f"Well log initialized: {self.well_log_file}")
+        self.add_to_display(f"Well log → {self.run_file.name}")
+        logger.info(f"Well log goes to run file: {self.run_file}")
 
     def _log_well_completion(self, well_id: str, sequence_name: str):
-        """Log well completion with sensor-synchronized timestamp.
+        """Journal a well completion into the run file, on the sensor's clock.
 
         Returns the sensor-relative time written, which identifies this row
         uniquely so _finalize_well_log() can mark it up afterwards. None if
         nothing was logged."""
         # Only log if sensor is connected and logging
-        if not self.sensor_log_start_time or not self.well_log_file:
+        if not self.sensor_log_start_time or self.run_file is None:
             return None
 
         now = datetime.now()
@@ -3166,9 +3139,7 @@ class AsyncAMUZAGUI(QMainWindow):
         # `blocked`/`use` are unknowable now: the detector needs ~a cycle more
         # data to judge this well. _finalize_well_log() resolves them at the end.
         try:
-            with open(self.well_log_file, 'a') as f:
-                f.write(f"{well_id},{now.strftime('%Y-%m-%d %H:%M:%S')},"
-                        f"{sensor_elapsed_min:.4f},{sequence_name},pending,pending\n")
+            self.run_file.log_well(well_id, now, sensor_elapsed_min, sequence_name)
             logger.debug(f"Logged well {well_id} at sensor_elapsed={sensor_elapsed_min:.4f} min")
         except Exception as e:
             logger.error(f"Failed to write well log: {e}")
@@ -3176,76 +3147,27 @@ class AsyncAMUZAGUI(QMainWindow):
 
         return sensor_elapsed_min
 
-        # Wells are stepping: re-arm the blockage detector and let it re-learn
-        # the cycle period from the real completion cadence.
-        if getattr(self, "blockage_detector", None) is not None:
-            self.blockage_detector.note_well_completed(time.monotonic())
-
     def _finalize_well_log(self):
         """Resolve the pending `blocked`/`use` columns once the run is over.
 
         Cannot be done as wells complete: the detector needs roughly another
         cycle of data before it can judge the well that just finished. So rows
-        are written `pending` and marked up here.
-
-        `use` lands on each well's last un-blocked attempt — the re-run, when
-        there was one. A well whose every attempt was blocked gets no use=1 row
-        at all; there is no good reading to point at, and saying so is better
-        than nominating a stale one."""
-        if not self.well_log_file or not self.well_log_file.exists():
+        are journaled `pending` and marked up here — still append-only, the
+        verdicts are re-issued into the run file and supersede the pending rows
+        (the rule itself lives in run_file.resolve_markup)."""
+        if self.run_file is None or not self.run_file.path.exists():
             return
         # Rows are keyed by (well_id, sensor_elapsed_min) — unique per row, and
-        # written into the CSV, so this survives the log starting mid-run.
+        # written into the file, so this survives the log starting mid-run.
         blocked_by_row = {(w, round(elapsed, 4)): self._span_blocked(w0, w1)
                           for w, w0, w1, elapsed in self._well_spans
                           if elapsed is not None}
         try:
-            lines = self.well_log_file.read_text().splitlines()
-        except Exception as e:
-            logger.error(f"Failed to read well log for finalizing: {e}")
-            return
-
-        rows, out = [], []
-        for ln in lines:
-            if ln.startswith("#") or ln.startswith("well_id") or not ln.strip():
-                out.append(ln)
-                continue
-            p = ln.split(",")
-            if len(p) < 6:
-                out.append(ln)
-                continue
-            try:
-                key = (p[0], round(float(p[2]), 4))
-            except ValueError:
-                out.append(ln)
-                continue
-            p[4] = "1" if blocked_by_row.get(key, False) else "0"
-            rows.append((len(out), p))
-            out.append(None)          # placeholder, filled below
-
-        # use=1 on the last un-blocked attempt for each well.
-        good = {}
-        for i, p in rows:
-            if p[4] == "0":
-                good[p[0]] = i
-        for i, p in rows:
-            p[5] = "1" if good.get(p[0]) == i else "0"
-            out[i] = ",".join(p)
-
-        # Write via a temp file and rename. A plain write truncates first, so a
-        # crash or power cut mid-write would destroy the run's only record of
-        # which well is which — the log is hours of work and cannot be recreated.
-        # os.replace is atomic: the old file stands until the new one is complete.
-        try:
-            tmp = self.well_log_file.with_suffix(self.well_log_file.suffix + ".tmp")
-            tmp.write_text("\n".join(out) + "\n")
-            os.replace(tmp, self.well_log_file)
+            spoiled, unusable = self.run_file.mark_wells(blocked_by_row)
         except Exception as e:
             logger.error(f"Failed to finalize well log: {e}")
             return
 
-        spoiled = sum(1 for _, p in rows if p[4] == "1")
-        unusable = sorted({p[0] for _, p in rows} - set(good))
         if spoiled:
             self.add_to_display(
                 f"Well log finalized: {spoiled} spoiled reading(s) marked blocked=1; "
@@ -3255,11 +3177,22 @@ class AsyncAMUZAGUI(QMainWindow):
                 f"⚠ No clean reading for: {', '.join(unusable)} — every attempt "
                 "hit a blockage.")
 
+    def _finalize_run_file(self) -> Optional[str]:
+        """Close out the session's file: rewrite the live journal into clean
+        sections (sampling / well log / flow log). Returns the file name, or
+        None if there was nothing to do or the rewrite failed (the journal form
+        is left intact in that case — it is still a complete record)."""
+        rf = self.run_file
+        if rf is None:
+            return None
+        ok = rf.finalize()
+        logger.info(f"Run file finalized: {rf} ({'ok' if ok else 'FAILED'})")
+        return rf.name if ok else None
+
     def _reset_well_log(self):
-        """Reset well log tracking (called when sensor disconnects)"""
+        """Forget the session's file (called when the sensor disconnects)."""
         self.sensor_log_start_time = None
-        self.well_log_file = None
-        self.well_log_initialized = False
+        self.run_file = None
 
     @asyncSlot()
     async def _on_insert(self):
@@ -3452,8 +3385,8 @@ class AsyncAMUZAGUI(QMainWindow):
     
     def _on_sensor_connect(self):
         """Handle sensor connect/disconnect - auto-connects to first available port"""
-        # If already connected, disconnect
-        if self.sensor_reader and self.sensor_reader.is_running:
+        # If already connected (or connecting), disconnect
+        if self.sensor_reader is not None:
             asyncio.create_task(self._disconnect_sensor())
             return
 
@@ -3492,14 +3425,22 @@ class AsyncAMUZAGUI(QMainWindow):
         """Async helper to disconnect sensor"""
         if self.sensor_reader is None:
             return
+        reader = self.sensor_reader
         try:
-            await self.sensor_reader.stop()
-            await self.sensor_reader.disconnect()
+            await reader.stop()
+            # Let the reading loop exit and flush its last buffered rows, so the
+            # finalize below sees every sample.
+            for _ in range(30):
+                if not reader.is_running:
+                    break
+                await asyncio.sleep(0.1)
+            await reader.disconnect()
             self.sensor_reader = None
 
-            # Reset well log tracking (log file remains, but new wells won't be logged)
-            if self.well_log_file:
-                self.add_to_display(f"Well log saved: {self.well_log_file.name}")
+            # Close out the session's single file (sampling + wells + flow).
+            name = self._finalize_run_file()
+            if name:
+                self.add_to_display(f"Run file saved: {name}")
             self._reset_well_log()
 
             # Update UI status
@@ -3517,9 +3458,18 @@ class AsyncAMUZAGUI(QMainWindow):
         try:
             # OPTIMIZED: Set up data callback for direct plot updates
             # This is more efficient than file polling
+            last_status = [0.0]
+
             def on_sensor_data(reading):
                 if self.plot_window:
                     self.plot_window.add_reading(reading)
+                    # Show that packets are actually arriving (≈1 Hz refresh),
+                    # so the button/label state reflects real readings.
+                    now_m = time.monotonic()
+                    if now_m - last_status[0] >= 1.0:
+                        last_status[0] = now_m
+                        self.plot_window.set_sensor_detail(
+                            f"● receiving — {reading.counter} readings")
                 self._track_blockage(reading)
 
             # Fresh detector per connection: the healthy-amplitude baseline is
@@ -3532,11 +3482,19 @@ class AsyncAMUZAGUI(QMainWindow):
                 cycle_s=float(t_buffer + t_sampling + move_overhead)
             )
 
+            # ONE file for the whole session: the sensor's sampling rows, the
+            # well log and the flow log all go into it (see run_file.py).
+            self.sensor_log_start_time = datetime.now()
+            self.run_file = RunFile.for_session(
+                FILES.SENSOR_READINGS_FOLDER, self.sensor_log_start_time,
+                FILES.SENSOR_FILENAME_FORMAT, FILES.TIMESTAMP_FORMAT)
+
             # Create sensor reader with data callback
             self.sensor_reader = AsyncPotentiostatReader(
                 port=port if not use_mock else "COM1",
                 use_mock=use_mock,
-                data_callback=on_sensor_data
+                data_callback=on_sensor_data,
+                sink=self.run_file,
             )
             # Log the Fluigent flow rate next to each sensor sample (high res)
             self.sensor_reader.set_flow_provider(self.flow_reading)
@@ -3547,8 +3505,7 @@ class AsyncAMUZAGUI(QMainWindow):
                 task = asyncio.create_task(self.sensor_reader.start_reading())
                 self.task_manager.add_task(task, "sensor_reading")
 
-                # Initialize well completion log (synchronized with sensor start)
-                self.sensor_log_start_time = datetime.now()
+                # Well log goes into the same run file, on the sensor's clock
                 self._init_well_log()
 
                 # Point the Plotting tab at the sensor's output file and show it
@@ -3571,11 +3528,13 @@ class AsyncAMUZAGUI(QMainWindow):
             else:
                 QMessageBox.warning(self, "Connection Failed", "Could not connect to sensor")
                 self.sensor_reader = None
+                self._reset_well_log()
 
         except Exception as e:
             logger.error(f"Sensor connection error: {e}")
             QMessageBox.critical(self, "Error", f"Sensor connection failed: {e}")
             self.sensor_reader = None
+            self._reset_well_log()
 
     async def _sensor_stream_watchdog(self, port: str, grace_s: float = 10.0):
         """Report WHY a connected sensor produces nothing.
@@ -3598,7 +3557,7 @@ class AsyncAMUZAGUI(QMainWindow):
                 raw = reader.bytes_received
 
                 if readings > 0:
-                    self.plot_window.set_sensor_detail(f"{readings} readings")
+                    self.plot_window.set_sensor_detail(f"● receiving — {readings} readings")
                     warned = False
                 elif raw < 25:   # a stray byte or two is still "silent"
                     msg = (f"No data on {port}: {raw} bytes received in {grace_s:.0f}s. "
@@ -3703,6 +3662,15 @@ class AsyncAMUZAGUI(QMainWindow):
                 notes.append("  metabolite sensor: stop requested (file flushed)")
             except Exception as e:
                 notes.append(f"  metabolite sensor: stop error: {e}")
+        # The run file: rewrite the live journal into clean sections. Rows the
+        # reader flushes after this land after the end marker; the next start-up
+        # tidies them in (run_file.tidy_folder).
+        if getattr(self, "run_file", None) is not None:
+            try:
+                name = self._finalize_run_file()
+                notes.append(f"  run file: {name or 'finalize FAILED (journal kept)'}")
+            except Exception as e:
+                notes.append(f"  run file: finalize error: {e}")
 
         for line in notes:
             logger.info(line)
@@ -3795,6 +3763,9 @@ async def async_main():
     # Ensure Sensor_Readings directory exists
     Path(FILES.SENSOR_READINGS_FOLDER).mkdir(parents=True, exist_ok=True)
     Path(FILES.AMUZA_LOGS_FOLDER).mkdir(parents=True, exist_ok=True)
+    # A run file left in journal form (app killed, power cut) gets its sections now.
+    for name in tidy_folder(FILES.SENSOR_READINGS_FOLDER):
+        logger.info(f"Tidied unfinished run file: {name}")
 
     # Create and show GUI
     gui = AsyncAMUZAGUI(app_state, task_manager)

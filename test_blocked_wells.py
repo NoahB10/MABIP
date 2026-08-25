@@ -10,6 +10,7 @@ import pytest
 
 from blockage_detector import BlockageDetector, BlockageEvent
 from gui_async import AsyncAMUZAGUI
+from run_file import RunFile, WELL_COLUMNS
 
 
 class FakeGUI:
@@ -26,7 +27,7 @@ class FakeGUI:
         self._blockage_spans = []
         self.blockage_detector = None
         self.displayed = []
-        self.well_log_file = None
+        self.run_file = None
 
     def add_to_display(self, msg):
         self.displayed.append(msg)
@@ -117,33 +118,33 @@ def test_onset_is_backdated_by_detector_latency():
     assert g._blocked_wells() == ["A2", "A3"], "must blame the well that was live"
 
 
-HEADER = (
-    "# Well completion log - Sensor started: 2026-07-14 15:00:28\n"
-    "# blocked=1: sampled through a blockage, reading is stale - discard.\n"
-    "# use=1: the reading to take for this well (its last un-blocked attempt).\n"
-    "# A well may appear twice: the spoiled attempt, then its re-run.\n"
-    "well_id,completed_at,sensor_elapsed_min,sequence_name,blocked,use\n"
-)
+HEADER = ("Created: 07/14/2026\t03:00:28 PM\n"
+          "counter\tt[min]\t#1ch1\t#1ch2\t#1ch3\t#1ch4\t#1ch5\t#1ch6\t#1ch7\tflow_uL_min\n"
+          "Start: 07/14/2026\t03:00:28 PM\n")
+SENSOR_ROW = "1\t0.0201\t-0.002\t0.000\t-0.003\t0.699\t0.719\t0.735\t20.062\t1.000\n"
 
 
 def _row(well, elapsed, seq="Sampling Sequence"):
-    return f"{well},2026-07-14 15:00:00,{elapsed:.4f},{seq},pending,pending\n"
+    """A well completion as the run file journals it while the run is live."""
+    return f"#WELL\t{well}\t2026-07-14 15:00:00\t{elapsed:.4f}\t{seq}\tpending\tpending\n"
+
+
+def _wells(run_file):
+    out = {}
+    for p in run_file.read().wells:
+        out.setdefault(p[0], []).append((float(p[2]), p[4], p[5]))
+    return out
 
 
 def _finalized(tmp_path, spans, blockages, rows):
     g = FakeGUI(sorted({s[0] for s in spans}))
     g._well_spans = list(spans)
     g._blockage_spans = [list(b) for b in blockages]
-    g.well_log_file = tmp_path / "Well_Log_test.csv"
-    g.well_log_file.write_text(HEADER + "".join(rows))
+    g.run_file = RunFile(tmp_path / "MABIP_Run_test.txt")
+    g.run_file.write_header(HEADER)
+    g.run_file.append(SENSOR_ROW + "".join(rows))
     g._finalize_well_log()
-    out = {}
-    for ln in g.well_log_file.read_text().splitlines():
-        if ln.startswith("#") or ln.startswith("well_id") or not ln.strip():
-            continue
-        p = ln.split(",")
-        out.setdefault(p[0], []).append((float(p[2]), p[4], p[5]))
-    return g, out
+    return g, _wells(g.run_file)
 
 
 def test_finalize_marks_clean_run_all_usable(tmp_path):
@@ -177,11 +178,25 @@ def test_finalize_no_clean_reading_gets_no_use_row(tmp_path):
     assert any("No clean reading" in m for m in g.displayed)
 
 
-def test_finalize_preserves_comments_and_header(tmp_path):
+def test_finalize_keeps_the_sampling_rows_and_header(tmp_path):
+    """Marking wells up is append-only: the sampling table above is untouched."""
     g, _ = _finalized(tmp_path, SPANS, [], [_row("A1", 1.0)])
-    text = g.well_log_file.read_text()
-    assert text.startswith("# Well completion log")
-    assert "well_id,completed_at,sensor_elapsed_min,sequence_name,blocked,use" in text
+    text = g.run_file.path.read_text()
+    assert text.startswith(HEADER + SENSOR_ROW)
+    run = g.run_file.read()
+    assert run.header == HEADER.splitlines()
+    assert run.sensor == [SENSOR_ROW.rstrip("\n")]
+
+
+def test_session_end_writes_clean_sections(tmp_path):
+    g, before = _finalized(tmp_path, SPANS, [[110, 190]],
+                           [_row("A1", 1.0), _row("A2", 2.0), _row("A3", 3.0)])
+    assert g.run_file.finalize()
+    text = g.run_file.path.read_text()
+    assert "=== WELL LOG ===" in text and "#WELL\t" not in text
+    assert "\t".join(WELL_COLUMNS) in text
+    assert text.rstrip().endswith("=== END OF RUN ===")
+    assert _wells(g.run_file) == before
 
 
 def test_finalize_is_idempotent(tmp_path):
@@ -189,26 +204,20 @@ def test_finalize_is_idempotent(tmp_path):
     g, out1 = _finalized(tmp_path, SPANS, [[110, 190]],
                          [_row("A1", 1.0), _row("A2", 2.0), _row("A3", 3.0)])
     g._finalize_well_log()
-    out2 = {}
-    for ln in g.well_log_file.read_text().splitlines():
-        if ln.startswith("#") or ln.startswith("well_id") or not ln.strip():
-            continue
-        p = ln.split(",")
-        out2.setdefault(p[0], []).append((float(p[2]), p[4], p[5]))
-    assert out1 == out2
+    assert _wells(g.run_file) == out1
+    g.run_file.finalize()
+    g._finalize_well_log()
+    assert _wells(g.run_file) == out1
 
 
 def test_finalize_never_destroys_the_log_if_the_write_fails(tmp_path, monkeypatch):
-    """The well log is hours of work and cannot be recreated. A failed rewrite
+    """The run file is hours of work and cannot be recreated. A failed rewrite
     must leave the original intact rather than a truncated stub."""
     import pathlib
 
-    g = FakeGUI(WELLS)
-    g._well_spans = list(SPANS)
-    g._blockage_spans = [[110, 190]]
-    g.well_log_file = tmp_path / "Well_Log_test.csv"
-    original = HEADER + _row("A1", 1.0) + _row("A2", 2.0) + _row("A3", 3.0)
-    g.well_log_file.write_text(original)
+    g, _ = _finalized(tmp_path, SPANS, [[110, 190]],
+                      [_row("A1", 1.0), _row("A2", 2.0), _row("A3", 3.0)])
+    original = g.run_file.path.read_text()
 
     real_write = pathlib.Path.write_text
 
@@ -218,18 +227,19 @@ def test_finalize_never_destroys_the_log_if_the_write_fails(tmp_path, monkeypatc
         return real_write(self, *a, **k)
 
     monkeypatch.setattr(pathlib.Path, "write_text", boom)
-    g._finalize_well_log()          # must not raise
+    assert g.run_file.finalize() is False          # must not raise
 
-    assert g.well_log_file.read_text() == original, "original log was clobbered"
+    assert g.run_file.path.read_text() == original, "original log was clobbered"
 
 
 def test_finalize_leaves_no_temp_file_behind(tmp_path):
     g, _ = _finalized(tmp_path, SPANS, [[110, 190]],
                       [_row("A1", 1.0), _row("A2", 2.0), _row("A3", 3.0)])
+    g.run_file.finalize()
     assert list(tmp_path.glob("*.tmp")) == []
 
 
-def test_finalize_without_log_file_is_a_noop():
+def test_finalize_without_run_file_is_a_noop():
     g = FakeGUI(WELLS)
     g._finalize_well_log()          # must not raise
 
