@@ -205,6 +205,11 @@ class AppState:
     # Settings persistence
     async def save_settings(self):
         """Save current settings to file."""
+        self.save_settings_sync()
+
+    def save_settings_sync(self):
+        """Synchronous save — usable from closeEvent / signal handlers, where
+        the asyncio loop may not get another turn."""
         settings = {
             "t_buffer": self.t_buffer,
             "t_sampling": self.t_sampling,

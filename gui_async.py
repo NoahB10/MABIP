@@ -3914,15 +3914,35 @@ class AsyncAMUZAGUI(QMainWindow):
             # Not an app exit, so allow a later shutdown to run again.
             self._shutdown_done = False
 
+    EXIT_GRACE_S = 10.0
+    """How long async_main's cleanup gets after the window closes before the
+    process quits regardless. Everything that matters — pump stopped, AMUZA
+    released, sensor file flushed, settings written — is already done
+    synchronously in closeEvent; cleanup only tidies tasks. On 22 Oct 2026 a
+    close left the process alive for good: the asyncio wake-ups pending at that
+    moment were lost (cause unknown — Qt timers and fresh callbacks still ran),
+    so the exit must not depend on the loop finishing anything."""
+
     def closeEvent(self, event):
         """Window closing — safe the hardware before anything else."""
         logger.info("Main window closing — running safe shutdown")
         self.safe_shutdown_sync("window closed")
+        try:
+            self.app_state.save_settings_sync()
+            logger.info("Settings saved")
+        except Exception as e:
+            logger.warning(f"Settings not saved: {e}")
 
         if self.plot_window:
             self.plot_window.close()
 
         event.accept()
+
+        # Hard deadline. If async_main finishes first its future stops the loop
+        # and this timer dies with the app; if not, quit anyway.
+        app = QApplication.instance()
+        if app is not None:
+            QTimer.singleShot(int(self.EXIT_GRACE_S * 1000), app.quit)
 
     async def cleanup(self):
         """Cleanup resources"""
@@ -4008,14 +4028,9 @@ def _install_shutdown_hooks(gui):
             gui.safe_shutdown_sync(f"{name} received")
         finally:
             try:
-                gui.close()          # unblocks async_main -> cleanup() -> loop stops
+                gui.close()          # closeEvent: saves, then arms the exit deadline
             except Exception:
                 pass
-            # Hard fallback only: quitting right away would race cleanup() the
-            # same way quitOnLastWindowClosed did. Give it a few seconds first.
-            app = QApplication.instance()
-            if app is not None:
-                QTimer.singleShot(8000, app.quit)
 
     for sig in (signal.SIGINT, signal.SIGTERM, getattr(signal, "SIGHUP", None)):
         if sig is None:
@@ -4065,7 +4080,13 @@ def main():
     
     # Run async main
     with loop:
-        loop.run_until_complete(async_main())
+        try:
+            loop.run_until_complete(async_main())
+        except RuntimeError as e:
+            # The exit deadline fired before the asyncio cleanup finished (or
+            # the loop stopped under it). Hardware and settings were handled
+            # synchronously in closeEvent, so this is a clean exit, not a crash.
+            logger.warning(f"Exited without a complete asyncio cleanup: {e}")
 
 
 if __name__ == "__main__":
