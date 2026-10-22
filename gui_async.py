@@ -2366,7 +2366,7 @@ class AsyncAMUZAGUI(QMainWindow):
         """A fresh low-volume controller if the mode is on, else None."""
         if not getattr(self.app_state, "lv_enabled", False):
             return None
-        from well_empty_detector import WellEmptyDetector
+        from low_volume import build_detector
         cfg = LowVolumeConfig.from_dict(getattr(self.app_state, "lv_config", {}) or {})
         tab = getattr(self, "flow_tab", None)
         pump = FlowTabPump(tab)
@@ -2374,7 +2374,7 @@ class AsyncAMUZAGUI(QMainWindow):
         self.add_to_display(
             "Low-volume mode: each well runs until it is empty"
             + ("" if pump.available else " (no pump connected: no escalation or clog clearing)"))
-        return LowVolumeController(cfg, WellEmptyDetector(flow_rate=rate), pump=pump)
+        return LowVolumeController(cfg, build_detector(cfg, rate), pump=pump)
 
     def _track_blockage(self, reading):
         """Feed the metabolite channels to the flow-sensor-independent blockage

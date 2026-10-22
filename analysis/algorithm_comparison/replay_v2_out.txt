@@ -1,0 +1,26 @@
+
+== v1 (current): surrogate recall 0.625 (n=1310, median latency 27.6s) | real dry wells 2/7 (median latency 33.0s) | false alarms 14 = 0.56/in-well h, 0.011/well
+    A1 hit called 166s after move (suction-break dip + air spike), 32.4s after the dip
+    A2 miss 
+    A2-re miss 
+    A3 miss 
+    A4 miss 
+    A5 miss 
+    A6 hit called 215s after move (suction-break dip + air spike), 33.7s after the dip
+run     260120_1234  260120_1304  260120_1811  260121_1452  260121_1516  260218_1143  260218_1258  260325_1214  260329_1246  260329_1650  260423_1148  260507_1046  260508_1059  260510_1022  260607_1449  260630_1320  260701_1254  260701_1754  260722_1106  260901_0945  260901_1005  261018_1854  261022_1047  261022_1316  261022_1339  261022_1421
+cycles            1           96          117            2           55            2           96           96           67           41           21          102           96           99          121          108           95           26           34            4            3            9            7            2            3            7
+hit               0           89           76            0            9            0           82           80           49           23           21           87           85           88           16           48           41            5            9            1            0            0            3            1            1            5
+fa                0            0            0            0            5            0            0            0            0            0            0            1            0            0            1            1            2            0            0            1            0            2            0            0            0            1
+
+== v2: surrogate recall 0.680 (n=1310, median latency 20.0s) | real dry wells 7/7 (median latency 5.1s) | false alarms 39 = 1.57/in-well h, 0.030/well
+    A1 hit called 137s after move (suction-break dip (fast)), 3.9s after the dip
+    A2 hit called 142s after move (suction-break dip (fast)), 21.7s after the dip
+    A2-re hit called 76s after move (suction-break dip (fast)), 5.1s after the dip
+    A3 hit called 149s after move (suction-break dip (fast)), 6.7s after the dip
+    A4 hit called 132s after move (suction-break dip (fast)), 5.1s after the dip
+    A5 hit called 193s after move (suction-break dip (fast)), 3.4s after the dip
+    A6 hit called 185s after move (suction-break dip (fast)), 3.3s after the dip
+run     260120_1234  260120_1304  260120_1811  260121_1452  260121_1516  260218_1143  260218_1258  260325_1214  260329_1246  260329_1650  260423_1148  260507_1046  260508_1059  260510_1022  260607_1449  260630_1320  260701_1254  260701_1754  260722_1106  260901_0945  260901_1005  261018_1854  261022_1047  261022_1316  261022_1339  261022_1421
+cycles            1           96          117            2           55            2           96           96           67           41           21          102           96           99          121          108           95           26           34            4            3            9            7            2            3            7
+hit               0           93           78            0           10            0           82           80           52           25           21           88           85           89           37           49           49            7           30            1            0            0            5            2            2            6
+fa                0            0            3            0            7            0            0            3            0            0            0            1            1            5            5            3            5            1            0            1            1            2            0            0            0            1

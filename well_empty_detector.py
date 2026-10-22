@@ -1,4 +1,25 @@
-"""Streaming "well ran dry" detector for the AMUZA / Jobst SIX rig (pure Python, no Qt).
+"""Streaming "well ran dry" detector for the AMUZA / Jobst SIX rig, v2 (pure Python, no Qt).
+
+v2 (22 Oct 2026) = v1 unchanged + a FAST SUCTION-BREAK DIP path.  On the seven real
+dry wells of 22 Oct (A1-A6, A2 re-entry) the tip meeting air showed a large, sharp,
+common-mode dip on ch1-ch4 (-0.2..-1.2 abs units, all four channels within 2x of each
+other in absolute size) followed by an exponential recovery and then a frozen plateau;
+a confirming air spike came in only 2 of 7.  v1 judges everything on a centred median
+(~7 s delay) and only alarms on dip + spike, so it called 1 of 7 (33 s after air).
+The fast path decides from the last 3 + 2 samples (~3.4 s after the dip appears):
+
+  * DROP: x[i] - min(x[i-1], x[i-2]) style 1-or-2-sample drop on every channel,
+    each <= -k_fast_dip noise units (noise = robust sigma of first differences);
+  * COMMON-MODE: max/min absolute drop across ch1-4 < fast_dip_cm_ratio, and the
+    mean absolute drop >= fast_dip_min_abs (rejects single-channel or tiny moves);
+  * NOT A SPIKE TAIL: no common-mode rise in the 5 samples before;
+  * RECOVERING: fast_dip_confirm samples later the ch1-4 mean has stopped falling
+    and recovered >= 10 % of the drop (a dip, not a step down in analyte).
+
+Armed only after move + lag + guard (as v1).  Bake-off of 10 methods and the replay:
+scratchpad/algos (results.csv, replay_v2.py).
+
+---- v1 notes follow ----
 
 Physics (measured on ~1000 scheduled lift-outs in 14 Jan-Jul 2026 runs, see report):
 when the needle tip goes from liquid to air -- a scheduled lift-out, or a well that
@@ -71,6 +92,14 @@ class WellEmptyConfig:
     noise_len: int = 400                   # samples for sigma estimate
     sigma_floor: float = 1e-4
     n_channels: int = 6
+    # ---- v2 fast suction-break dip (EMPTY with ~3.4 s delay) ----
+    fast_dip: bool = True
+    k_fast_dip: float = 20.0               # drop / (sigma*sqrt2) per channel
+    fast_dip_votes: int = 3                # of ch1-4
+    fast_dip_cm_ratio: float = 2.0         # max/min |drop| among voting channels
+    fast_dip_min_abs: float = 0.15         # mean |drop| among voters, raw units
+    fast_dip_confirm: int = 2              # samples to wait for the recovery to start
+    fast_sigma_floor: float = 7e-4         # data are quantised to 0.001
 
 
 @dataclass
@@ -123,6 +152,9 @@ class WellEmptyDetector:
         self._last_evt_i = -99
         self._i = 0
         self.lag_s = self.cfg.lag_s
+        self._raw = deque(maxlen=8)            # (t, ch1..ch4) undelayed, for the fast dip path
+        self._rise = deque(maxlen=5)           # recent common-mode rise flags
+        self._pend = []                        # fast-dip candidates awaiting confirmation
 
     # ------------------------------------------------------------------ API
     def set_flow_rate(self, flow_rate: float) -> None:
@@ -145,6 +177,7 @@ class WellEmptyDetector:
         self._dips.clear()
         self._spikes.clear()
         self._best = None
+        self._pend = []
 
     def note_lift(self, t_s: float) -> None:
         """Call if the robot is pulled out deliberately (stops judging this well)."""
@@ -158,6 +191,77 @@ class WellEmptyDetector:
         return self._move_t + self.lag_s + self.cfg.guard_s
 
     def update(self, t_s: float, channels: Sequence[float]) -> Optional[WellEmptyEvent]:
+        """Feed one sample. Returns EMPTY / SUSPECT events or None."""
+        ev = self._update_v1(t_s, channels)          # also updates the noise estimates
+        if ev is not None and ev.kind == "EMPTY":
+            return ev
+        fast = self._fast_dip(float(t_s), channels) if self.cfg.fast_dip else None
+        return fast if fast is not None else ev
+
+    def _sig_fast(self, c):
+        d = self._dabs[c]
+        s = 1.4826 * _median(d) / 1.4142 if d else 0.0
+        return max(s, self.cfg.fast_sigma_floor)
+
+    def _fast_dip(self, t, channels):
+        cfg = self.cfg
+        x = [float(channels[c]) for c in cfg.vote_channels]
+        prev = self._raw[-1] if self._raw else None
+        self._raw.append((t, x))
+        nv = len(x)
+        sig = [self._sig_fast(c) for c in cfg.vote_channels]
+        # common-mode rise flag (first difference), used to ignore the tail of an air spike
+        rise = False
+        if prev is not None:
+            rise = sum(1 for j in range(nv) if (x[j] - prev[1][j]) / sig[j] > cfg.k_fast_dip) >= cfg.fast_dip_votes
+        recent_rise = any(self._rise)
+        self._rise.append(rise)
+        out = None
+        # 1) confirm pending candidates (recovery started)
+        cm_now = sum(x) / nv
+        keep = []
+        for (i0, t0, pre) in self._pend:
+            age = self._i - i0
+            if age < cfg.fast_dip_confirm:
+                keep.append((i0, t0, pre)); continue
+            seg = [sum(v) / nv for tt, v in list(self._raw)[-(age + 1):]]
+            trough = min(seg); depth = pre - trough
+            if depth > 0 and cm_now - trough >= 0.1 * depth and out is None:
+                out = self._fast_fire(t, t0)
+        self._pend = keep
+        if out is not None:
+            return out
+        # 2) new candidate at this sample
+        if len(self._raw) < 4 or recent_rise:
+            return None
+        r = list(self._raw)
+        drops = []
+        for j in range(nv):
+            d1 = x[j] - r[-2][1][j]; d2 = x[j] - r[-3][1][j]
+            drops.append(min(d1, d2))
+        voters = [j for j in range(nv) if drops[j] / sig[j] / 1.4142 < -cfg.k_fast_dip]
+        if len(voters) < cfg.fast_dip_votes:
+            return None
+        a = [abs(drops[j]) for j in voters]
+        if max(a) / max(min(a), 1e-4) >= cfg.fast_dip_cm_ratio or sum(a) / len(a) < cfg.fast_dip_min_abs:
+            return None
+        pre = sum(sum(v) / nv for tt, v in r[-4:-1]) / 3.0
+        self._pend.append((self._i, t, pre))
+        return None
+
+    def _fast_fire(self, t_dec, t_dip):
+        if self._move_t is None or t_dec < self._move_t + self.lag_s + self.cfg.guard_s:
+            return None                       # not in a well / still in the move-in transient
+        since = t_dec - self._move_t
+        self._armed = False
+        mt = self._move_t
+        self._move_t = None
+        return WellEmptyEvent("EMPTY", t_dec, since, t_dip, "suction-break dip (fast)",
+                              ["ch1", "ch2", "ch3", "ch4"],
+                              f"WELL EMPTY: sharp common-mode suction-break dip on ch1-ch4; tip met air "
+                              f"~{t_dip - mt:.0f}s into the well (decided {t_dec - t_dip:.0f}s later).")
+
+    def _update_v1(self, t_s: float, channels: Sequence[float]) -> Optional[WellEmptyEvent]:
         cfg = self.cfg
         self._i += 1
         for c in range(cfg.n_channels):

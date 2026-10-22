@@ -446,18 +446,22 @@ def test_detector_lag_follows_pump_rate():
     assert abs(d.lag_s - lag130 / 2) < 0.01
 
 
-def test_leave_on_dip_is_immediate():
-    pump = FakePump()
-    det = DipDetector()
-    ctl = LowVolumeController(_cfg(escalate_after_s=100), det, pump=pump, poll_s=0.01)
+def test_fast_dip_empty_event_leaves_immediately():
+    """The detector's fast-dip path reports EMPTY with a dip reason."""
+    class FastDip(FakeDetector):
+        def update(self, t, ch):
+            if self.fire:
+                self.fire = False
+                class E:
+                    kind, reason, message = "EMPTY", "suction-break dip (fast)", "dip"
+                return E()
+            return None
+    det = FastDip()
+    ctl = LowVolumeController(_cfg(escalate_after_s=100), det, pump=FakePump(), poll_s=0.01)
     conn = FakeConn()
 
     async def go():
-        async def dip_soon():
-            await asyncio.sleep(0.05)
-            det.dip = True
-            ctl.feed(time.monotonic(), [0] * 6)
-        asyncio.ensure_future(dip_soon())
+        asyncio.ensure_future(_feed_after(ctl, det, 0.05))
         return await ctl.run_in_well(conn, Method("A4", wait=60), 25, asyncio.Event())
     t0 = time.monotonic()
     assert asyncio.run(go()) is True
@@ -465,11 +469,17 @@ def test_leave_on_dip_is_immediate():
     assert ctl.log[0][1] == "empty-dip"
 
 
-def test_leave_on_dip_can_be_turned_off():
+def test_slow_dip_alone_does_not_leave():
+    """The old SUSPECT dip only feeds the dip-then-stale rule now."""
     det = DipDetector()
-    ctl = LowVolumeController(_cfg(escalate_after_s=100, leave_on_dip=False), det,
-                              pump=FakePump(), poll_s=0.01)
+    ctl = LowVolumeController(_cfg(escalate_after_s=100), det, pump=FakePump(), poll_s=0.01)
     det.dip = True
     ctl._in_well = True
     ctl.feed(time.monotonic(), [0] * 6)
     assert ctl._empty_at is None and ctl._last_dip is not None
+
+
+def test_setting_switches_the_fast_dip_path():
+    from low_volume import build_detector
+    assert build_detector(_cfg(leave_on_dip=True), 130).cfg.fast_dip is True
+    assert build_detector(_cfg(leave_on_dip=False), 130).cfg.fast_dip is False

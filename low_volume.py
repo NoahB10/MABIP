@@ -83,11 +83,12 @@ class LowVolumeConfig:
     """How long to run at max_rate without air before calling it a clog."""
 
     leave_on_dip: bool = True
-    """Leave the well on the suction-break dip alone, the moment the tip meets
-    air (no tube delay). Every real dry well on 22 Oct 2026 showed the dip
-    promptly (A1 134 s, A2 122 s, A3 147 s, A4 127 s) while the confirming air
-    spike came late or never; waiting for it cost 50 s+ or a manual STOP. The
-    price: an occasional lone dip on a healthy plateau leaves a well early."""
+    """Leave the well on the suction-break dip, the moment the tip meets air
+    (no tube delay). Switches on the detector's fast-dip path (fast_dip),
+    chosen 22 Oct 2026 from a 10-method comparison over 30 runs: it caught
+    all 7 real dry wells ~5 s after the dip (the spike-confirming detector
+    caught 2/7 at ~33 s) at ~1.6 false alarms per in-well hour, about one
+    early exit every 33 wells. Off = wait for the air spike."""
 
     dip_stale_s: float = 180.0
     """A suction-break dip (the tip met air) followed by a stale signal within
@@ -207,15 +208,10 @@ class LowVolumeController:
             # followed by a stale signal it means the well is dry.
             if "dip" in str(getattr(ev, "reason", "")):
                 self._last_dip = t
-                if self.cfg.leave_on_dip:
-                    self._empty_at, self._empty_reason = t, "dip"
-                    logger.info(f"Low-volume: {getattr(ev, 'message', ev)} -> leaving "
-                                "the well now")
-                    return
             logger.info(f"Low-volume: {getattr(ev, 'message', ev)}")
             return
         self._empty_at = t
-        self._empty_reason = "air"
+        self._empty_reason = "dip" if "dip" in str(getattr(ev, "reason", "")) else "air"
         logger.info(f"Low-volume: {getattr(ev, 'message', ev)}")
 
     # ---- freshness: is fresh fluid still reaching the sensor? -------------
@@ -459,6 +455,12 @@ class LowVolumeController:
                 continue
 
             await asyncio.sleep(self.poll_s)
+
+
+def build_detector(cfg: "LowVolumeConfig", flow_rate=None):
+    """The well-empty detector for a low-volume run, configured from cfg."""
+    from well_empty_detector import WellEmptyDetector
+    return WellEmptyDetector(flow_rate=flow_rate, fast_dip=bool(cfg.leave_on_dip))
 
 
 def _median(v):
