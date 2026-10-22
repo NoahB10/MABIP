@@ -227,7 +227,8 @@ def test_stop_sends_T_and_restores_base():
         return await ctl.run_in_well(conn, Method("A1", wait=60), 1, stop)
     assert asyncio.run(go()) is False
     assert conn.sent[-1] == "@T"
-    assert ctl.pump.rates[-1] == 100
+    # STOP owns the pump: the controller must not restart it at base rate.
+    assert 100 not in ctl.pump.rates
 
 
 def test_no_pump_means_only_waiting_for_air():

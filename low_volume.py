@@ -322,10 +322,10 @@ class LowVolumeController:
         while True:
             now = self.clock()
             if stop_event.is_set():
+                # STOP already halted the pump (flow_tab.pause_for_stop);
+                # restarting it here would undo the operator's STOP.
                 self._leave()
                 await conn.stop_movement()
-                if pump_ok and rate != base:
-                    self._set_rate(base, "stopped")
                 return False
 
             # 0. The operator said this well is done.
