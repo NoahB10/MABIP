@@ -118,6 +118,8 @@ class FlowDefinitionsDialog(QDialog):
         ("exp_approach_ramp", "Well-flow: ramp→well (s)"), ("exp_recover_ramp", "Well-flow: ramp→buffer (s)"),
         ("ff_pause_s", "Feed-fwd: pause after move (s)"), ("ff_resume_s", "Feed-fwd: resume after move (s)"),
         ("ff_resume_ramp", "Feed-fwd: resume ramp (s)"),
+        ("ff_boost_rate", "Well entry: boost rate (µL/min, 0=off)"),
+        ("ff_boost_s", "Well entry: boost duration (s)"),
         ("exp_settle_max_var", "Max flow variation (µL/min)"), ("exp_settle_hold", "Settle hold (s)"),
         ("exp_settle_timeout", "Settle timeout (s)"), ("exp_settle_bump", "Settle raise step (%)"),
     ]
@@ -126,7 +128,7 @@ class FlowDefinitionsDialog(QDialog):
     # _FIELDS is a bench-tuning constant — burst shapes, clog thresholds,
     # feed-forward timings, the ramp/prime numbers — and those stay behind
     # developer mode so this dialog is readable at a glance.
-    _BASIC_FIELDS = ("window",)
+    _BASIC_FIELDS = ("window", "ff_boost_rate", "ff_boost_s")
 
     # Value boxes are sized to their contents — 3-6 characters for the tuning
     # numbers, a bit more for a port name. Left to stretch they take the whole
@@ -332,7 +334,9 @@ class FlowControlTab(QWidget):
     def __init__(self, parent=None, main_gui=None):
         super().__init__(parent)
         self.main_gui = main_gui         # for mutual-exclusive plotting
-        self.line = None
+        self.line = None                 # DualSyringeLine — present iff the PUMP is connected
+        self.sensor = None               # Fluigent flow sensor — independent of the pump
+        self._sensor_channel = 0
         self.latest_flow = None          # read by the well-log writer
         self.flow_unit = "uL/min"
         self.is_clogged = False          # read by the well-log writer
@@ -358,6 +362,7 @@ class FlowControlTab(QWidget):
         self._phase_flow_gen = 0         # cancels a running phase ramp
         self._ff_enabled = False         # feed-forward pause/resume across moves
         self._ff_gen = 0                 # cancels stale pause/resume timers
+        self._boost_until = 0.0          # monotonic time the well-entry boost ends
         self._last_air = False           # latest Fluigent air-bubble flag
         self._clearing = False           # True while the clog-clearing escalation runs
         self._abort_clear = False        # STOP / resume flag that unwinds the escalation
@@ -424,6 +429,11 @@ class FlowControlTab(QWidget):
             "exp_approach_ramp": 5.0, "exp_recover_ramp": 5.0,
             # feed-forward pause/resume across a move (calibrated 2026-07-15)
             "ff_pause_s": 0.45, "ff_resume_s": 10.0, "ff_resume_ramp": 0.0,
+            # well-entry boost: run at ff_boost_rate for ff_boost_s after the tip
+            # is back in liquid, then drop to the Flow rate. Pushes the well's
+            # dead volume (~130 µL at 100 µL/min = 80 s) to the sensor sooner.
+            # 0 = off.
+            "ff_boost_rate": 0.0, "ff_boost_s": 0.0,
             # closed-loop settle: reach the specified flow (sensor) before a run starts
             "exp_settle": False, "exp_settle_max_var": 5.0, "exp_settle_hold": 5.0,
             "exp_settle_timeout": 120.0, "exp_settle_bump": 5.0,
@@ -472,7 +482,8 @@ class FlowControlTab(QWidget):
         self.btn_sensor = QPushButton("Connect sensor")
         self.btn_sensor.clicked.connect(self._connect_sensor)
         self.btn_sensor.setToolTip("Connect / disconnect the Fluigent flow sensor (OPTIONAL). "
-                                   "Enables live plotting, flow logging, clog detection, and Ramp/Calibrate/Verify.")
+                                   "Works with NO pump: live plotting + flow logging. "
+                                   "With a pump too: clog detection and Ramp/Calibrate/Verify.")
         conn2.addWidget(self.pill_sensor); conn2.addWidget(self.btn_sensor)
         left.addLayout(conn2)
         self._set_pill(self.pill_pump, False, "pump")
@@ -545,7 +556,9 @@ class FlowControlTab(QWidget):
         self.chk_ff = QCheckBox("Pause pump on moves")
         self.chk_ff.setToolTip("On each well move: PAUSE the pump ~0.45 s after the move command "
                                "(tip lifts out of liquid) and RESUME ~10 s later (tip back in liquid) — "
-                               "kills the air surge. Runs at the Flow rate; calibrated, needs NO sensor.")
+                               "kills the air surge. Runs at the Flow rate; calibrated, needs NO sensor.\n"
+                               "A well-entry boost (Definitions) runs faster for a few seconds after the "
+                               "resume, then drops to the Flow rate — it works with or without this tick.")
         self.chk_ff.toggled.connect(lambda v: setattr(self, "_ff_enabled", bool(v)))
         left.addWidget(self.chk_ff)
         self.chk_settle = QCheckBox("Settle to target rate")
@@ -674,7 +687,7 @@ class FlowControlTab(QWidget):
 
         # Say out loud when a saved setting was carried onto a new default —
         # a threshold that changes itself silently is worse than the old value.
-        for note in getattr(self, "_migration_notes", []):
+        for note in getattr(self, "_migration_notes", []) + getattr(self, "_applied_notes", []):
             self.status_msg.emit(f"[settings] updated: {note}")
 
     # ------------------------------------------------------------- helpers
@@ -743,6 +756,26 @@ class FlowControlTab(QWidget):
                     self.cfg[k] = v
             self._saved_fields = saved.get("fields") or {}
             saved_version = int(saved.get("cfg_version") or 0)
+        except Exception:
+            pass
+        # One-shot overlay: ~/.mabip/flow_settings.apply.json {"cfg": {...},
+        # "fields": {...}} is merged over the saved settings and then deleted.
+        # Lets settings be queued for the next launch while the app is running
+        # (the running instance would otherwise overwrite a direct edit).
+        apply_path = self._cfg_path.replace(".json", ".apply.json")
+        try:
+            if os.path.exists(apply_path):
+                with open(apply_path) as f:
+                    pending = json.load(f)
+                for k, v in (pending.get("cfg") or {}).items():
+                    if k in self.cfg:
+                        self.cfg[k] = v
+                self._saved_fields.update(pending.get("fields") or {})
+                os.remove(apply_path)
+                self._applied_notes = [f"applied queued settings from {os.path.basename(apply_path)}"]
+                # Persist now: the apply file is gone, and _migrate_cfg only
+                # saves when the version changed.
+                self._save_cfg()
         except Exception:
             pass
         self._migrate_cfg(saved_version)
@@ -993,12 +1026,16 @@ class FlowControlTab(QWidget):
             self.chk_pull.setChecked(self.cfg["direction"] == "withdraw")
             applied.append(self.cfg["direction"])
         for fkey, ckey in (("pause_after", "ff_pause_s"), ("resume_after", "ff_resume_s"),
-                           ("resume_ramp", "ff_resume_ramp")):
+                           ("resume_ramp", "ff_resume_ramp"),
+                           ("boost_rate", "ff_boost_rate"), ("boost_s", "ff_boost_s")):
             if fkey in exp:
                 try:
                     self.cfg[ckey] = float(exp[fkey])
                 except ValueError:
                     pass
+        if "boost_rate" in exp:
+            applied.append(f"well-entry boost {exp['boost_rate']} µL/min "
+                           f"for {exp.get('boost_s', self.cfg.get('ff_boost_s'))}s")
         if "pause_on_move" in exp:
             on = exp["pause_on_move"].lower() in ("yes", "true", "1", "on", "y")
             self._ff_enabled = on; self.chk_ff.setChecked(on)
@@ -1066,12 +1103,28 @@ class FlowControlTab(QWidget):
         """Enable buttons per connection state: pump-only actions need the pump;
         Ramp/Calibrate/Verify additionally need the flow sensor."""
         pump = self.line is not None
-        sensor = pump and getattr(self.line, "sensor", None) is not None
+        sensor = self.sensor is not None
         busy = self._busy
         for k in ("startflow", "run", "burst", "prime"):      # work without a sensor
             self.btn[k].setEnabled(pump and not busy)
-        self.btn["ramp"].setEnabled(sensor and not busy)      # needs the flow sensor
+        self.btn["ramp"].setEnabled(pump and sensor and not busy)   # needs BOTH
         self.btn["stop"].setEnabled(pump)
+
+    # The flow sensor is owned by the TAB, not by the pump line: it can be
+    # connected, read, plotted and logged with no pump at all. When a pump line
+    # exists the same sensor object is lent to it (line.sensor) so the backend's
+    # Ramp/Calibrate/Verify/Burst can use it; the line never closes it.
+    def _attach_sensor_to_line(self):
+        if self.line is None:
+            return
+        self.line.sensor = self.sensor
+        self.line.sensor_channel = self._sensor_channel
+        self.line._own_sensor = False
+
+    def _detach_sensor_from_line(self):
+        if self.line is not None:
+            self.line.sensor = None
+            self.line._own_sensor = False
 
     def _set_busy(self, b):
         self._busy = b
@@ -1107,19 +1160,23 @@ class FlowControlTab(QWidget):
             ok = False
             try:
                 from dual_syringe import DualSyringeLine
+                # Lend an already-connected sensor to the line (sensor=... makes
+                # the line NOT own it, so line.close() leaves it open).
                 line = DualSyringeLine(diameter_mm=float(self.cfg["diameter"]),
                                        n_syringes=int(self.cfg["n"]),
                                        direction=self.cfg["direction"],
                                        pump_port=self.cfg["port"],
-                                       require_sensor=False, sensor=None, verbose=False)
+                                       require_sensor=False, sensor=self.sensor,
+                                       sensor_channel=self._sensor_channel, verbose=False)
                 self.line = line
                 ok = True
                 # New hardware in hand: a previous safe shutdown must not latch
                 # this one out.
                 self._shutdown_done = False
                 self._abort = False
-                self.status_msg.emit(f"Pump connected — {line.pump.port.split('/')[-1]}. "
-                                     "Connect the flow sensor too if you have one.")
+                hint = ("" if self.sensor is not None
+                        else " Connect the flow sensor too if you have one.")
+                self.status_msg.emit(f"Pump connected — {line.pump.port.split('/')[-1]}.{hint}")
             except Exception as e:
                 self.status_msg.emit(f"Pump connect failed: {e}")
             self.pump_result.emit(ok)
@@ -1132,32 +1189,26 @@ class FlowControlTab(QWidget):
 
         self._set_pill(self.pill_pump, ok, "pump")
         self.btn_pump.setText("Disconnect pump" if ok else "Connect pump")
-        self.btn_sensor.setEnabled(ok)          # sensor attaches to a live pump
         if not ok:
             self.line = None
         self._refresh_actions()
 
     def _disconnect_pump(self):
-        """Disconnect the pump (and the sensor, if attached)."""
+        """Disconnect the pump. A connected flow sensor stays connected and keeps
+        plotting/logging — it never belonged to the pump."""
         self._steady = False
-        try:
-            if self.line is not None:
-                self.line.disconnect_sensor()
-        except Exception:
-            pass
+        self._detach_sensor_from_line()
         try:
             if self.line is not None:
                 self.line.close()
         except Exception:
             pass
-        self.line = None; self.latest_flow = None
-        self._flow_log_path = None; self._flow_log_armed = False
+        self.line = None
         self._set_pill(self.pill_pump, False, "pump")
-        self._set_pill(self.pill_sensor, False, "sensor")
         self.btn_pump.setText("Connect pump")
-        self.btn_sensor.setText("Connect sensor"); self.btn_sensor.setEnabled(False)
         self._refresh_actions()
-        self.status_msg.emit("Pump disconnected.")
+        self.status_msg.emit("Pump disconnected." +
+                             (" Flow sensor still connected." if self.sensor is not None else ""))
 
     def _flow_sign(self):
         """+1.0 or -1.0. Anything that isn't clearly negative means "don't flip"."""
@@ -1167,29 +1218,39 @@ class FlowControlTab(QWidget):
             return 1.0
 
     def _connect_sensor(self):
-        """Attach the Fluigent flow sensor to the live pump (optional)."""
-        if self.line is None:
-            self.status_msg.emit("Connect the pump first."); return
-        if getattr(self.line, "sensor", None) is not None:
+        """Connect the Fluigent flow sensor. Independent of the pump: works with
+        no pump at all (read / plot / log only), and is lent to the pump line
+        whenever one exists."""
+        if self.sensor is not None:
             self._disconnect_sensor(); return
         self.status_msg.emit("Connecting flow sensor…"); self.btn_sensor.setEnabled(False)
+        ch = int(self.cfg.get("sensor_channel", 0))
 
         def job():
             ok = False
             try:
-                self.line.connect_sensor(channel=int(self.cfg.get("sensor_channel", 0)))
+                from fluigent_sensor import FluigentSensor
+                raw = FluigentSensor(channel=ch, auto_open=True)
                 # Correct the orientation at the source, before anything reads it.
-                self.line.sensor = _SignedSensor(self.line.sensor, self._flow_sign)
+                self.sensor = _SignedSensor(raw, self._flow_sign)
+                self._sensor_channel = ch
+                self._attach_sensor_to_line()
                 ok = True
+                # New hardware in hand: a previous safe shutdown must not latch
+                # this one out.
+                self._shutdown_done = False
                 inv = " (readings INVERTED: flow_sign = -1)" if self._flow_sign() < 0 else ""
-                self.status_msg.emit(f"Flow sensor connected — plotting + logging.{inv}")
+                pump = "" if self.line is not None else " No pump — read-only."
+                self.status_msg.emit(f"Flow sensor connected — plotting + logging.{inv}{pump}")
             except Exception as e:
                 self.status_msg.emit(f"Sensor connect failed: {e}")
             self.sensor_result.emit(ok)
         threading.Thread(target=job, daemon=True).start()
 
     def _after_sensor(self, ok):
-        self.btn_sensor.setEnabled(self.line is not None)
+        self.btn_sensor.setEnabled(True)
+        if ok and not self.poll_timer.isActive():
+            self.poll_timer.start(150)   # a previous safe shutdown stopped it
         self._set_pill(self.pill_sensor, ok, "sensor")
         self.btn_sensor.setText("Disconnect sensor" if ok else "Connect sensor")
         if ok:
@@ -1197,18 +1258,25 @@ class FlowControlTab(QWidget):
             self._start_flow_log()   # only log flow when a sensor is present
         self._refresh_actions()
 
-    def _disconnect_sensor(self):
-        try:
-            if self.line is not None:
-                self.line.disconnect_sensor()
-        except Exception:
-            pass
+    def _release_sensor(self):
+        """Close the tab's sensor and forget it (no UI). Never raises."""
+        self._detach_sensor_from_line()
+        s, self.sensor = self.sensor, None
+        if s is not None:
+            try:
+                s.close()
+            except Exception:
+                pass
         self.latest_flow = None
         self._flow_log_path = None; self._flow_log_armed = False
+
+    def _disconnect_sensor(self):
+        self._release_sensor()
         self._set_pill(self.pill_sensor, False, "sensor")
         self.btn_sensor.setText("Connect sensor")
         self._refresh_actions()
-        self.status_msg.emit("Flow sensor disconnected (pump still connected).")
+        self.status_msg.emit("Flow sensor disconnected" +
+                             (" (pump still connected)." if self.line is not None else "."))
 
     def _start_flow_log(self):
         """Arm flow logging. Rows go into MABIP's run file while the metabolite
@@ -1603,7 +1671,8 @@ class FlowControlTab(QWidget):
             self.cfg["direction"] = "withdraw" if d.startswith(("w", "pull")) else "infuse"
             self.chk_pull.setChecked(self.cfg["direction"] == "withdraw")
         for fkey, ckey in (("pause_after", "ff_pause_s"), ("resume_after", "ff_resume_s"),
-                           ("resume_ramp", "ff_resume_ramp")):
+                           ("resume_ramp", "ff_resume_ramp"),
+                           ("boost_rate", "ff_boost_rate"), ("boost_s", "ff_boost_s")):
             if fkey in run:
                 try:
                     self.cfg[ckey] = float(run[fkey])
@@ -1879,22 +1948,24 @@ class FlowControlTab(QWidget):
                     pass
 
     def _poll(self):
-        # Nothing to read/plot/log without a flow sensor (pump-only is fine).
-        if self.line is None or getattr(self.line, "sensor", None) is None:
+        # Nothing to read/plot/log without a flow sensor (pump-only is fine;
+        # sensor-only is fine too — no pump needed to measure flow).
+        sensor = self.sensor
+        if sensor is None:
             return
         # During a burst calibration the worker thread owns the sensor (fast
         # sampling); don't read it here too (concurrent HID reads corrupt data).
         if self._calibrating:
             return
-        ch = getattr(self.line, "sensor_channel", 0)
+        ch = self._sensor_channel
         try:
-            val = float(self.line.sensor.read(ch))
+            val = float(sensor.read(ch))
         except Exception as e:
             self.status_msg.emit(f"sensor read error: {e}"); return
         now = time.monotonic() - self._t0
         self.latest_flow = val
         try:
-            self._last_air = bool(self.line.sensor.air_bubble(ch))
+            self._last_air = bool(sensor.air_bubble(ch))
         except Exception:
             self._last_air = False
         self.t.append(now); self.v.append(val)
@@ -1960,7 +2031,10 @@ class FlowControlTab(QWidget):
         """MABIP just sent a move command (the exact anchor). Feed-forward PAUSE
         the pump ~0.45 s later (tip lifts out) and RESUME ~10 s later (tip back in
         liquid), covering the air gap. Fires off local timers, so it's precise."""
-        if not self._ff_enabled or self.line is None:
+        boost_rate = self._cfgf("ff_boost_rate", 0.0)
+        boost_s = self._cfgf("ff_boost_s", 0.0)
+        boost = boost_rate > 0 and boost_s > 0
+        if (not self._ff_enabled and not boost) or self.line is None:
             return
         try:
             pause_ms = int(float(self.cfg.get("ff_pause_s", 0.45)) * 1000)
@@ -1971,10 +2045,20 @@ class FlowControlTab(QWidget):
         n = self._nsyr()
         self._ff_gen += 1
         gen = self._ff_gen
-        self.status_msg.emit(f"[ff] move→{well_id}: pause in {pause_ms/1000:.2f}s, "
-                             f"resume {rate:g} µL/min in {resume_ms/1000:.1f}s.")
+        if boost:
+            self.status_msg.emit(
+                f"[ff] move→{well_id}: {'pause in %.2fs, ' % (pause_ms/1000) if self._ff_enabled else ''}"
+                f"boost {boost_rate:g} µL/min at {resume_ms/1000:.1f}s for {boost_s:g}s, "
+                f"then {rate:g} µL/min.")
+        else:
+            self.status_msg.emit(f"[ff] move→{well_id}: pause in {pause_ms/1000:.2f}s, "
+                                 f"resume {rate:g} µL/min in {resume_ms/1000:.1f}s.")
 
         ramp_s = float(self.cfg.get("ff_resume_ramp", 0.0) or 0.0)
+        # What the resume runs at: the boost rate if a boost is set, else the
+        # Flow rate. The boost ends with a separate timer that drops to the
+        # Flow rate (same ramp setting, so a ramped resume gets a ramped drop).
+        resume_rate = boost_rate if boost else rate
 
         def do_pause():
             if gen != self._ff_gen or self.line is None:
@@ -1986,21 +2070,35 @@ class FlowControlTab(QWidget):
             self._phase_flow_rate = 0.0     # so a ramped resume starts from 0
             self.status_msg.emit(f"[ff] pump paused (moving to {well_id}).")
 
+        def _go(target, label):
+            if ramp_s > 0:                  # gentle ramp (not a step) to avoid overshoot
+                self._apply_phase_flow(target, ramp_s, label)
+            else:
+                try:
+                    self.line.start_flow_single(target / n, direction=self.cfg["direction"])
+                except Exception:
+                    pass
+                self._phase_flow_rate = target
+                self.status_msg.emit(f"[ff] pump {label}: {target:g} µL/min (in {well_id}).")
+
         def do_resume():
             if gen != self._ff_gen or self.line is None:
                 return
-            if ramp_s > 0:                  # gentle ramp up (not a step) to avoid overshoot
-                self._apply_phase_flow(rate, ramp_s, f"resume→{well_id}")
-            else:
-                try:
-                    self.line.start_flow_single(rate / n, direction=self.cfg["direction"])
-                except Exception:
-                    pass
-                self._phase_flow_rate = rate
-                self.status_msg.emit(f"[ff] pump resumed {rate:g} µL/min (in {well_id}).")
+            if boost:
+                self._boost_until = time.monotonic() + boost_s
+            _go(resume_rate, "boost" if boost else "resumed")
 
-        QTimer.singleShot(pause_ms, do_pause)
+        def do_boost_end():
+            if gen != self._ff_gen or self.line is None:
+                return
+            self._boost_until = 0.0
+            _go(rate, "boost over, back to")
+
+        if self._ff_enabled:
+            QTimer.singleShot(pause_ms, do_pause)
         QTimer.singleShot(resume_ms, do_resume)
+        if boost:
+            QTimer.singleShot(resume_ms + int(boost_s * 1000), do_boost_end)
 
     def set_experiment_phase(self, phase, n_wells=0):
         """Called by MABIP: phase in {'idle','buffer','well'} with well count.
@@ -2040,7 +2138,8 @@ class FlowControlTab(QWidget):
         # flow slightly off. Skipped when flow-follows-wells or feed-forward is
         # already driving the pump. Fires once per well entry (prev != "well").
         if phase == "well" and prev != "well" and self.line is not None \
-                and not self._exp_follow and not self._ff_enabled:
+                and not self._exp_follow and not self._ff_enabled \
+                and time.monotonic() >= self._boost_until:
             rate = self._num(self.f_rate, 0.0)
             if rate > 0:
                 try:
@@ -2599,31 +2698,31 @@ class FlowControlTab(QWidget):
 
         if self.line is None:
             notes.append("pump not connected — nothing to stop")
-            return notes
+        else:
+            # 3. Stop, wait for any worker to notice the abort, stop again.
+            stopped = self._insist_stop()
+            notes.append("pump STOP sent" if stopped else
+                         "pump STOP FAILED — check the pump is off at the front panel")
+            deadline = time.monotonic() + 2.0
+            while self._busy and time.monotonic() < deadline:
+                time.sleep(0.05)
+            if self._busy:
+                notes.append("a flow worker was still running — stop re-sent over it")
+            if self._insist_stop():
+                notes.append("pump confirmed stopped")
 
-        # 3. Stop, wait for any worker to notice the abort, stop again.
-        stopped = self._insist_stop()
-        notes.append("pump STOP sent" if stopped else
-                     "pump STOP FAILED — check the pump is off at the front panel")
-        deadline = time.monotonic() + 2.0
-        while self._busy and time.monotonic() < deadline:
-            time.sleep(0.05)
-        if self._busy:
-            notes.append("a flow worker was still running — stop re-sent over it")
-        if self._insist_stop():
-            notes.append("pump confirmed stopped")
-
-        # 4. Release the hardware. close() stops once more on its way out.
-        try:
-            self.line.disconnect_sensor()
+        # 4. Release the hardware. The sensor is the tab's, not the line's, so
+        # it is released here whether or not a pump was ever connected.
+        # line.close() stops the pump once more on its way out.
+        if self.sensor is not None:
+            self._release_sensor()
             notes.append("flow sensor released")
-        except Exception as e:
-            notes.append(f"flow sensor release error: {e}")
-        try:
-            self.line.close()
-            notes.append("pump port closed")
-        except Exception as e:
-            notes.append(f"pump close error: {e}")
+        if self.line is not None:
+            try:
+                self.line.close()
+                notes.append("pump port closed")
+            except Exception as e:
+                notes.append(f"pump close error: {e}")
         self.line = None
         self.latest_flow = None
 
@@ -2631,7 +2730,7 @@ class FlowControlTab(QWidget):
             self._set_pill(self.pill_pump, False, "pump")
             self._set_pill(self.pill_sensor, False, "sensor")
             self.btn_pump.setText("Connect pump")
-            self.btn_sensor.setText("Connect sensor"); self.btn_sensor.setEnabled(False)
+            self.btn_sensor.setText("Connect sensor"); self.btn_sensor.setEnabled(True)
             self._refresh_actions()
         except Exception:
             pass

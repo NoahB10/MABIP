@@ -1,0 +1,15 @@
+# MABIP experiment — WELL-ENTRY BOOST
+# Measured 22 Oct 2026: at 100 µL/min the well's fluid takes ~1 min 20 s to reach
+# the sensor (~130 µL dead volume). So on entering each well run FAST for a short
+# while, then settle to the run rate:
+#   move → tip back in liquid (+10 s) → 160 µL/min for 30 s → 100 µL/min for the rest.
+# Load this in the Flow Control tab (📂 Load experiment…). It only sets the pump
+# settings — pick wells and sampling/buffer times in the Sampling tab as usual.
+flow_rate: 100
+direction: withdraw
+pause_on_move: yes
+pause_after: 0.45
+resume_after: 10
+resume_ramp: 0
+boost_rate: 160
+boost_s: 30

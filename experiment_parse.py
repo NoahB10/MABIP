@@ -15,6 +15,8 @@ def parse_experiment(text):
       pause_after: 0.45            # s after move command to pause
       resume_after: 10             # s after move command to resume
       resume_ramp: 3               # s to ramp up on resume (0 = step)
+      boost_rate: 160              # well-entry boost rate, µL/min (0 = off)
+      boost_s: 30                  # boost duration after resume, seconds
 
     A well-plate multi-run file adds `[run] Name` (or `[Name]`) headers; lines under
     each header are that run's settings (each run inherits the shared settings above).
