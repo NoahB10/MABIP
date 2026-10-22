@@ -81,7 +81,8 @@ class FakeDetector:
 
 def _cfg(**kw):
     base = dict(max_dwell_s=900, escalate_after_s=0.1, step=20, step_every_s=0.05,
-                max_rate=160, hold_at_max_s=0.1, max_clears=2, clear_timeout_s=2.0)
+                max_rate=160, hold_at_max_s=0.1, max_clears=2, clear_timeout_s=2.0,
+                fresh_window_s=0.1)
     base.update(kw)
     return LowVolumeConfig(**base)
 
@@ -91,6 +92,30 @@ def _ctl(cfg=None, pump=None):
     ctl = LowVolumeController(cfg or _cfg(), det, pump=pump if pump is not None else FakePump(),
                               poll_s=0.01)
     return ctl, det
+
+
+def _signal(kind):
+    """Six channels at time t: 'flat' (stale, tiny noise), 'rising', 'falling'."""
+    import math
+    def f(t, i):
+        noise = 0.001 * math.sin(i * 12.9898)
+        if kind == "flat":
+            return [1.0 + noise] * 6
+        slope = 5.0 if kind == "rising" else -5.0
+        return [1.0 + slope * t + noise] * 6
+    return f
+
+
+async def _stream(ctl, sig, until_s=10.0, dt=0.01, switch=None):
+    """Feed readings every dt. `switch=(after_s, other_sig)` changes the signal."""
+    t0 = time.monotonic()
+    i = 0
+    while time.monotonic() - t0 < until_s:
+        el = time.monotonic() - t0
+        s = switch[1] if switch and el >= switch[0] else sig
+        ctl.feed(time.monotonic(), s(el, i))
+        i += 1
+        await asyncio.sleep(dt)
 
 
 async def _feed_after(ctl, det, delay):
@@ -124,7 +149,8 @@ def test_escalates_in_steps_then_air_resets_to_base():
     conn = FakeConn()
 
     async def go():
-        asyncio.ensure_future(_feed_after(ctl, det, 0.35))
+        asyncio.ensure_future(_stream(ctl, _signal("flat")))
+        asyncio.ensure_future(_feed_after(ctl, det, 0.45))
         return await ctl.run_in_well(conn, Method("A1", wait=60), 1, asyncio.Event())
     assert asyncio.run(go()) is True
     assert ctl.pump.rates[:3] == [120, 140, 160]   # +20 steps, capped at max
@@ -138,8 +164,9 @@ def test_clog_goes_home_clears_and_returns_to_same_well():
     conn = FakeConn()
 
     async def go():
+        asyncio.ensure_future(_stream(ctl, _signal("flat")))
         # No air until well after the first clog trip.
-        asyncio.ensure_future(_feed_after(ctl, det, 0.9))
+        asyncio.ensure_future(_feed_after(ctl, det, 0.6))
         return await ctl.run_in_well(conn, Method("B3", wait=60), 15, asyncio.Event(),
                                      on_move=lambda w: moves.append(w))
     moves = []
@@ -155,7 +182,11 @@ def test_gives_up_after_max_clears():
     pump = FakePump()
     ctl, det = _ctl(_cfg(max_clears=1), pump=pump)
     conn = FakeConn()
-    ok = asyncio.run(ctl.run_in_well(conn, Method("C1", wait=60), 3, asyncio.Event()))
+
+    async def go():
+        asyncio.ensure_future(_stream(ctl, _signal("flat")))
+        return await ctl.run_in_well(conn, Method("C1", wait=60), 3, asyncio.Event())
+    ok = asyncio.run(go())
     assert ok is False
     assert pump.clears == 1
     assert "C1" in ctl.last_error and "halted" in ctl.last_error
@@ -189,8 +220,9 @@ def test_stop_sends_T_and_restores_base():
 
     async def go():
         async def press():
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(0.4)
             stop.set()
+        asyncio.ensure_future(_stream(ctl, _signal("flat")))
         asyncio.ensure_future(press())
         return await ctl.run_in_well(conn, Method("A1", wait=60), 1, stop)
     assert asyncio.run(go()) is False
@@ -277,3 +309,55 @@ def test_detector_on_real_run_flags_only_the_dry_well():
         if ev and ev.kind == "EMPTY" and k and t - mv[k - 1] <= 150:
             in_well_empty.append(names[k - 1])
     assert in_well_empty == ["H3"]
+
+
+
+def test_moving_signal_never_raises_the_pump():
+    """Fresh fluid arriving (signal rising) = draining fine: no escalation, no
+    clog trip, however long it takes."""
+    pump = FakePump()
+    ctl, det = _ctl(pump=pump)
+    conn = FakeConn()
+
+    async def go():
+        asyncio.ensure_future(_stream(ctl, _signal("rising")))
+        asyncio.ensure_future(_feed_after(ctl, det, 0.8))
+        return await ctl.run_in_well(conn, Method("A1", wait=60), 1, asyncio.Event())
+    assert asyncio.run(go()) is True
+    assert pump.rates == [] and pump.clears == 0
+    assert ctl.log[0][1] == "empty"
+
+
+def test_falling_signal_also_counts_as_fresh():
+    pump = FakePump()
+    ctl, det = _ctl(pump=pump)
+    conn = FakeConn()
+
+    async def go():
+        asyncio.ensure_future(_stream(ctl, _signal("falling")))
+        asyncio.ensure_future(_feed_after(ctl, det, 0.5))
+        return await ctl.run_in_well(conn, Method("A1", wait=60), 1, asyncio.Event())
+    assert asyncio.run(go()) is True
+    assert pump.rates == []
+
+
+def test_signal_going_stale_midway_starts_escalation():
+    pump = FakePump()
+    ctl, det = _ctl(_cfg(hold_at_max_s=10), pump=pump)
+    conn = FakeConn()
+
+    async def go():
+        asyncio.ensure_future(_stream(ctl, _signal("rising"),
+                                      switch=(0.4, _signal("flat"))))
+        asyncio.ensure_future(_feed_after(ctl, det, 1.0))
+        return await ctl.run_in_well(conn, Method("A1", wait=60), 1, asyncio.Event())
+    assert asyncio.run(go()) is True
+    assert pump.rates and pump.rates[0] == 120
+    assert pump.clears == 0
+
+
+def test_freshness_judgement_needs_a_full_window():
+    ctl, det = _ctl(_cfg(fresh_window_s=30))
+    now = time.monotonic()
+    ctl.feed(now, [1.0] * 6)
+    assert ctl.signal_fresh(now) is None

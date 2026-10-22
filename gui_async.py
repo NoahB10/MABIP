@@ -1410,19 +1410,20 @@ class SettingsDialog(QDialog):
         self.lv_checkbox.setChecked(bool(getattr(self.app_state, "lv_enabled", False)))
         self.lv_checkbox.setToolTip(
             "Ignores Sampling Time. The robot stays in each well until the sensor "
-            "shows the air that follows the well emptying, then moves on. If no "
-            "air comes, the pump rate is raised step by step up to the max; still "
-            "nothing at the max means a clog: the needle goes home, the line is "
-            "cleared there, and it returns to the same well.")
+            "shows the air that follows the well emptying, then moves on. While "
+            "the metabolite signal keeps moving the pump is left alone; if it goes "
+            "stale (flat), the pump rate is raised step by step up to the max. "
+            "Still stale at the max means a clog: the needle goes home, the line "
+            "is cleared there, and it returns to the same well.")
         lv_form.addRow("", self.lv_checkbox)
         lv = LowVolumeConfig.from_dict(getattr(self.app_state, "lv_config", {}) or {})
         self._lv_spins = {}
         for key, label, lo, hi, step, suffix in (
-                ("escalate_after_s", "Raise pump after no air for", 10, 3600, 10, " s"),
-                ("step", "Raise by", 1, 200, 5, " µL/min"),
-                ("step_every_s", "Every", 5, 600, 5, " s"),
+                ("escalate_after_s", "Start checking signal after", 10, 3600, 10, " s"),
+                ("step", "If stale, raise pump by", 1, 200, 5, " µL/min"),
+                ("step_every_s", "Check every", 5, 600, 5, " s"),
                 ("max_rate", "Up to (max)", 10, 1000, 10, " µL/min"),
-                ("hold_at_max_s", "Clog if no air at max for", 10, 1800, 10, " s"),
+                ("hold_at_max_s", "Clog if still stale at max for", 10, 1800, 10, " s"),
                 ("max_clears", "Clog clears per well", 0, 10, 1, ""),
                 ("max_dwell_s", "Safety cap per well", 60, 9999, 60, " s")):
             sp = QDoubleSpinBox() if key not in ("max_clears", "max_dwell_s") else QSpinBox()
@@ -3595,9 +3596,9 @@ class AsyncAMUZAGUI(QMainWindow):
             if values['lv_enabled']:
                 c = LowVolumeConfig.from_dict(values['lv_config'])
                 self.add_to_display(
-                    f"Low-volume mode ON: stay until air; raise pump +{c.step:g} every "
-                    f"{c.step_every_s:g}s after {c.escalate_after_s:g}s, up to {c.max_rate:g}; "
-                    f"clog-clear at home after {c.hold_at_max_s:g}s at max.")
+                    f"Low-volume mode ON: stay until air; from {c.escalate_after_s:g}s check "
+                    f"the signal every {c.step_every_s:g}s, if stale raise pump +{c.step:g} "
+                    f"up to {c.max_rate:g}; clog-clear at home if stale {c.hold_at_max_s:g}s at max.")
             self.notifier.configure(enabled=values['notify_enabled'],
                                     topic=values['notify_topic'],
                                     server=values['notify_server'],

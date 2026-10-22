@@ -17,10 +17,13 @@ Per well:
 3. Air seen -> ``@T``. Verified from the AMUZA logs (22 Oct 2026): ``@T``
    mid-dwell aborts the dwell and returns the needle home (state 05 for 6-8 s,
    then 01 READY at position 000), and a following ``@P`` works normally.
-4. No air after ``escalate_after_s`` -> raise the pump rate by ``step`` every
-   ``step_every_s`` up to ``max_rate``. A well that is merely slow to empty
-   empties faster.
-5. Still no air after ``hold_at_max_s`` at ``max_rate`` -> treat it as a CLOG.
+4. After a grace period (``escalate_after_s``, long enough for the well's
+   fluid to reach the sensor), check the signal every ``step_every_s``. If the
+   metabolite channels are still MOVING (fresh fluid is arriving) leave the
+   pump alone: the well is draining fine. Only a STALE signal, flat over the
+   last ``fresh_window_s``, raises the pump rate by ``step``, up to
+   ``max_rate``. (Elapsed time alone is not a reason to push harder.)
+5. Stale for ``hold_at_max_s`` at ``max_rate`` -> treat it as a CLOG.
    Go home (``@T``), run the Flow Control tab's clog clearing there, where
    bursts and reverse pushes cannot disturb a well's reading, then go back into
    the same well at the base rate and keep watching. Give up after
@@ -36,6 +39,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections import deque
 from dataclasses import dataclass, asdict, fields
 from typing import Callable, Optional
 
@@ -50,16 +54,26 @@ class LowVolumeConfig:
     """Safety cap sent to the robot as the dwell. The run normally leaves long
     before this; reaching it means the well never showed air."""
 
-    escalate_after_s: float = 120.0
-    """Time in the well with no air before the pump rate starts rising. Must be
-    longer than the dead-volume lag plus the expected empty time, or slow-but-
-    healthy wells get pushed harder than needed."""
+    escalate_after_s: float = 90.0
+    """Grace period after entering before the signal is judged. Must exceed
+    the dead-volume lag (65 s at 120 µL/min), or the flat buffer signal still
+    in the line reads as stale."""
 
     step: float = 20.0
     """Pump rate increase per escalation step, µL/min (combined line)."""
 
     step_every_s: float = 30.0
-    """Seconds between escalation steps."""
+    """Seconds between signal checks (and so between escalation steps)."""
+
+    fresh_window_s: float = 30.0
+    """The signal is compared with its level this long ago."""
+
+    fresh_k: float = 6.0
+    """Change needed to count as moving, in units of the channel's own sample
+    noise (median absolute first difference)."""
+
+    fresh_min_channels: int = 2
+    """Channels that must be moving for the signal to count as fresh."""
 
     max_rate: float = 300.0
     """Ceiling for the escalation, µL/min. The pump has no pressure sensor, so
@@ -137,12 +151,16 @@ class LowVolumeController:
         self.poll_s = poll_s
         self._in_well = False
         self._empty_at: Optional[float] = None
+        self._hist = deque()                      # (t, channels) for freshness
+        self._dabs = [deque(maxlen=300) for _ in range(6)]
+        self._prev = None
         self.last_error: Optional[str] = None
         self.log: list = []          # (well, outcome, seconds_in_well, clears)
 
     # ---- sensor side ------------------------------------------------------
     def feed(self, t: float, channels) -> None:
         """One sensor reading. Only acted on while the needle is in a well."""
+        self._record(t, channels)
         try:
             ev = self.detector.update(t, channels)
         except Exception as e:  # noqa: BLE001 — a detector bug must not kill the run
@@ -157,6 +175,45 @@ class LowVolumeController:
             return
         self._empty_at = t
         logger.info(f"Low-volume: {getattr(ev, 'message', ev)}")
+
+    # ---- freshness: is fresh fluid still reaching the sensor? -------------
+    def _record(self, t, channels):
+        try:
+            ch = [float(x) for x in list(channels)[:6]]
+        except (TypeError, ValueError):
+            return
+        if self._prev is not None:
+            for i, (a, b) in enumerate(zip(ch, self._prev)):
+                self._dabs[i].append(abs(a - b))
+        self._prev = ch
+        self._hist.append((t, ch))
+        keep = self.cfg.fresh_window_s + 30.0
+        while self._hist and t - self._hist[0][0] > keep:
+            self._hist.popleft()
+
+    def signal_fresh(self, now: float) -> Optional[bool]:
+        """True = the channels moved over the last fresh_window_s (fluid is
+        arriving), False = flat (stale), None = not enough data to judge.
+
+        Levels are 5-sample medians, so a single air spike or glitch cannot
+        make a stale signal look fresh. Each channel is scaled by its own
+        noise, because amplitudes differ ~50x between channels."""
+        w = self.cfg.fresh_window_s
+        if not self._hist or self._hist[-1][0] - self._hist[0][0] < w:
+            return None
+        recent = [c for _, c in self._hist][-5:]
+        t_recent = self._hist[-len(recent)][0]
+        past = [c for tt, c in self._hist if tt <= t_recent - w][-5:]
+        if len(recent) < 2 or len(past) < 2:
+            return None
+        moving = 0
+        for i in range(6):
+            noise = _median(list(self._dabs[i])) if self._dabs[i] else 0.0
+            noise = max(noise, 1e-4)
+            change = abs(_median([c[i] for c in recent]) - _median([c[i] for c in past]))
+            if change / noise >= self.cfg.fresh_k:
+                moving += 1
+        return moving >= self.cfg.fresh_min_channels
 
     def _enter(self, t: float) -> None:
         self._in_well = True
@@ -262,14 +319,26 @@ class LowVolumeController:
             self._say(on_progress, f"Sampling: well {well} (low-volume, {t_in:.0f}s"
                                    + (f", pump {rate:g}" if pump_ok else "") + ")", log=False)
 
-            # 3. No air yet -> push harder, up to max_rate.
-            if pump_ok and t_in >= cfg.escalate_after_s and rate < cfg.max_rate \
+            # 3. Past the grace period, judge the signal every step_every_s.
+            #    Moving = fluid is arriving, leave the pump alone. Flat = stale,
+            #    push harder, up to max_rate.
+            if pump_ok and t_in >= cfg.escalate_after_s \
                     and (last_step is None or now - last_step >= cfg.step_every_s):
-                rate = min(cfg.max_rate, max(rate, base) + cfg.step)
-                self.pump.set_rate(rate, f"escalate {well}")
-                logger.info(f"Low-volume: {well} no air after {t_in:.0f}s, pump -> {rate:g}")
                 last_step = now
-                if rate >= cfg.max_rate:
+                fresh = self.signal_fresh(now)
+                if fresh is True:
+                    if at_max_since is not None:
+                        logger.info(f"Low-volume: {well} signal moving again at "
+                                    f"{rate:g}; clog countdown cancelled")
+                    at_max_since = None
+                elif fresh is False and rate < cfg.max_rate:
+                    rate = min(cfg.max_rate, max(rate, base) + cfg.step)
+                    self.pump.set_rate(rate, f"stale signal {well}")
+                    logger.info(f"Low-volume: {well} signal stale after {t_in:.0f}s, "
+                                f"pump -> {rate:g}")
+                    if rate >= cfg.max_rate:
+                        at_max_since = now
+                elif fresh is False and at_max_since is None:
                     at_max_since = now
 
             # 4. At max_rate for long enough and still nothing -> clog.
@@ -311,6 +380,14 @@ class LowVolumeController:
                 continue
 
             await asyncio.sleep(self.poll_s)
+
+
+def _median(v):
+    s = sorted(v)
+    n = len(s)
+    if n == 0:
+        return 0.0
+    return s[n // 2] if n % 2 else 0.5 * (s[n // 2 - 1] + s[n // 2])
 
 
 def _movement_priority():
