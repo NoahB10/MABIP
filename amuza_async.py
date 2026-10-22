@@ -988,10 +988,15 @@ class AsyncAmuzaConnection:
         stop_event: asyncio.Event,
         on_progress: Optional[Callable[[str, int, int], None]] = None,
         on_move: Optional[Callable[[str], None]] = None,
-        pause_gate: Optional[Callable[[], Awaitable[bool]]] = None
+        pause_gate: Optional[Callable[[], Awaitable[bool]]] = None,
+        dwell_controller=None
     ) -> bool:
         """
         Execute a single method with interruptible waits.
+
+        dwell_controller (low_volume.LowVolumeController): if given, the move is
+        sent with the controller's dwell cap and the controller decides when to
+        leave the well (when it runs dry) instead of the fixed sampling time.
         on_move(well_id) fires the instant the move command is sent (the anchor
         for feed-forward pump pause/resume).
 
@@ -1043,7 +1048,10 @@ class AsyncAmuzaConnection:
             port = method.pos
 
         # Send move command
-        command = self._format_method_command(port, method.wait)
+        dwell = method.wait
+        if dwell_controller is not None:
+            dwell = int(dwell_controller.cfg.max_dwell_s)
+        command = self._format_method_command(port, dwell)
         move_time = self.calculate_move_time(str(method.pos))
 
         logger.info(f"Moving to {method.pos} (port {port}), sampling for {method.wait}s")
@@ -1087,6 +1095,13 @@ class AsyncAmuzaConnection:
                                    "after two move commands. Well not marked done.")
                 logger.error(self.last_error)
                 return False
+
+        if dwell_controller is not None:
+            ok = await dwell_controller.run_in_well(
+                self, method, port, stop_event, on_progress=on_progress, on_move=on_move)
+            if not ok and getattr(dwell_controller, "last_error", None):
+                self.last_error = dwell_controller.last_error
+            return ok
 
         # Now monitor device status until completion, with interruptible checks
         # Use device's actual countdown rather than software timing
@@ -1145,7 +1160,8 @@ class AsyncAmuzaConnection:
         progress_callback: Optional[Callable[[str, int, int], None]] = None,
         timing_provider: Optional[Callable[[], tuple]] = None,
         move_callback: Optional[Callable[[str], None]] = None,
-        pause_gate: Optional[Callable[[], Awaitable[bool]]] = None
+        pause_gate: Optional[Callable[[], Awaitable[bool]]] = None,
+        dwell_controller=None
     ) -> bool:
         """
         Execute a sequence of methods with stop support.
@@ -1194,7 +1210,8 @@ class AsyncAmuzaConnection:
                 completed = await self.execute_method(method, stop_event,
                                                       on_progress=progress_callback,
                                                       on_move=move_callback,
-                                                      pause_gate=pause_gate)
+                                                      pause_gate=pause_gate,
+                                                      dwell_controller=dwell_controller)
 
                 if not completed:
                     logger.info(f"Method not completed, stopping sequence")

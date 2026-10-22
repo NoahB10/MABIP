@@ -58,6 +58,10 @@ class AppState:
     notify_server: str = "https://ntfy.sh"
     notify_desktop: bool = True
 
+    # Low-volume mode (low_volume.py): stay in each well until it runs dry.
+    lv_enabled: bool = False
+    lv_config: Dict[str, float] = field(default_factory=dict)
+
     # Calibration gains
     calibration_gains: Dict[str, float] = field(default_factory=lambda: {
         "Glutamate": 3.394,
@@ -222,6 +226,8 @@ class AppState:
             "notify_topic": self.notify_topic,
             "notify_server": self.notify_server,
             "notify_desktop": self.notify_desktop,
+            "lv_enabled": self.lv_enabled,
+            "lv_config": self.lv_config,
         }
 
         try:
@@ -260,6 +266,10 @@ class AppState:
                     self.notify_server = str(settings["notify_server"] or "https://ntfy.sh")
                 if "notify_desktop" in settings:
                     self.notify_desktop = bool(settings["notify_desktop"])
+                if "lv_enabled" in settings:
+                    self.lv_enabled = bool(settings["lv_enabled"])
+                if isinstance(settings.get("lv_config"), dict):
+                    self.lv_config = dict(settings["lv_config"])
 
                 print(f"Settings loaded from {SETTINGS_FILE}")
         except Exception as e:

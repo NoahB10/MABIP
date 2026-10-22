@@ -70,6 +70,7 @@ from amuza_async import AsyncAmuzaConnection, Method, Sequence
 from sensor_reader_async import AsyncPotentiostatReader
 from blockage_detector import BlockageDetector
 from notifier import Notifier, DEFAULT_SERVER
+from low_volume import LowVolumeConfig, LowVolumeController, FlowTabPump
 
 
 logger = logging.getLogger(__name__)
@@ -1402,6 +1403,39 @@ class SettingsDialog(QDialog):
 
         layout.addLayout(notify_form)
 
+        # Low-volume mode — leave each well when it runs dry, not on a timer.
+        layout.addWidget(QLabel("<b>Low-volume mode</b>"))
+        lv_form = QFormLayout()
+        self.lv_checkbox = QCheckBox("Stay in each well until it runs dry (air bubble)")
+        self.lv_checkbox.setChecked(bool(getattr(self.app_state, "lv_enabled", False)))
+        self.lv_checkbox.setToolTip(
+            "Ignores Sampling Time. The robot stays in each well until the sensor "
+            "shows the air that follows the well emptying, then moves on. If no "
+            "air comes, the pump rate is raised step by step up to the max; still "
+            "nothing at the max means a clog: the needle goes home, the line is "
+            "cleared there, and it returns to the same well.")
+        lv_form.addRow("", self.lv_checkbox)
+        lv = LowVolumeConfig.from_dict(getattr(self.app_state, "lv_config", {}) or {})
+        self._lv_spins = {}
+        for key, label, lo, hi, step, suffix in (
+                ("escalate_after_s", "Raise pump after no air for", 10, 3600, 10, " s"),
+                ("step", "Raise by", 1, 200, 5, " µL/min"),
+                ("step_every_s", "Every", 5, 600, 5, " s"),
+                ("max_rate", "Up to (max)", 10, 1000, 10, " µL/min"),
+                ("hold_at_max_s", "Clog if no air at max for", 10, 1800, 10, " s"),
+                ("max_clears", "Clog clears per well", 0, 10, 1, ""),
+                ("max_dwell_s", "Safety cap per well", 60, 9999, 60, " s")):
+            sp = QDoubleSpinBox() if key not in ("max_clears", "max_dwell_s") else QSpinBox()
+            sp.setRange(lo, hi)
+            sp.setSingleStep(step)
+            if isinstance(sp, QDoubleSpinBox):
+                sp.setDecimals(0)
+            sp.setValue(type(sp.value())(getattr(lv, key)))
+            sp.setSuffix(suffix)
+            self._lv_spins[key] = sp
+            lv_form.addRow(label + ":", sp)
+        layout.addLayout(lv_form)
+
         # Validation message
         self.validation_label = QLabel("")
         self.validation_label.setStyleSheet("color: red;")
@@ -1476,6 +1510,8 @@ class SettingsDialog(QDialog):
             'notify_topic': self.notify_topic_edit.text().strip(),
             'notify_server': self.notify_server_edit.text().strip() or DEFAULT_SERVER,
             'notify_desktop': self.notify_desktop_checkbox.isChecked(),
+            'lv_enabled': self.lv_checkbox.isChecked(),
+            'lv_config': {k: sp.value() for k, sp in self._lv_spins.items()},
         }
 
 
@@ -1756,6 +1792,7 @@ class AsyncAMUZAGUI(QMainWindow):
         self._well_started: Dict[str, float] = {}  # well_id -> move-command time
         self._active_seq_name: str = "Sampling Sequence"
         self._blockage_box = None                  # live blockage dialog, if any
+        self._lv_controller = None                 # low-volume run in progress
         self._last_burst_attempt: float = 0.0      # cooldown clock for clear bursts
 
         # Phone/desktop notifications for the events above (notifier.py).
@@ -2296,6 +2333,20 @@ class AsyncAMUZAGUI(QMainWindow):
                     tab.line and tab.line.stop()
                 except Exception:
                     pass
+
+    def _make_lv_controller(self):
+        """A fresh low-volume controller if the mode is on, else None."""
+        if not getattr(self.app_state, "lv_enabled", False):
+            return None
+        from well_empty_detector import WellEmptyDetector
+        cfg = LowVolumeConfig.from_dict(getattr(self.app_state, "lv_config", {}) or {})
+        tab = getattr(self, "flow_tab", None)
+        pump = FlowTabPump(tab)
+        rate = pump.base_rate() if pump.available else None
+        self.add_to_display(
+            "Low-volume mode: each well runs until it is empty"
+            + ("" if pump.available else " (no pump connected: no escalation or clog clearing)"))
+        return LowVolumeController(cfg, WellEmptyDetector(flow_rate=rate), pump=pump)
 
     def _track_blockage(self, reading):
         """Feed the metabolite channels to the flow-sensor-independent blockage
@@ -2909,7 +2960,10 @@ class AsyncAMUZAGUI(QMainWindow):
 
             # Wells are about to step: from here a flat signal is a blockage.
             # Arming drops the idle data in the window so it cannot be judged.
-            _set_detector_cycling(self, True)
+            # Low-volume mode handles clogs itself and has no regular cycle, so
+            # the flatline detector stays idle there.
+            self._lv_controller = self._make_lv_controller()
+            _set_detector_cycling(self, self._lv_controller is None)
             self.connection.last_error = None
 
             completed = await self.connection.execute_sequence(
@@ -2919,7 +2973,8 @@ class AsyncAMUZAGUI(QMainWindow):
                 progress_callback=on_seq_progress,
                 timing_provider=get_current_timing,
                 move_callback=on_seq_move,
-                pause_gate=pause_gate
+                pause_gate=pause_gate,
+                dwell_controller=self._lv_controller
             )
 
             # Wells sampled through a blockage returned stale fluid, so their
@@ -2971,6 +3026,12 @@ class AsyncAMUZAGUI(QMainWindow):
             # Nothing is stepping any more, so flat is normal again: stop
             # judging, or the parked plate would raise a false blockage.
             _set_detector_cycling(self, False)
+            lv, self._lv_controller = self._lv_controller, None
+            if lv is not None and lv.log:
+                summary = ", ".join(f"{w} {o} {s:.0f}s" + (f" ({c} clears)" if c else "")
+                                    for w, o, s, c in lv.log)
+                self.add_to_display(f"Low-volume summary: {summary}")
+                logger.info(f"Low-volume summary: {summary}")
             # The task is still executing right here, so this alone cannot
             # re-enable Start -- the done-callback from _watch_run_task does
             # that once it is genuinely finished. Called anyway so the nested
@@ -3529,6 +3590,14 @@ class AsyncAMUZAGUI(QMainWindow):
             self.app_state.notify_topic = values['notify_topic']
             self.app_state.notify_server = values['notify_server']
             self.app_state.notify_desktop = values['notify_desktop']
+            self.app_state.lv_enabled = values['lv_enabled']
+            self.app_state.lv_config = values['lv_config']
+            if values['lv_enabled']:
+                c = LowVolumeConfig.from_dict(values['lv_config'])
+                self.add_to_display(
+                    f"Low-volume mode ON: stay until air; raise pump +{c.step:g} every "
+                    f"{c.step_every_s:g}s after {c.escalate_after_s:g}s, up to {c.max_rate:g}; "
+                    f"clog-clear at home after {c.hold_at_max_s:g}s at max.")
             self.notifier.configure(enabled=values['notify_enabled'],
                                     topic=values['notify_topic'],
                                     server=values['notify_server'],
@@ -3711,6 +3780,9 @@ class AsyncAMUZAGUI(QMainWindow):
                         self.plot_window.set_sensor_detail(
                             f"● receiving — {reading.counter} readings")
                 self._track_blockage(reading)
+                lv = self._lv_controller
+                if lv is not None:
+                    lv.feed(time.monotonic(), reading.channels[:6])
 
             # Fresh detector per connection: the healthy-amplitude baseline is
             # specific to this run's electrodes and timing. Seed the cycle from

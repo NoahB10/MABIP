@@ -1793,6 +1793,23 @@ class FlowControlTab(QWidget):
                                  f"{r['expected_combined']:g} ({r['error_pct']:+.1f}%)")
         self._work(fn)
 
+    def set_override_rate(self, rate, label=""):
+        """Run the pump at `rate` (combined line µL/min) now, cancelling any
+        pending boost-end / feed-forward timer or phase ramp so it cannot step
+        the rate back behind the caller (low-volume escalation). The Flow rate
+        field is left alone: it stays the base the run returns to."""
+        self._ff_gen += 1
+        self._phase_flow_gen += 1
+        self._boost_until = 0.0
+        if self.line is None or rate is None or rate <= 0:
+            return
+        try:
+            self.line.start_flow_single(rate / self._nsyr(), direction=self.cfg["direction"])
+            self._phase_flow_rate = rate
+            self.status_msg.emit(f"Pump {rate:g} µL/min" + (f" ({label})" if label else "") + ".")
+        except Exception as e:
+            self.status_msg.emit(f"⚠ Pump rate change failed: {e}")
+
     def pause_for_stop(self, reason="STOP"):
         """The run was stopped (STOP button, or the robot failed): halt the
         pump now and cancel any pending boost / feed-forward resume / phase ramp,
