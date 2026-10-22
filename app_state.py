@@ -51,6 +51,13 @@ class AppState:
     # AMUZA machine selection
     selected_machine: str = "Machine 1"
 
+    # Push notifications (ntfy) — see notifier.py. The topic is generated on
+    # first run and kept, so the phone subscription survives restarts.
+    notify_enabled: bool = False
+    notify_topic: str = ""
+    notify_server: str = "https://ntfy.sh"
+    notify_desktop: bool = True
+
     # Calibration gains
     calibration_gains: Dict[str, float] = field(default_factory=lambda: {
         "Glutamate": 3.394,
@@ -206,6 +213,10 @@ class AppState:
             "calibration_gains": self.calibration_gains,
             "calibration_values": self.calibration_values,
             "selected_machine": self.selected_machine,
+            "notify_enabled": self.notify_enabled,
+            "notify_topic": self.notify_topic,
+            "notify_server": self.notify_server,
+            "notify_desktop": self.notify_desktop,
         }
 
         try:
@@ -236,6 +247,14 @@ class AppState:
                     self.calibration_values.update(settings["calibration_values"])
                 if "selected_machine" in settings:
                     self.selected_machine = settings["selected_machine"]
+                if "notify_enabled" in settings:
+                    self.notify_enabled = bool(settings["notify_enabled"])
+                if "notify_topic" in settings:
+                    self.notify_topic = str(settings["notify_topic"] or "")
+                if "notify_server" in settings:
+                    self.notify_server = str(settings["notify_server"] or "https://ntfy.sh")
+                if "notify_desktop" in settings:
+                    self.notify_desktop = bool(settings["notify_desktop"])
 
                 print(f"Settings loaded from {SETTINGS_FILE}")
         except Exception as e:

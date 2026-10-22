@@ -215,6 +215,8 @@ class BlockageDetector:
             for b in self._buf:
                 b.clear()
             self._armed_since = self._t
+            # Verdict bookkeeping from the previous run is stale too.
+            self.last_ratios, self.last_usable = {}, []
 
     def set_cycle_s(self, cycle_s: float) -> None:
         """Update the expected well period (e.g. user changed timing mid-run)."""
@@ -318,6 +320,15 @@ class BlockageDetector:
         return False
 
     @property
+    def judging(self) -> bool:
+        """Can the detector deliver a verdict right now?
+
+        False while idle or warming up — i.e. before enough healthy cycles have
+        built a baseline. A run shorter than window + warm-up (about 15 min at
+        default settings) never gets there, so waiting on it is pointless."""
+        return self._cycling and len(self.last_usable) >= self.cfg.min_channels
+
+    @property
     def window_s(self) -> float:
         return self.cfg.cycle_s * self.cfg.window_factor
 
@@ -366,8 +377,16 @@ class BlockageDetector:
         # latency_s/cycle_s, ~1.75 by default). Callers wait latency_s after the
         # last well for a verdict on it; idling sooner than that would discard the
         # verdict they are waiting for.
-        if self._wells and (t - self._wells[-1]) > 2.5 * cfg.cycle_s:
-            self.set_cycling(False)
+        #
+        # Measured from the later of the last completion and the last arming:
+        # a fresh run's Start must not be undone by the previous run's stale
+        # completion time still sitting in _wells.
+        if self._wells:
+            last = self._wells[-1]
+            if self._armed_since is not None:
+                last = max(last, self._armed_since)
+            if (t - last) > 2.5 * cfg.cycle_s:
+                self.set_cycling(False)
 
         # Need a full window of *judgeable* data. After a pause this restarts,
         # so idle-flat samples can never be mistaken for a blockage.
@@ -386,16 +405,24 @@ class BlockageDetector:
             base = self._baseline_range(i)
 
             # Grow the baseline only from healthy samples. Frozen while blocked
-            # so a long blockage cannot redefine "normal" and self-clear. The low
-            # is kept alongside the range: clearance-watching needs to know where
-            # the signal sits when fresh buffer is arriving.
-            if not self.blocked and (base == 0.0 or rng >= base * cfg.clear_frac):
+            # so a long blockage cannot redefine "normal" and self-clear, and
+            # frozen while not cycling: a parked plate gives a legitimately flat
+            # signal, and learning from it would teach the detector that "flat"
+            # is the healthy amplitude, so a blockage at the start of the next
+            # run would look normal. The low is kept alongside the range:
+            # clearance-watching needs to know where the signal sits when fresh
+            # buffer is arriving.
+            if (self._cycling and not self.blocked
+                    and (base == 0.0 or rng >= base * cfg.clear_frac)):
                 self._base[i].append((t, rng, lo))
                 while self._base[i] and t - self._base[i][0][0] > cfg.baseline_s:
                     self._base[i].popleft()
                 base = self._baseline_range(i)
 
-            if base <= 0.0 or t - self._t0 < cfg.min_baseline_s:
+            # Warm-up counts from the first *baseline* entry, not the first
+            # sample: the sensor is usually connected long before Start, and
+            # one window is too little history to judge against.
+            if base <= 0.0 or t - self._base[i][0][0] < cfg.min_baseline_s:
                 continue
 
             noise = _median(list(self._noise[i])) if self._noise[i] else 0.0

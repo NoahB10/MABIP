@@ -68,6 +68,10 @@ class FakeGUI:
     def add_to_display(self, msg):
         self.displayed.append(msg)
 
+    async def _settle_for_blockage_judgement(self, stop_event):
+        # The real one sleeps for the detector latency; nothing to wait for here.
+        pass
+
 
 WELLS = ["A1", "A2", "A3"]
 

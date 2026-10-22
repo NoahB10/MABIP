@@ -69,6 +69,7 @@ from async_utils import AsyncTaskManager, interruptible_sleep
 from amuza_async import AsyncAmuzaConnection, Method, Sequence
 from sensor_reader_async import AsyncPotentiostatReader
 from blockage_detector import BlockageDetector
+from notifier import Notifier, DEFAULT_SERVER
 
 
 logger = logging.getLogger(__name__)
@@ -1272,12 +1273,15 @@ class PlotWindow(QWidget):
 
 
 class SettingsDialog(QDialog):
-    """Settings dialog for timing and temperature parameters"""
+    """Settings dialog for timing, temperature, machine and notifications"""
+
+    _test_done = pyqtSignal(bool, str)   # result of the "Send test" button
 
     def __init__(self, app_state: AppState, parent=None):
         super().__init__(parent)
         self.app_state = app_state
         self._init_ui()
+        self._test_done.connect(self._show_test_result)
 
     def _init_ui(self):
         """Initialize UI"""
@@ -1356,6 +1360,48 @@ class SettingsDialog(QDialog):
 
         layout.addLayout(machine_form)
 
+        # Notifications section — phone push via ntfy when the metabolite
+        # signal stops cycling (blockage), clears, or the sensor goes silent.
+        layout.addWidget(QLabel("<b>Notifications</b>"))
+        notify_form = QFormLayout()
+
+        self.notify_checkbox = QCheckBox("Message my phone (ntfy) on blockage / sensor loss")
+        self.notify_checkbox.setChecked(bool(getattr(self.app_state, "notify_enabled", False)))
+        self.notify_checkbox.setToolTip(
+            "Sends a push notification when the metabolite signal flatlines "
+            "during a run (no fresh fluid reaching the sensor), when it clears, "
+            "and when the sensor stops sending data.")
+        notify_form.addRow("", self.notify_checkbox)
+
+        topic = getattr(self.app_state, "notify_topic", "") or Notifier.new_topic()
+        self.notify_topic_edit = QLineEdit(topic)
+        self.notify_topic_edit.setToolTip(
+            "Subscribe to this topic in the ntfy app (Android/iOS) or open "
+            "https://ntfy.sh/<topic> in a browser. Anyone who knows the topic can "
+            "read it, so keep the random name.")
+        notify_form.addRow("Topic:", self.notify_topic_edit)
+
+        self.notify_server_edit = QLineEdit(
+            getattr(self.app_state, "notify_server", DEFAULT_SERVER) or DEFAULT_SERVER)
+        self.notify_server_edit.setToolTip("ntfy server; leave as ntfy.sh unless self-hosting.")
+        notify_form.addRow("Server:", self.notify_server_edit)
+
+        self.notify_desktop_checkbox = QCheckBox("Also show a desktop notification on this screen")
+        self.notify_desktop_checkbox.setChecked(bool(getattr(self.app_state, "notify_desktop", True)))
+        notify_form.addRow("", self.notify_desktop_checkbox)
+
+        test_row = QHBoxLayout()
+        self.notify_test_btn = QPushButton("Send test")
+        self.notify_test_btn.setToolTip("Send a test message to the topic above right now.")
+        self.notify_test_btn.clicked.connect(self._send_test_notification)
+        test_row.addWidget(self.notify_test_btn)
+        self.notify_test_label = QLabel("")
+        self.notify_test_label.setWordWrap(True)
+        test_row.addWidget(self.notify_test_label, stretch=1)
+        notify_form.addRow("", test_row)
+
+        layout.addLayout(notify_form)
+
         # Validation message
         self.validation_label = QLabel("")
         self.validation_label.setStyleSheet("color: red;")
@@ -1368,6 +1414,33 @@ class SettingsDialog(QDialog):
         buttons.accepted.connect(self._validate_and_accept)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+
+    def _send_test_notification(self):
+        """Push a test message with the dialog's current (unsaved) settings.
+
+        Runs on a thread so a slow network cannot freeze the dialog; the result
+        comes back through _test_done so the label is touched on the GUI thread."""
+        n = Notifier(enabled=True,
+                     topic=self.notify_topic_edit.text(),
+                     server=self.notify_server_edit.text(),
+                     desktop=self.notify_desktop_checkbox.isChecked())
+        self.notify_test_btn.setEnabled(False)
+        self.notify_test_label.setText("Sending…")
+
+        def _work():
+            ok, detail = n.send_now(
+                "MABIP test", "Notifications are working. You will be messaged "
+                "if the metabolite signal flatlines during a run.",
+                priority="default", tags=["white_check_mark"])
+            self._test_done.emit(ok, detail)
+
+        import threading
+        threading.Thread(target=_work, name="notify-test", daemon=True).start()
+
+    def _show_test_result(self, ok: bool, detail: str):
+        self.notify_test_btn.setEnabled(True)
+        self.notify_test_label.setStyleSheet("color: green;" if ok else "color: red;")
+        self.notify_test_label.setText(("✓ " if ok else "✗ ") + detail)
 
     def _validate_and_accept(self):
         """Validate inputs before accepting"""
@@ -1385,6 +1458,9 @@ class SettingsDialog(QDialog):
         if temp < 0 or temp > 50:
             self.validation_label.setText("Temperature must be between 0 and 50 C")
             return
+        if self.notify_checkbox.isChecked() and not self.notify_topic_edit.text().strip():
+            self.validation_label.setText("Notifications need a topic name")
+            return
 
         self.accept()
 
@@ -1395,7 +1471,11 @@ class SettingsDialog(QDialog):
             'sampling': self.sampling_spin.value(),
             'temperature': self.temp_spin.value(),
             'heater_enabled': self.heater_checkbox.isChecked(),
-            'machine': self.machine_combo.currentText()
+            'machine': self.machine_combo.currentText(),
+            'notify_enabled': self.notify_checkbox.isChecked(),
+            'notify_topic': self.notify_topic_edit.text().strip(),
+            'notify_server': self.notify_server_edit.text().strip() or DEFAULT_SERVER,
+            'notify_desktop': self.notify_desktop_checkbox.isChecked(),
         }
 
 
@@ -1594,6 +1674,35 @@ class CalibrationSettingsDialog(QDialog):
         }
 
 
+def _notify(gui, title: str, message: str, priority: str = "default",
+            tags=(), key=None) -> None:
+    """Push a notification through the GUI's notifier, if it has one.
+
+    Module-level and getattr-guarded so the pause-gate tests' FakeGUI (which has
+    no notifier) and any headless caller keep working; a notification must
+    never be able to break a run."""
+    n = getattr(gui, "notifier", None)
+    if n is None:
+        return
+    try:
+        n.send(title, message, priority=priority, tags=tags, key=key)
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"notify failed: {e}")
+
+
+def _set_detector_cycling(gui, cycling: bool) -> None:
+    """Tell the blockage detector whether wells are stepping right now.
+
+    Module-level and getattr-guarded for the same reason as _notify: test
+    fakes and headless callers do not carry a detector."""
+    det = getattr(gui, "blockage_detector", None)
+    if det is not None:
+        try:
+            det.set_cycling(cycling)
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"Blockage detector gating error: {e}")
+
+
 class AsyncAMUZAGUI(QMainWindow):
     """
     Main async GUI for AMUZA control.
@@ -1624,6 +1733,15 @@ class AsyncAMUZAGUI(QMainWindow):
         self._active_seq_name: str = "Sampling Sequence"
         self._blockage_box = None                  # live blockage dialog, if any
         self._last_burst_attempt: float = 0.0      # cooldown clock for clear bursts
+
+        # Phone/desktop notifications for the events above (notifier.py).
+        # A topic is minted once so the phone subscription stays valid.
+        if not app_state.notify_topic:
+            app_state.notify_topic = Notifier.new_topic()
+        self.notifier = Notifier(enabled=app_state.notify_enabled,
+                                 topic=app_state.notify_topic,
+                                 server=app_state.notify_server,
+                                 desktop=app_state.notify_desktop)
         
         # Wells
         self.well_labels: Dict[str, WellLabel] = {}
@@ -1647,6 +1765,8 @@ class AsyncAMUZAGUI(QMainWindow):
         self.experiment_timer.timeout.connect(self._update_experiment_timer)
         self.experiment_remaining_seconds = 0
         self.experiment_total_seconds = 0
+        self._timer_caption = "Experiment Timer:"   # swapped during the post-run check
+        self._settling = False                      # inside the post-run blockage check
 
         # Stop/Resume state
         self.is_paused = False
@@ -2178,6 +2298,14 @@ class AsyncAMUZAGUI(QMainWindow):
 
         self.add_to_display(("⚠ " if event.blocked else "") + event.message)
         logger.warning(event.message) if event.blocked else logger.info(event.message)
+        if event.blocked:
+            _notify(self, "MABIP: BLOCKAGE — signal flatlined",
+                    f"{event.message} The plate will hold in buffer before any "
+                    "further sampling.",
+                    priority="urgent", tags=["rotating_light"], key="blocked")
+        else:
+            _notify(self, "MABIP: signal cycling again", event.message,
+                    priority="default", tags=["white_check_mark"], key="cleared")
         try:
             self.blockage_changed.emit(event.blocked)
         except Exception:
@@ -2487,7 +2615,7 @@ class AsyncAMUZAGUI(QMainWindow):
             seconds = self.experiment_remaining_seconds % 60
             
             time_str = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
-            self.timer_label.setText(f"Experiment Timer:\n{time_str}")
+            self.timer_label.setText(f"{self._timer_caption}\n{time_str}")
             
             # Change color as timer approaches zero
             if self.experiment_remaining_seconds < 60:
@@ -2508,7 +2636,7 @@ class AsyncAMUZAGUI(QMainWindow):
             seconds = self.experiment_remaining_seconds % 60
 
             time_str = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
-            self.timer_label.setText(f"Experiment Timer:\n{time_str}")
+            self.timer_label.setText(f"{self._timer_caption}\n{time_str}")
 
             # Update color based on remaining time
             if self.experiment_remaining_seconds < 60:
@@ -2699,6 +2827,11 @@ class AsyncAMUZAGUI(QMainWindow):
                 now_m = time.monotonic()
                 self._well_spans.append(
                     (well_id, self._well_started.get(well_id, now_m), now_m, elapsed))
+                # The detector learns the true well period from completions and
+                # idles itself if they stop arriving.
+                det = getattr(self, "blockage_detector", None)
+                if det is not None:
+                    det.note_well_completed(now_m)
 
                 # Track completion count and calibrate timer after first well
                 self.wells_completed_count += 1
@@ -2750,6 +2883,10 @@ class AsyncAMUZAGUI(QMainWindow):
             async def pause_gate():
                 return await self._blockage_pause_gate(stop_event)
 
+            # Wells are about to step: from here a flat signal is a blockage.
+            # Arming drops the idle data in the window so it cannot be judged.
+            _set_detector_cycling(self, True)
+
             completed = await self.connection.execute_sequence(
                 sequence,
                 stop_event,
@@ -2790,6 +2927,9 @@ class AsyncAMUZAGUI(QMainWindow):
             self._reset_stop_button()
 
         finally:
+            # Nothing is stepping any more, so flat is normal again: stop
+            # judging, or the parked plate would raise a false blockage.
+            _set_detector_cycling(self, False)
             # The task is still executing right here, so this alone cannot
             # re-enable Start -- the done-callback from _watch_run_task does
             # that once it is genuinely finished. Called anyway so the nested
@@ -2844,8 +2984,13 @@ class AsyncAMUZAGUI(QMainWindow):
 
         if not proceed:
             self.add_to_display("Run stopped while blocked.")
+            _notify(self, "MABIP: run stopped", "Run stopped while the line was blocked.",
+                    priority="high", tags=["octagonal_sign"], key="run_stopped")
             stop_event.set()
             return False
+        _notify(self, "MABIP: resuming", "Line cleared — the run is resuming from "
+                "the well it was about to sample.",
+                priority="default", tags=["white_check_mark"], key="cleared")
         return True
 
     async def _wait_for_clearance(self, det, stop_event) -> bool:
@@ -2981,11 +3126,30 @@ class AsyncAMUZAGUI(QMainWindow):
         det = getattr(self, "blockage_detector", None)
         if det is None or self.sensor_reader is None:
             return
+        if not det.judging:
+            # A short run never builds a baseline (one window plus the warm-up),
+            # so waiting could not produce a verdict. It also looked like a hung
+            # run: timer at COMPLETE, wells gold, Start still greyed out.
+            self.add_to_display(
+                f"Blockage check of the last wells skipped — detector is "
+                f"{det.status()} (run too short to judge). Run complete.")
+            return
         wait = det.latency_s
         self.add_to_display(
-            f"Settling {wait/60:.1f} min so the last wells can be checked for "
-            "blockage...")
-        await interruptible_sleep(wait, stop_event)
+            f"Wells done — keeping the sensor reading {wait/60:.1f} min so the "
+            "last wells can be checked for blockage. Press STOP to skip this.")
+        self._settling = True
+        self._timer_caption = "Blockage check (last wells):"
+        self.experiment_remaining_seconds = int(wait)
+        self.experiment_timer.start(1000)
+        self._refresh_timer_display()
+        try:
+            await interruptible_sleep(wait, stop_event)
+        finally:
+            self._settling = False
+            self._timer_caption = "Experiment Timer:"
+            self.experiment_remaining_seconds = 0
+            self._update_experiment_timer()      # stops the timer, shows COMPLETE!
 
     MAX_BLOCKAGE_RETRY_PASSES = 2
     """How many extra passes to re-sample spoiled wells. Bounded because a line
@@ -3040,6 +3204,7 @@ class AsyncAMUZAGUI(QMainWindow):
                 if w in self.well_labels:
                     self.well_labels[w].set_completed(False)
 
+            _set_detector_cycling(self, True)
             completed = await self.connection.execute_sequence(
                 sequence, stop_event,
                 well_completed_callback=on_well_completed,
@@ -3049,6 +3214,9 @@ class AsyncAMUZAGUI(QMainWindow):
                 pause_gate=pause_gate)
             if not completed:
                 return False
+            # The retry's last wells need their verdict too (see
+            # _settle_for_blockage_judgement) before the next pass judges them.
+            await self._settle_for_blockage_judgement(stop_event)
 
         still = self._blocked_wells(since=since)
         if still:
@@ -3071,6 +3239,12 @@ class AsyncAMUZAGUI(QMainWindow):
     async def _on_stop_resume(self):
         """Handle stop/resume toggle button"""
         if not self.is_paused:
+            if self._settling:
+                # Nothing left to sample: STOP just cuts the post-run check short.
+                await self.app_state.request_stop()
+                logger.info("Post-run blockage check skipped by user")
+                self.add_to_display("Skipping the post-run blockage check — run complete.")
+                return
             # STOP: Request stop, will finish current well then pause
             await self.app_state.request_stop()
             self.is_paused = True
@@ -3299,6 +3473,18 @@ class AsyncAMUZAGUI(QMainWindow):
             # Update selected machine
             self.app_state.selected_machine = values['machine']
 
+            # Notifications
+            self.app_state.notify_enabled = values['notify_enabled']
+            self.app_state.notify_topic = values['notify_topic']
+            self.app_state.notify_server = values['notify_server']
+            self.app_state.notify_desktop = values['notify_desktop']
+            self.notifier.configure(enabled=values['notify_enabled'],
+                                    topic=values['notify_topic'],
+                                    server=values['notify_server'],
+                                    desktop=values['notify_desktop'])
+            if values['notify_enabled']:
+                self.add_to_display(f"Notifications on → {self.notifier.topic_url}")
+
             # Apply temperature to AMUZA if connected
             if self.connection and self.connection.is_connected:
                 asyncio.create_task(self._apply_temperature_settings(values['temperature'], values['heater_enabled']))
@@ -3484,6 +3670,9 @@ class AsyncAMUZAGUI(QMainWindow):
             self.blockage_detector = BlockageDetector(
                 cycle_s=float(t_buffer + t_sampling + move_overhead)
             )
+            # A flat signal only means "blocked" while wells are stepping.
+            # Idle until a sequence starts; _execute_sequence arms it.
+            self.blockage_detector.set_cycling(False)
 
             # ONE file for the whole session: the sensor's sampling rows, the
             # well log and the flow log all go into it (see run_file.py).
@@ -3550,6 +3739,7 @@ class AsyncAMUZAGUI(QMainWindow):
         """
         reader = self.sensor_reader
         warned = False
+        last_readings = 0
         try:
             while reader is not None and reader is self.sensor_reader:
                 await asyncio.sleep(grace_s)
@@ -3559,9 +3749,24 @@ class AsyncAMUZAGUI(QMainWindow):
                 readings = reader.readings_count
                 raw = reader.bytes_received
 
-                if readings > 0:
+                if readings > last_readings:
+                    last_readings = readings
                     self.plot_window.set_sensor_detail(f"● receiving — {readings} readings")
                     warned = False
+                elif readings > 0:
+                    # It WAS streaming and has stopped: a transmitter that died
+                    # mid-run. The blockage detector gets no samples now, so
+                    # this is the only alarm that can reach the phone.
+                    msg = (f"Sensor stopped streaming on {port}: no new readings in "
+                           f"{grace_s:.0f}s (last count {readings}). Check the SIX "
+                           "transmitter power and cable.")
+                    self.plot_window.set_sensor_detail("stream stalled", warn=True)
+                    if not warned:
+                        self.add_to_display(f"⚠ {msg}")
+                        logger.warning(msg)
+                        warned = True
+                        _notify(self, "MABIP: sensor stopped", msg,
+                                priority="urgent", tags=["warning"], key="sensor_silent")
                 elif raw < 25:   # a stray byte or two is still "silent"
                     msg = (f"No data on {port}: {raw} bytes received in {grace_s:.0f}s. "
                            "The SIX transmitter is off, unplugged, or on another "
@@ -3571,6 +3776,8 @@ class AsyncAMUZAGUI(QMainWindow):
                         self.add_to_display(f"⚠ {msg}")
                         logger.warning(msg)
                         warned = True
+                        _notify(self, "MABIP: sensor silent", msg,
+                                priority="high", tags=["warning"], key="sensor_silent")
                 else:
                     msg = (f"{raw} bytes on {port} but no valid packets "
                            f"({reader.bad_frames} rejected) — likely a baud-rate "
@@ -3801,12 +4008,14 @@ def _install_shutdown_hooks(gui):
             gui.safe_shutdown_sync(f"{name} received")
         finally:
             try:
-                gui.close()          # unblocks async_main -> cleanup()
+                gui.close()          # unblocks async_main -> cleanup() -> loop stops
             except Exception:
                 pass
+            # Hard fallback only: quitting right away would race cleanup() the
+            # same way quitOnLastWindowClosed did. Give it a few seconds first.
             app = QApplication.instance()
             if app is not None:
-                app.quit()
+                QTimer.singleShot(8000, app.quit)
 
     for sig in (signal.SIGINT, signal.SIGTERM, getattr(signal, "SIGHUP", None)):
         if sig is None:
@@ -3842,6 +4051,13 @@ def main():
     # Create Qt application
     app = QApplication(sys.argv)
     mac_ui.apply(app)          # base font / font aliases; no-op off macOS
+    # Closing the window must NOT quit the Qt loop by itself. async_main's
+    # finally (save settings, cleanup) still has to run, and it needs a running
+    # loop; qasync tears the loop down the moment exec() returns and then steps
+    # the coroutine anyway -> "RuntimeError: no running event loop" at exit
+    # (seen on ~1 in 3 shutdowns). Instead the window closing ends async_main,
+    # and its completion is what stops the loop.
+    app.setQuitOnLastWindowClosed(False)
 
     # Create async event loop with qasync
     loop = QEventLoop(app)
