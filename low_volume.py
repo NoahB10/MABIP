@@ -82,6 +82,14 @@ class LowVolumeConfig:
     hold_at_max_s: float = 60.0
     """How long to run at max_rate without air before calling it a clog."""
 
+    dip_stale_s: float = 180.0
+    """A suction-break dip (the tip met air) followed by a stale signal within
+    this long means the well is DRY, not clogged. Seen 22 Oct 2026 well A2:
+    dip at 122 s, then the reading froze at its plateau with no air spike for
+    over two minutes; with air in the needle the pump's suction expands the air
+    instead of moving liquid past the sensor. A clog never puts the tip in air,
+    so it has no dip."""
+
     max_clears: int = 2
     """Clog-clearing trips home per well before the run halts."""
 
@@ -151,11 +159,29 @@ class LowVolumeController:
         self.poll_s = poll_s
         self._in_well = False
         self._empty_at: Optional[float] = None
+        self._last_dip: Optional[float] = None
+        self._manual_next = False
+        self._empty_reason = ""
         self._hist = deque()                      # (t, channels) for freshness
         self._dabs = [deque(maxlen=300) for _ in range(6)]
         self._prev = None
         self.last_error: Optional[str] = None
         self.log: list = []          # (well, outcome, seconds_in_well, clears)
+
+    # ---- operator ---------------------------------------------------------
+    def request_next(self) -> None:
+        """The operator says this well is done: leave it (or stop trying to go
+        back into it) and move to the next well. Honoured at every stage."""
+        self._manual_next = True
+        logger.info("Low-volume: operator marked the current well done")
+
+    def _set_rate(self, rate, label):
+        self.pump.set_rate(rate, label)
+        if hasattr(self.detector, "set_flow_rate"):
+            try:
+                self.detector.set_flow_rate(rate)
+            except Exception:
+                pass
 
     # ---- sensor side ------------------------------------------------------
     def feed(self, t: float, channels) -> None:
@@ -170,10 +196,14 @@ class LowVolumeController:
             return
         kind = getattr(ev, "kind", "EMPTY")
         if kind != "EMPTY":
-            # SUSPECT = a suction-break dip or a lone spike: early warning only.
+            # SUSPECT = a suction-break dip or a lone spike. A dip is remembered:
+            # followed by a stale signal it means the well is dry.
+            if "dip" in str(getattr(ev, "reason", "")):
+                self._last_dip = t
             logger.info(f"Low-volume: {getattr(ev, 'message', ev)}")
             return
         self._empty_at = t
+        self._empty_reason = "air"
         logger.info(f"Low-volume: {getattr(ev, 'message', ev)}")
 
     # ---- freshness: is fresh fluid still reaching the sensor? -------------
@@ -218,6 +248,7 @@ class LowVolumeController:
     def _enter(self, t: float) -> None:
         self._in_well = True
         self._empty_at = None
+        self._last_dip = None
         try:
             self.detector.note_move(t)
         except Exception as e:  # noqa: BLE001
@@ -276,6 +307,8 @@ class LowVolumeController:
         cfg = self.cfg
         well = str(method.pos)
         self.last_error = None
+        self._manual_next = False
+        self._empty_reason = ""
         self._enter(self.clock())
         entered = self.clock()
         well_t0 = entered
@@ -292,16 +325,28 @@ class LowVolumeController:
                 self._leave()
                 await conn.stop_movement()
                 if pump_ok and rate != base:
-                    self.pump.set_rate(base, "stopped")
+                    self._set_rate(base, "stopped")
                 return False
+
+            # 0. The operator said this well is done.
+            if self._manual_next:
+                self._manual_next = False
+                await self._go_home(conn)
+                if pump_ok and rate != base:
+                    self._set_rate(base, "well done (operator)")
+                self.log.append((well, "operator", round(now - well_t0, 1), clears))
+                self._say(on_progress, f"Buffer: {well} marked done by operator, moving on")
+                return True
 
             # 1. The well ran dry -> leave.
             if self._empty_at is not None:
                 await self._go_home(conn)
                 if pump_ok and rate != base:
-                    self.pump.set_rate(base, "well done")
-                self.log.append((well, "empty", round(now - well_t0, 1), clears))
-                self._say(on_progress, f"Buffer: {well} empty after {now - entered:.0f}s, "
+                    self._set_rate(base, "well done")
+                outcome = "empty" if self._empty_reason == "air" else "empty-dip"
+                self.log.append((well, outcome, round(now - well_t0, 1), clears))
+                self._say(on_progress, f"Buffer: {well} empty after {now - entered:.0f}s "
+                                       f"({'air' if outcome == 'empty' else 'dip then stale'}), "
                                        "moving on")
                 return True
 
@@ -309,7 +354,7 @@ class LowVolumeController:
             if conn.is_ready() and now - entered > 15.0:
                 self._leave()
                 if pump_ok and rate != base:
-                    self.pump.set_rate(base, "dwell cap")
+                    self._set_rate(base, "dwell cap")
                 self.log.append((well, "max_dwell", round(now - well_t0, 1), clears))
                 logger.warning(f"Low-volume: {well} reached the {cfg.max_dwell_s}s dwell "
                                "cap without air")
@@ -326,6 +371,13 @@ class LowVolumeController:
                     and (last_step is None or now - last_step >= cfg.step_every_s):
                 last_step = now
                 fresh = self.signal_fresh(now)
+                if fresh is False and self._last_dip is not None \
+                        and now - self._last_dip <= cfg.dip_stale_s:
+                    # Tip met air, then the reading froze: the well is dry.
+                    logger.info(f"Low-volume: {well} dip {now - self._last_dip:.0f}s ago and "
+                                "signal now stale -> well empty")
+                    self._empty_at, self._empty_reason = now, "dip"
+                    continue
                 if fresh is True:
                     if at_max_since is not None:
                         logger.info(f"Low-volume: {well} signal moving again at "
@@ -333,7 +385,7 @@ class LowVolumeController:
                     at_max_since = None
                 elif fresh is False and rate < cfg.max_rate:
                     rate = min(cfg.max_rate, max(rate, base) + cfg.step)
-                    self.pump.set_rate(rate, f"stale signal {well}")
+                    self._set_rate(rate, f"stale signal {well}")
                     logger.info(f"Low-volume: {well} signal stale after {t_in:.0f}s, "
                                 f"pump -> {rate:g}")
                     if rate >= cfg.max_rate:
@@ -344,10 +396,14 @@ class LowVolumeController:
             # 4. At max_rate for long enough and still nothing -> clog.
             if pump_ok and at_max_since is not None \
                     and now - at_max_since >= cfg.hold_at_max_s:
+                if self._last_dip is not None:
+                    # The tip met air in this well: it is dry, not clogged.
+                    self._empty_at, self._empty_reason = now, "dip"
+                    continue
                 clears += 1
                 if clears > cfg.max_clears:
                     await self._go_home(conn)
-                    self.pump.set_rate(base, "giving up")
+                    self._set_rate(base, "giving up")
                     self.last_error = (f"{well}: no air after {cfg.max_clears} clog-clearing "
                                        f"attempts at up to {cfg.max_rate:g} µL/min. Run halted "
                                        "with the needle home; check the line.")
@@ -356,7 +412,7 @@ class LowVolumeController:
                 self._say(on_progress, f"Buffer: {well} no air at {rate:g} µL/min, "
                                        f"clearing clog at home ({clears}/{cfg.max_clears})")
                 await self._go_home(conn)
-                self.pump.set_rate(base, "before clearing")
+                self._set_rate(base, "before clearing")
                 if self.pump.request_clear():
                     t0 = self.clock()
                     await asyncio.sleep(self.poll_s)
@@ -364,6 +420,8 @@ class LowVolumeController:
                         if stop_event.is_set():
                             self.pump.abort_clear()
                             return False
+                        if self._manual_next:
+                            break
                         await asyncio.sleep(self.poll_s)
                     if self.pump.clearing():
                         self.pump.abort_clear()
@@ -371,7 +429,16 @@ class LowVolumeController:
                     logger.warning("Low-volume: clog clearing could not start")
                 if stop_event.is_set():
                     return False
-                self.pump.set_rate(base, "after clearing")
+                if self._manual_next:
+                    # Operator: do not go back in. The needle is already home.
+                    self._manual_next = False
+                    if self.pump.clearing():
+                        self.pump.abort_clear()
+                    self._set_rate(base, "well done (operator)")
+                    self.log.append((well, "operator", round(self.clock() - well_t0, 1), clears))
+                    self._say(on_progress, f"Buffer: {well} marked done by operator, moving on")
+                    return True
+                self._set_rate(base, "after clearing")
                 if not await self._reenter(conn, method, port, on_move):
                     self.last_error = (f"AMUZA did not go back into {well} after clearing.")
                     return False

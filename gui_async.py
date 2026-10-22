@@ -1907,6 +1907,17 @@ class AsyncAMUZAGUI(QMainWindow):
         self.stop_btn.setEnabled(False)
         left_col.addWidget(self.stop_btn)
 
+        # Low-volume mode: the operator can always overrule the detector.
+        self.next_well_btn = QPushButton("Well done → next well")
+        self.next_well_btn.setToolTip(
+            "Low-volume mode: mark the current well as done and move to the next "
+            "one now. Works while the needle is in the well, during a clog-clearing "
+            "trip home, or before it goes back in.")
+        self.next_well_btn.setStyleSheet("QPushButton { background:#1565c0; color:white; font-weight:700; } QPushButton:hover{ background:#0d47a1; }")
+        self.next_well_btn.clicked.connect(self._on_next_well)
+        self.next_well_btn.setVisible(False)
+        left_col.addWidget(self.next_well_btn)
+
         self.settings_btn = QPushButton("Settings")
         self.settings_btn.clicked.connect(self._on_settings)
         left_col.addWidget(self.settings_btn)
@@ -2334,6 +2345,14 @@ class AsyncAMUZAGUI(QMainWindow):
                     tab.line and tab.line.stop()
                 except Exception:
                     pass
+
+    def _on_next_well(self):
+        lv = self._lv_controller
+        if lv is None:
+            self.add_to_display("Not in a low-volume run.")
+            return
+        lv.request_next()
+        self.add_to_display("Marking this well done — moving to the next well…")
 
     def _make_lv_controller(self):
         """A fresh low-volume controller if the mode is on, else None."""
@@ -2965,6 +2984,7 @@ class AsyncAMUZAGUI(QMainWindow):
             # the flatline detector stays idle there.
             self._lv_controller = self._make_lv_controller()
             _set_detector_cycling(self, self._lv_controller is None)
+            self.next_well_btn.setVisible(self._lv_controller is not None)
             self.connection.last_error = None
 
             completed = await self.connection.execute_sequence(
@@ -3028,6 +3048,7 @@ class AsyncAMUZAGUI(QMainWindow):
             # judging, or the parked plate would raise a false blockage.
             _set_detector_cycling(self, False)
             lv, self._lv_controller = self._lv_controller, None
+            self.next_well_btn.setVisible(False)
             if lv is not None and lv.log:
                 summary = ", ".join(f"{w} {o} {s:.0f}s" + (f" ({c} clears)" if c else "")
                                     for w, o, s, c in lv.log)

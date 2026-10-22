@@ -361,3 +361,85 @@ def test_freshness_judgement_needs_a_full_window():
     now = time.monotonic()
     ctl.feed(now, [1.0] * 6)
     assert ctl.signal_fresh(now) is None
+
+
+class DipDetector(FakeDetector):
+    """Emits a suction-break dip once when told to."""
+    def __init__(self):
+        super().__init__()
+        self.dip = False
+
+    def update(self, t, ch):
+        if self.dip:
+            self.dip = False
+            class E:
+                kind, reason, message = "SUSPECT", "suction-break dip", "dip"
+            return E()
+        return super().update(t, ch)
+
+
+def test_dip_then_stale_is_empty_not_a_clog():
+    """22 Oct A2: the tip met air (dip), then the reading froze at its plateau.
+    That is a dry well; the pump must not be raised and no clog trip made."""
+    pump = FakePump()
+    det = DipDetector()
+    ctl = LowVolumeController(_cfg(), det, pump=pump, poll_s=0.01)
+    conn = FakeConn()
+
+    async def go():
+        async def dip_soon():
+            await asyncio.sleep(0.05)
+            det.dip = True
+        asyncio.ensure_future(_stream(ctl, _signal("flat")))
+        asyncio.ensure_future(dip_soon())
+        return await ctl.run_in_well(conn, Method("A2", wait=60), 9, asyncio.Event())
+    assert asyncio.run(go()) is True
+    assert ctl.log[0][1] == "empty-dip"
+    assert pump.clears == 0 and pump.rates == []
+    assert conn.sent == ["@T"]
+
+
+def test_operator_next_leaves_the_well():
+    ctl, det = _ctl(_cfg(escalate_after_s=100))
+    conn = FakeConn()
+
+    async def go():
+        async def press():
+            await asyncio.sleep(0.05)
+            ctl.request_next()
+        asyncio.ensure_future(press())
+        return await ctl.run_in_well(conn, Method("A3", wait=60), 17, asyncio.Event())
+    assert asyncio.run(go()) is True
+    assert ctl.log[0][1] == "operator"
+    assert conn.sent == ["@T"]
+
+
+def test_operator_next_during_clog_trip_does_not_go_back_in():
+    pump = FakePump(clear_s=5.0)                       # a long clearing
+    ctl, det = _ctl(pump=pump)
+    conn = FakeConn()
+
+    async def go():
+        asyncio.ensure_future(_stream(ctl, _signal("flat")))
+        async def press_when_clearing():
+            while not pump.clearing():
+                await asyncio.sleep(0.01)
+            await asyncio.sleep(0.05)
+            ctl.request_next()
+        asyncio.ensure_future(press_when_clearing())
+        return await ctl.run_in_well(conn, Method("A2", wait=60), 9, asyncio.Event())
+    t0 = time.monotonic()
+    assert asyncio.run(go()) is True
+    assert time.monotonic() - t0 < 3.0                 # did not wait out the clear
+    assert ctl.log[0][1] == "operator"
+    assert not [c for c in conn.sent[1:] if c.startswith("@P")]   # never re-entered
+    assert not pump.clearing()                         # clearing aborted
+    assert pump.rates[-1] == 100
+
+
+def test_detector_lag_follows_pump_rate():
+    from well_empty_detector import WellEmptyDetector
+    d = WellEmptyDetector(flow_rate=130)
+    lag130 = d.lag_s
+    d.set_flow_rate(260)
+    assert abs(d.lag_s - lag130 / 2) < 0.01

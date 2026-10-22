@@ -102,7 +102,8 @@ class WellEmptyDetector:
         self.cfg = config or WellEmptyConfig(**kw)
         # The Jun/Jul replays showed a wrong prior lag is the main way this
         # misses: seed it from the actual pump rate when we know it.
-        if flow_rate and flow_rate > 0:
+        self._rate = flow_rate if flow_rate and flow_rate > 0 else None
+        if self._rate:
             self.cfg.lag_s = min(self.cfg.lag_max_s,
                                  max(self.cfg.lag_min_s, lag_for_rate(flow_rate, dead_volume_ul)))
         n = self.cfg.n_channels
@@ -124,6 +125,18 @@ class WellEmptyDetector:
         self.lag_s = self.cfg.lag_s
 
     # ------------------------------------------------------------------ API
+    def set_flow_rate(self, flow_rate: float) -> None:
+        """The pump rate changed: air now travels at a different speed. Scale
+        the lag by rate, keeping whatever calibration has been learned (the
+        learned/prior ratio) so a measured lag is not thrown away."""
+        if not flow_rate or flow_rate <= 0:
+            return
+        prior = getattr(self, "_rate", None)
+        if prior and prior > 0:
+            self.lag_s = min(self.cfg.lag_max_s,
+                             max(self.cfg.lag_min_s, self.lag_s * prior / flow_rate))
+        self._rate = flow_rate
+
     def note_move(self, t_s: float) -> None:
         """Call when the needle is commanded into a well (the @P send time)."""
         self._move_t = float(t_s)
@@ -202,9 +215,13 @@ class WellEmptyDetector:
             tol = max(cfg.pair_tol_s, cfg.pair_tol_frac * self.lag_s)
             self._spikes.append(tc)
             chans = [f"ch{c+1}" for c in usable if z[c] > cfg.k_spike]
-            match = [d for d in self._dips if abs(tc - (d + self.lag_s)) <= tol]
+            # Any air spike after a dip, up to one lag (+tol) later, confirms. Not
+            # only at exactly one lag: the pump rate changes during a well
+            # (boost, escalation), which moves the arrival, and on 22 Oct A1/A2
+            # the confirming spike came 20-40 s after the dip.
+            match = [d for d in self._dips if 0 < tc - d <= self.lag_s + tol]
             if match:
-                return self._fire(tc, since, match[0], "suction-break dip + air spike one lag later", chans)
+                return self._fire(tc, since, match[0], "suction-break dip + air spike", chans)
             if len(self._spikes) >= 2 and self._spikes[-1] - self._spikes[-2] <= cfg.train_s:
                 return self._fire(tc, since, self._spikes[-2] - self.lag_s, "train of air spikes", chans)
             return WellEmptyEvent("SUSPECT", tc, since, tc - self.lag_s, "isolated air spike", chans,
