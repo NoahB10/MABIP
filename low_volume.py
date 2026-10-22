@@ -82,6 +82,13 @@ class LowVolumeConfig:
     hold_at_max_s: float = 60.0
     """How long to run at max_rate without air before calling it a clog."""
 
+    leave_on_dip: bool = True
+    """Leave the well on the suction-break dip alone, the moment the tip meets
+    air (no tube delay). Every real dry well on 22 Oct 2026 showed the dip
+    promptly (A1 134 s, A2 122 s, A3 147 s, A4 127 s) while the confirming air
+    spike came late or never; waiting for it cost 50 s+ or a manual STOP. The
+    price: an occasional lone dip on a healthy plateau leaves a well early."""
+
     dip_stale_s: float = 180.0
     """A suction-break dip (the tip met air) followed by a stale signal within
     this long means the well is DRY, not clogged. Seen 22 Oct 2026 well A2:
@@ -200,6 +207,11 @@ class LowVolumeController:
             # followed by a stale signal it means the well is dry.
             if "dip" in str(getattr(ev, "reason", "")):
                 self._last_dip = t
+                if self.cfg.leave_on_dip:
+                    self._empty_at, self._empty_reason = t, "dip"
+                    logger.info(f"Low-volume: {getattr(ev, 'message', ev)} -> leaving "
+                                "the well now")
+                    return
             logger.info(f"Low-volume: {getattr(ev, 'message', ev)}")
             return
         self._empty_at = t
@@ -345,9 +357,9 @@ class LowVolumeController:
                     self._set_rate(base, "well done")
                 outcome = "empty" if self._empty_reason == "air" else "empty-dip"
                 self.log.append((well, outcome, round(now - well_t0, 1), clears))
+                why = {"air": "air spike", "dip": "suction dip"}.get(self._empty_reason, "dip")
                 self._say(on_progress, f"Buffer: {well} empty after {now - entered:.0f}s "
-                                       f"({'air' if outcome == 'empty' else 'dip then stale'}), "
-                                       "moving on")
+                                       f"({why}), moving on")
                 return True
 
             # 2. The robot ran out its dwell cap by itself.

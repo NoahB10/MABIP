@@ -384,7 +384,7 @@ def test_dip_then_stale_is_empty_not_a_clog():
     That is a dry well; the pump must not be raised and no clog trip made."""
     pump = FakePump()
     det = DipDetector()
-    ctl = LowVolumeController(_cfg(), det, pump=pump, poll_s=0.01)
+    ctl = LowVolumeController(_cfg(leave_on_dip=False), det, pump=pump, poll_s=0.01)
     conn = FakeConn()
 
     async def go():
@@ -444,3 +444,32 @@ def test_detector_lag_follows_pump_rate():
     lag130 = d.lag_s
     d.set_flow_rate(260)
     assert abs(d.lag_s - lag130 / 2) < 0.01
+
+
+def test_leave_on_dip_is_immediate():
+    pump = FakePump()
+    det = DipDetector()
+    ctl = LowVolumeController(_cfg(escalate_after_s=100), det, pump=pump, poll_s=0.01)
+    conn = FakeConn()
+
+    async def go():
+        async def dip_soon():
+            await asyncio.sleep(0.05)
+            det.dip = True
+            ctl.feed(time.monotonic(), [0] * 6)
+        asyncio.ensure_future(dip_soon())
+        return await ctl.run_in_well(conn, Method("A4", wait=60), 25, asyncio.Event())
+    t0 = time.monotonic()
+    assert asyncio.run(go()) is True
+    assert time.monotonic() - t0 < 0.5
+    assert ctl.log[0][1] == "empty-dip"
+
+
+def test_leave_on_dip_can_be_turned_off():
+    det = DipDetector()
+    ctl = LowVolumeController(_cfg(escalate_after_s=100, leave_on_dip=False), det,
+                              pump=FakePump(), poll_s=0.01)
+    det.dip = True
+    ctl._in_well = True
+    ctl.feed(time.monotonic(), [0] * 6)
+    assert ctl._empty_at is None and ctl._last_dip is not None
