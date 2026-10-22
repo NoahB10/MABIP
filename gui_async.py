@@ -1674,6 +1674,30 @@ class CalibrationSettingsDialog(QDialog):
         }
 
 
+def _popup(parent, kind: str, title: str, text: str) -> None:
+    """Show a message box WITHOUT a nested event loop.
+
+    QMessageBox.warning()/critical()/exec_() spin a nested Qt loop. Called from
+    inside a coroutine (any @asyncSlot handler), that loop dispatches other
+    asyncio tasks' wake-ups while the handler's task is still "current";
+    asyncio rejects each one ("Cannot enter into task ... while another task is
+    being executed") and the rejected tasks are never woken again. On 22 Oct
+    2026 a "No Wells" warning from Start killed the AMUZA command sender and
+    status poller this way: later moves were queued but never transmitted, and
+    wells were marked done without the robot moving. show() returns at once."""
+    icons = {"warning": QMessageBox.Warning, "critical": QMessageBox.Critical,
+             "information": QMessageBox.Information}
+    try:
+        box = QMessageBox(icons.get(kind, QMessageBox.Information), title, text,
+                          QMessageBox.Ok, parent)
+        box.setAttribute(Qt.WA_DeleteOnClose)
+        box.setWindowModality(Qt.WindowModal)
+        box.show()
+        box.raise_()
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"{title}: {text} (popup failed: {e})")
+
+
 def _notify(gui, title: str, message: str, priority: str = "default",
             tags=(), key=None) -> None:
     """Push a notification through the GUI's notifier, if it has one.
@@ -2391,7 +2415,7 @@ class AsyncAMUZAGUI(QMainWindow):
                 self.connect_btn.setText("Reconnect")
                 self.connect_btn.setEnabled(True)
                 self.add_to_display(f"Failed to connect to {selected_machine}. Check Settings to change machine.")
-                QMessageBox.warning(self, "Connection Failed", f"Could not connect to {selected_machine}")
+                _popup(self, 'warning', 'Connection Failed', f'Could not connect to {selected_machine}')
 
         except Exception as e:
             logger.error(f"Connection error: {e}")
@@ -2399,7 +2423,7 @@ class AsyncAMUZAGUI(QMainWindow):
             self.connect_btn.setText("Reconnect")
             self.connect_btn.setEnabled(True)
             self.add_to_display(f"Connection error: {e}")
-            QMessageBox.critical(self, "Error", f"Connection failed: {e}")
+            _popup(self, 'critical', 'Error', f'Connection failed: {e}')
 
     async def _disconnect_amuza(self):
         """Disconnect from AMUZA device"""
@@ -2704,7 +2728,7 @@ class AsyncAMUZAGUI(QMainWindow):
             wells = await self.app_state.get_selected_wells()
 
             if not wells:
-                QMessageBox.warning(self, "No Wells", "Please select wells to sample")
+                _popup(self, 'warning', 'No Wells', 'Please select wells to sample')
                 return
 
             # A fresh Start replaces whatever a previous STOP left parked --
@@ -2772,7 +2796,7 @@ class AsyncAMUZAGUI(QMainWindow):
 
         except Exception as e:
             logger.error(f"Start error: {e}")
-            QMessageBox.critical(self, "Error", f"Failed to start: {e}")
+            _popup(self, 'critical', 'Error', f'Failed to start: {e}')
         finally:
             # Whatever happened above, the buttons must match reality -- a throw
             # part-way through used to leave Start greyed out for good.
@@ -2886,6 +2910,7 @@ class AsyncAMUZAGUI(QMainWindow):
             # Wells are about to step: from here a flat signal is a blockage.
             # Arming drops the idle data in the window so it cannot be judged.
             _set_detector_cycling(self, True)
+            self.connection.last_error = None
 
             completed = await self.connection.execute_sequence(
                 sequence,
@@ -2917,6 +2942,22 @@ class AsyncAMUZAGUI(QMainWindow):
                 self._reset_stop_button()
                 logger.info("Sampling sequence completed")
             else:
+                err = getattr(self.connection, "last_error", None)
+                if err and not stop_event.is_set():
+                    # Not a user stop: the robot failed to act. Park as paused
+                    # so RESUME retries the remaining wells.
+                    self.is_paused = True
+                    self.stop_btn.setText("RESUME")
+                    self.stop_btn.setStyleSheet("QPushButton { background:#2e7d32; color:white; font-weight:700; } QPushButton:hover{ background:#1b5e20; }")
+                    self.experiment_timer.stop()
+                    tab = getattr(self, "flow_tab", None)
+                    if tab is not None and hasattr(tab, "pause_for_stop"):
+                        tab.pause_for_stop("run halted")
+                    self.add_to_display(f"⚠ RUN HALTED: {err}")
+                    _popup(self, "critical", "AMUZA not responding", err)
+                    _notify(self, "MABIP: run halted", err, priority="urgent",
+                            tags=["rotating_light"], key="amuza_fail")
+                    self._refresh_run_buttons()
                 # Stopped by user - don't reset button (it's now RESUME)
                 logger.info(f"Sampling sequence stopped. {len(self.remaining_wells)} wells remaining.")
 
@@ -3256,6 +3297,11 @@ class AsyncAMUZAGUI(QMainWindow):
             # Pause the experiment timer
             self.experiment_timer.stop()
 
+            # STOP halts the pump too (and cancels any pending boost/resume).
+            tab = getattr(self, "flow_tab", None)
+            if tab is not None and hasattr(tab, "pause_for_stop"):
+                tab.pause_for_stop("STOP pressed")
+
             self._refresh_run_buttons()
             logger.info("Stop requested - will finish current well then pause")
             self.add_to_display("STOPPED - Finishing current well, then pausing. "
@@ -3276,6 +3322,11 @@ class AsyncAMUZAGUI(QMainWindow):
 
             # Resume experiment timer
             self.experiment_timer.start(1000)
+
+            # RESUME restarts the pump at the Flow rate it was stopped from.
+            tab = getattr(self, "flow_tab", None)
+            if tab is not None and hasattr(tab, "resume_after_stop"):
+                tab.resume_after_stop()
 
             logger.info(f"Resuming sequence with {len(self.remaining_wells)} wells remaining")
             self.add_to_display(f"RESUMED - Continuing with {len(self.remaining_wells)} wells: {', '.join(self.remaining_wells[:5])}{'...' if len(self.remaining_wells) > 5 else ''}")
@@ -3375,7 +3426,7 @@ class AsyncAMUZAGUI(QMainWindow):
     async def _on_insert(self):
         """Insert tray"""
         if not self.connection:
-            QMessageBox.warning(self, "Not Connected", "Connect first.")
+            _popup(self, 'warning', 'Not Connected', 'Connect first.')
             return
         await self.connection.insert()
         self.add_to_display("Insert command sent.")
@@ -3384,7 +3435,7 @@ class AsyncAMUZAGUI(QMainWindow):
     async def _on_eject(self):
         """Eject tray"""
         if not self.connection:
-            QMessageBox.warning(self, "Not Connected", "Connect first.")
+            _popup(self, 'warning', 'Not Connected', 'Connect first.')
             return
         await self.connection.eject()
         self.add_to_display("Eject command sent.")
@@ -3395,7 +3446,7 @@ class AsyncAMUZAGUI(QMainWindow):
         try:
             wells = await self.app_state.get_selected_wells(ctrl=True)
             if not wells:
-                QMessageBox.warning(self, "No Ctrl Wells", "Ctrl+click wells to move.")
+                _popup(self, 'warning', 'No Ctrl Wells', 'Ctrl+click wells to move.')
                 return
 
             # Sort wells naturally: A1, A2, ... A10, A11, A12, B1, B2, ... (not A1, A10, A11...)
@@ -3442,7 +3493,7 @@ class AsyncAMUZAGUI(QMainWindow):
             self._watch_run_task(task)
         except Exception as e:
             logger.error(f"Move error: {e}")
-            QMessageBox.critical(self, "Error", f"Move failed: {e}")
+            _popup(self, 'critical', 'Error', f'Move failed: {e}')
         finally:
             self._refresh_run_buttons()
     
@@ -3718,13 +3769,13 @@ class AsyncAMUZAGUI(QMainWindow):
                 watchdog = asyncio.create_task(self._sensor_stream_watchdog(port))
                 self.task_manager.add_task(watchdog, "sensor_watchdog")
             else:
-                QMessageBox.warning(self, "Connection Failed", "Could not connect to sensor")
+                _popup(self, 'warning', 'Connection Failed', 'Could not connect to sensor')
                 self.sensor_reader = None
                 self._reset_well_log()
 
         except Exception as e:
             logger.error(f"Sensor connection error: {e}")
-            QMessageBox.critical(self, "Error", f"Sensor connection failed: {e}")
+            _popup(self, 'critical', 'Error', f'Sensor connection failed: {e}')
             self.sensor_reader = None
             self._reset_well_log()
 

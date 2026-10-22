@@ -1315,10 +1315,16 @@ class FlowControlTab(QWidget):
         return self._flow_log_path
 
     def _console_log(self, msg):
-        """Append a timestamped line to the activity console under the graph."""
+        """Append a timestamped line to the activity console under the graph,
+        and to the app log, so pump actions can be reconstructed afterwards."""
         from datetime import datetime
         try:
             self.console.appendPlainText(f"{datetime.now():%H:%M:%S}  {msg}")
+        except Exception:
+            pass
+        try:
+            import logging
+            logging.getLogger("flow_tab").info(msg)
         except Exception:
             pass
 
@@ -1786,6 +1792,40 @@ class FlowControlTab(QWidget):
             self.status_msg.emit(f"Verify: sensor {r['measured_mean']:+.2f} vs expected "
                                  f"{r['expected_combined']:g} ({r['error_pct']:+.1f}%)")
         self._work(fn)
+
+    def pause_for_stop(self, reason="STOP"):
+        """The run was stopped (STOP button, or the robot failed): halt the
+        pump now and cancel any pending boost / feed-forward resume / phase ramp,
+        so nothing restarts it behind the user's back. resume_after_stop()
+        undoes it."""
+        self._ff_gen += 1
+        self._phase_flow_gen += 1
+        self._boost_until = 0.0
+        if self.line is None:
+            return
+        self._paused_by_run = True
+        self._stop()
+        if not self._insist_stop():
+            self.status_msg.emit("⚠ Pump STOP may not have gone through — check the pump.")
+        self._phase_flow_rate = 0.0
+        self.status_msg.emit(f"Pump stopped ({reason}).")
+
+    def resume_after_stop(self):
+        """RESUME after pause_for_stop(): restart the pump at the Flow rate.
+        The next move's boost (if configured) then takes over as usual."""
+        if self.line is None or not getattr(self, "_paused_by_run", False):
+            return
+        self._paused_by_run = False
+        rate = self._num(self.f_rate, 0.0)
+        if not rate or rate <= 0:
+            return
+        self._abort = False
+        try:
+            self.line.start_flow_single(rate / self._nsyr(), direction=self.cfg["direction"])
+            self._phase_flow_rate = rate
+            self.status_msg.emit(f"Pump resumed at {rate:g} µL/min.")
+        except Exception as e:
+            self.status_msg.emit(f"⚠ Pump resume failed: {e}")
 
     def _stop(self):
         self._abort = True; self._abort_clear = True

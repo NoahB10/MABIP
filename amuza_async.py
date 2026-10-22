@@ -319,6 +319,8 @@ class AsyncAmuzaConnection:
 
         # Status tracking
         self.status = DeviceStatus()
+        self.last_error: Optional[str] = None   # why the last method failed
+        self.last_status_t: Optional[float] = None  # monotonic time of last @q reply
         self.last_response = ""
         self.last_ack_code = ""
 
@@ -718,6 +720,7 @@ class AsyncAmuzaConnection:
             data = response[3:].split(',')
 
             self.status.raw_response = response
+            self.last_status_t = time.monotonic()   # liveness heartbeat
 
             if len(data) >= 1:
                 self.status.state = int(data[0])
@@ -786,6 +789,23 @@ class AsyncAmuzaConnection:
             return False
         finally:
             self._waiting_for_completion = False
+
+    STATUS_STALE_S = 5.0
+
+    def _sender_alive(self) -> bool:
+        """Is the AMUZA link actually working?
+
+        Judged by a heartbeat (time of the last @q status reply; polled every
+        ~1 s), not by task.done(): a task whose wake-up was rejected by asyncio
+        stays pending forever while doing nothing, so done() still says alive."""
+        for t in (getattr(self, "command_sender_task", None),
+                  getattr(self, "query_task", None)):
+            if t is not None and t.done():
+                return False
+        if self.use_mock:
+            return True
+        last = getattr(self, "last_status_t", None)
+        return last is not None and (time.monotonic() - last) < self.STATUS_STALE_S
 
     async def wait_for_busy(self, timeout: float = 5.0) -> bool:
         """Wait until device becomes busy (started moving/executing)"""
@@ -1043,9 +1063,30 @@ class AsyncAmuzaConnection:
             expected_duration=0.2  # Just send time
         )
 
-        # Wait for device to start moving (prevents false early completion)
+        # Wait for device to start moving (prevents false early completion).
+        # A move the device never acknowledges must NOT fall through to the
+        # completion check below: the status still reads READY from before the
+        # command, so it would be "completed" in 0 s and the well marked done
+        # without the robot moving (22 Oct 2026). Every past busy timeout in
+        # the logs was a dead sender loop or a disconnect, never a slow robot,
+        # so: resend once, then fail the well and stop the sequence.
         logger.info("Waiting for device to start moving...")
-        await self.wait_for_busy(timeout=5.0)
+        if not await self.wait_for_busy(timeout=5.0):
+            if stop_event.is_set():
+                return False
+            if not self._sender_alive():
+                self.last_error = (f"Move to {method.pos} was never sent: the AMUZA "
+                                   "command loop has stopped. Restart MABIP.")
+                logger.error(self.last_error)
+                return False
+            logger.warning(f"No response to move {method.pos}; resending once")
+            await self.send_command(command, priority=CommandPriority.MOVEMENT,
+                                    expected_duration=0.2)
+            if not await self.wait_for_busy(timeout=5.0):
+                self.last_error = (f"AMUZA did not start moving to {method.pos} "
+                                   "after two move commands. Well not marked done.")
+                logger.error(self.last_error)
+                return False
 
         # Now monitor device status until completion, with interruptible checks
         # Use device's actual countdown rather than software timing
