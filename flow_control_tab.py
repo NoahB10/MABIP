@@ -118,8 +118,8 @@ class FlowDefinitionsDialog(QDialog):
         ("exp_approach_ramp", "Well-flow: ramp→well (s)"), ("exp_recover_ramp", "Well-flow: ramp→buffer (s)"),
         ("ff_pause_s", "Feed-fwd: pause after move (s)"), ("ff_resume_s", "Feed-fwd: resume after move (s)"),
         ("ff_resume_ramp", "Feed-fwd: resume ramp (s)"),
-        ("ff_boost_rate", "Well entry: boost rate (µL/min, 0=off)"),
-        ("ff_boost_s", "Well entry: boost duration (s)"),
+        ("ff_boost_add", "Well entry: boost ABOVE Flow rate (µL/min, 0=off)"),
+        ("ff_boost_s", "Well entry: boost duration from the move (s)"),
         ("exp_settle_max_var", "Max flow variation (µL/min)"), ("exp_settle_hold", "Settle hold (s)"),
         ("exp_settle_timeout", "Settle timeout (s)"), ("exp_settle_bump", "Settle raise step (%)"),
     ]
@@ -128,7 +128,7 @@ class FlowDefinitionsDialog(QDialog):
     # _FIELDS is a bench-tuning constant — burst shapes, clog thresholds,
     # feed-forward timings, the ramp/prime numbers — and those stay behind
     # developer mode so this dialog is readable at a glance.
-    _BASIC_FIELDS = ("window", "ff_boost_rate", "ff_boost_s")
+    _BASIC_FIELDS = ("window", "ff_boost_add", "ff_boost_s")
 
     # Value boxes are sized to their contents — 3-6 characters for the tuning
     # numbers, a bit more for a port name. Left to stretch they take the whole
@@ -429,11 +429,10 @@ class FlowControlTab(QWidget):
             "exp_approach_ramp": 5.0, "exp_recover_ramp": 5.0,
             # feed-forward pause/resume across a move (calibrated 2026-07-15)
             "ff_pause_s": 0.45, "ff_resume_s": 10.0, "ff_resume_ramp": 0.0,
-            # well-entry boost: run at ff_boost_rate for ff_boost_s after the tip
-            # is back in liquid, then drop to the Flow rate. Pushes the well's
-            # dead volume (~130 µL at 100 µL/min = 80 s) to the sensor sooner.
-            # 0 = off.
-            "ff_boost_rate": 0.0, "ff_boost_s": 0.0,
+            # well-entry boost: from the move command, run at Flow rate +
+            # ff_boost_add for ff_boost_s, then drop to the Flow rate. Clears the
+            # tube's dead volume (~130 µL = 80 s at 100 µL/min) sooner. 0 = off.
+            "ff_boost_add": 0.0, "ff_boost_s": 0.0,
             # closed-loop settle: reach the specified flow (sensor) before a run starts
             "exp_settle": False, "exp_settle_max_var": 5.0, "exp_settle_hold": 5.0,
             "exp_settle_timeout": 120.0, "exp_settle_bump": 5.0,
@@ -557,8 +556,8 @@ class FlowControlTab(QWidget):
         self.chk_ff.setToolTip("On each well move: PAUSE the pump ~0.45 s after the move command "
                                "(tip lifts out of liquid) and RESUME ~10 s later (tip back in liquid) — "
                                "kills the air surge. Runs at the Flow rate; calibrated, needs NO sensor.\n"
-                               "A well-entry boost (Definitions) runs faster for a few seconds after the "
-                               "resume, then drops to the Flow rate — it works with or without this tick.")
+                               "A well-entry boost (Definitions) overrides this: from the move command the "
+                               "pump runs at Flow rate + offset for N s, then drops to the Flow rate.")
         self.chk_ff.toggled.connect(lambda v: setattr(self, "_ff_enabled", bool(v)))
         left.addWidget(self.chk_ff)
         self.chk_settle = QCheckBox("Settle to target rate")
@@ -1027,14 +1026,14 @@ class FlowControlTab(QWidget):
             applied.append(self.cfg["direction"])
         for fkey, ckey in (("pause_after", "ff_pause_s"), ("resume_after", "ff_resume_s"),
                            ("resume_ramp", "ff_resume_ramp"),
-                           ("boost_rate", "ff_boost_rate"), ("boost_s", "ff_boost_s")):
+                           ("boost_add", "ff_boost_add"), ("boost_s", "ff_boost_s")):
             if fkey in exp:
                 try:
                     self.cfg[ckey] = float(exp[fkey])
                 except ValueError:
                     pass
-        if "boost_rate" in exp:
-            applied.append(f"well-entry boost {exp['boost_rate']} µL/min "
+        if "boost_add" in exp:
+            applied.append(f"well-entry boost +{exp['boost_add']} µL/min "
                            f"for {exp.get('boost_s', self.cfg.get('ff_boost_s'))}s")
         if "pause_on_move" in exp:
             on = exp["pause_on_move"].lower() in ("yes", "true", "1", "on", "y")
@@ -1672,7 +1671,7 @@ class FlowControlTab(QWidget):
             self.chk_pull.setChecked(self.cfg["direction"] == "withdraw")
         for fkey, ckey in (("pause_after", "ff_pause_s"), ("resume_after", "ff_resume_s"),
                            ("resume_ramp", "ff_resume_ramp"),
-                           ("boost_rate", "ff_boost_rate"), ("boost_s", "ff_boost_s")):
+                           ("boost_add", "ff_boost_add"), ("boost_s", "ff_boost_s")):
             if fkey in run:
                 try:
                     self.cfg[ckey] = float(run[fkey])
@@ -2028,12 +2027,25 @@ class FlowControlTab(QWidget):
 
     # ------------------------------------------------------- experiment phase
     def on_move_command(self, well_id=""):
-        """MABIP just sent a move command (the exact anchor). Feed-forward PAUSE
-        the pump ~0.45 s later (tip lifts out) and RESUME ~10 s later (tip back in
-        liquid), covering the air gap. Fires off local timers, so it's precise."""
-        boost_rate = self._cfgf("ff_boost_rate", 0.0)
+        """MABIP just sent a move command (the exact anchor).
+
+        Two independent behaviours hang off it:
+
+        * Well-entry boost (ff_boost_add > 0): the instant the robot leaves for
+          the well, run at Flow rate + ff_boost_add for ff_boost_s seconds, then
+          drop to the Flow rate. Running through the transit pulls the old fluid
+          out of the tube so the new well's fluid reaches the sensor sooner
+          (~130 uL dead volume = 80 s at 100 uL/min). An offset, not an absolute,
+          so raising the Flow rate raises the boost with it.
+        * Feed-forward pause (chk_ff): PAUSE ~0.45 s after the move (tip lifts
+          out) and RESUME ~10 s later (tip back in liquid) at the Flow rate.
+
+        A boost takes precedence: pausing during the transit would defeat it,
+        so with a boost configured the pump is never paused for the move.
+        Local timers, so the timing is precise."""
+        boost_add = self._cfgf("ff_boost_add", 0.0)
         boost_s = self._cfgf("ff_boost_s", 0.0)
-        boost = boost_rate > 0 and boost_s > 0
+        boost = boost_add > 0 and boost_s > 0
         if (not self._ff_enabled and not boost) or self.line is None:
             return
         try:
@@ -2045,20 +2057,38 @@ class FlowControlTab(QWidget):
         n = self._nsyr()
         self._ff_gen += 1
         gen = self._ff_gen
-        if boost:
-            self.status_msg.emit(
-                f"[ff] move→{well_id}: {'pause in %.2fs, ' % (pause_ms/1000) if self._ff_enabled else ''}"
-                f"boost {boost_rate:g} µL/min at {resume_ms/1000:.1f}s for {boost_s:g}s, "
-                f"then {rate:g} µL/min.")
-        else:
-            self.status_msg.emit(f"[ff] move→{well_id}: pause in {pause_ms/1000:.2f}s, "
-                                 f"resume {rate:g} µL/min in {resume_ms/1000:.1f}s.")
-
         ramp_s = float(self.cfg.get("ff_resume_ramp", 0.0) or 0.0)
-        # What the resume runs at: the boost rate if a boost is set, else the
-        # Flow rate. The boost ends with a separate timer that drops to the
-        # Flow rate (same ramp setting, so a ramped resume gets a ramped drop).
-        resume_rate = boost_rate if boost else rate
+
+        def _go(target, label):
+            if ramp_s > 0:                  # gentle ramp (not a step) to avoid overshoot
+                self._apply_phase_flow(target, ramp_s, label)
+            else:
+                try:
+                    self.line.start_flow_single(target / n, direction=self.cfg["direction"])
+                except Exception:
+                    pass
+                self._phase_flow_rate = target
+                self.status_msg.emit(f"[ff] pump {label}: {target:g} uL/min ({well_id}).")
+
+        if boost:
+            boost_rate = rate + boost_add
+            self.status_msg.emit(
+                f"[ff] move->{well_id}: boost {boost_rate:g} uL/min now "
+                f"(= {rate:g} + {boost_add:g}) for {boost_s:g}s, then {rate:g}.")
+            self._boost_until = time.monotonic() + boost_s
+            _go(boost_rate, "boost")
+
+            def do_boost_end():
+                if gen != self._ff_gen or self.line is None:
+                    return
+                self._boost_until = 0.0
+                _go(rate, "boost over, back to")
+
+            QTimer.singleShot(int(boost_s * 1000), do_boost_end)
+            return
+
+        self.status_msg.emit(f"[ff] move->{well_id}: pause in {pause_ms/1000:.2f}s, "
+                             f"resume {rate:g} uL/min in {resume_ms/1000:.1f}s.")
 
         def do_pause():
             if gen != self._ff_gen or self.line is None:
@@ -2070,35 +2100,13 @@ class FlowControlTab(QWidget):
             self._phase_flow_rate = 0.0     # so a ramped resume starts from 0
             self.status_msg.emit(f"[ff] pump paused (moving to {well_id}).")
 
-        def _go(target, label):
-            if ramp_s > 0:                  # gentle ramp (not a step) to avoid overshoot
-                self._apply_phase_flow(target, ramp_s, label)
-            else:
-                try:
-                    self.line.start_flow_single(target / n, direction=self.cfg["direction"])
-                except Exception:
-                    pass
-                self._phase_flow_rate = target
-                self.status_msg.emit(f"[ff] pump {label}: {target:g} µL/min (in {well_id}).")
-
         def do_resume():
             if gen != self._ff_gen or self.line is None:
                 return
-            if boost:
-                self._boost_until = time.monotonic() + boost_s
-            _go(resume_rate, "boost" if boost else "resumed")
+            _go(rate, "resumed")
 
-        def do_boost_end():
-            if gen != self._ff_gen or self.line is None:
-                return
-            self._boost_until = 0.0
-            _go(rate, "boost over, back to")
-
-        if self._ff_enabled:
-            QTimer.singleShot(pause_ms, do_pause)
+        QTimer.singleShot(pause_ms, do_pause)
         QTimer.singleShot(resume_ms, do_resume)
-        if boost:
-            QTimer.singleShot(resume_ms + int(boost_s * 1000), do_boost_end)
 
     def set_experiment_phase(self, phase, n_wells=0):
         """Called by MABIP: phase in {'idle','buffer','well'} with well count.

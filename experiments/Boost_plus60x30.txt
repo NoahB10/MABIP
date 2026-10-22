@@ -1,0 +1,13 @@
+# MABIP experiment — WELL-ENTRY BOOST (+60 µL/min for 30 s)
+# Measured 22 Oct 2026: at 100 µL/min the well's fluid takes ~1 min 20 s to reach
+# the sensor (~130 µL dead volume). So the moment the robot leaves for a well the
+# pump runs at flow_rate + boost_add, which clears the tube during the transit,
+# then settles to flow_rate:
+#   move command → (100+60)=160 µL/min for 30 s → 100 µL/min for the rest.
+# The boost is an OFFSET: set flow_rate 150 and the boost becomes 210.
+# Load this in the Flow Control tab (📂 Load experiment…). It only sets the pump
+# settings — pick wells and sampling/buffer times in the Sampling tab as usual.
+flow_rate: 100
+direction: withdraw
+boost_add: 60
+boost_s: 30
