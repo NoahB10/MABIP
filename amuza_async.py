@@ -1054,7 +1054,11 @@ class AsyncAmuzaConnection:
         command = self._format_method_command(port, dwell)
         move_time = self.calculate_move_time(str(method.pos))
 
-        logger.info(f"Moving to {method.pos} (port {port}), sampling for {method.wait}s")
+        if dwell_controller is not None:
+            logger.info(f"Moving to {method.pos} (port {port}), low-volume: until empty "
+                        f"(cap {dwell}s)")
+        else:
+            logger.info(f"Moving to {method.pos} (port {port}), sampling for {method.wait}s")
         logger.info(f"Command: {repr(command)}")
 
         # Feed-forward anchor: fire at the instant the move command goes out, so

@@ -245,6 +245,7 @@ class WellEmptyDetector:
     def _fire(self, t, since, t_air, reason, chans):
         self._armed = False
         self._move_t = None
+        air_in = since - (t - t_air)      # seconds into the well the tip met air
         return WellEmptyEvent("EMPTY", t, since, t_air, reason, chans,
-                              f"WELL EMPTY: {reason} on {', '.join(chans)}; tip met air ~{t_air:.0f}s "
-                              f"(lag {self.lag_s:.0f}s).")
+                              f"WELL EMPTY: {reason} on {', '.join(chans)}; tip met air "
+                              f"~{air_in:.0f}s into the well (lag {self.lag_s:.0f}s).")
