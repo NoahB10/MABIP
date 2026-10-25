@@ -105,8 +105,14 @@ class LowVolumeConfig:
     plateau_window_s: float = 15.0
     """Length of the window, ending plateau_gap_s before the air, that must be flat."""
 
-    plateau_gap_s: float = 2.0
-    """Gap left between the plateau window and the moment the tip met air."""
+    plateau_gap_s: float = 5.0
+    """Gap left between the plateau window and the moment the tip met air.
+    5 s, not 2: the detector's t_air lands a sample or two into the dip, and a
+    2 s gap let the start of the dip into the window, so real dry wells failed
+    the check (22 Oct A4 never left, A5 waited 20 s). Full leave-decision
+    replay, 1376 labelled wells: left at the right time 840 -> 841, left early
+    27 -> 22; 22 Oct: all dry wells leave as fast as before, the already-empty
+    A2 re-entry leaves flagged after 25 s."""
 
     plateau_k: float = 8.0
     """Plateau must sit this many noise units above the baseline."""
