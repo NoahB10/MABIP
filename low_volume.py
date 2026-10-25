@@ -147,6 +147,58 @@ class LowVolumeConfig:
     clear_timeout_s: float = 300.0
     """Longest a clearing attempt may take before returning anyway."""
 
+    # ---- v4 (dry-well study, 25 Oct 2026) ------------------------------------
+    well_volume_ul: float = 0.0
+    """Volume loaded into each well, µL (0 = not entered). The controller
+    integrates the commanded pump rate (boost included) to know the volume drawn
+    from the current well. Before vol_gate_frac of it has been drawn the well
+    cannot be dry, so a well-empty call is ignored (logged) and listening
+    continues; the dry backstop also waits for the gate."""
+
+    vol_gate_frac: float = 0.75
+    """Fraction of the loaded (or learned) volume that must have been drawn
+    before a well-empty call is believed. 0.75 tolerates an entered volume up
+    to 25 % too high; too low an entry only weakens the protection."""
+
+    learn_volume: bool = False
+    """With no well_volume_ul: learn the volume drawn at the dry-well air front
+    from the wells already confirmed empty in this run (median) and gate the
+    next wells at vol_gate_frac of it.
+    OFF by default (25 Oct 2026): a later well holding LESS than the earlier
+    ones would have its real dry call ignored until the dwell cap or the
+    operator's button. It gained nothing in the 13-well replay."""
+
+    dry_backstop_lag: float = 1.5
+    """After a CONFIRMED dry-well air front that did not end the well (no steady
+    plateau before it, or ignored before the volume gate), leave flagged once
+    this many dead-volume lags have passed with no fresh sample arriving (no
+    new all-channel rise). Replaces waiting for stale-at-max (25 Oct: 378 s and
+    667 s). 0 = off."""
+
+    dry_backstop_pre_steady: bool = False
+    """Also apply the dry backstop to an air front seen BEFORE the plateau was
+    steady (leaves flagged 'empty-NO-PLATEAU'). Off: on the 1376 gold wells it
+    left 8 healthy wells early (a wash-in that never settled + a drop)."""
+
+    dry_backstop_gate_lag: float = 0.5
+    """Same, but used when a volume is known and the gate is open."""
+
+    dead_volume_ul: float = 130.0
+    """Tip-to-sensor dead volume (for the lag in the dry backstop)."""
+
+    hold_on_plateau: bool = True
+    """A flat signal on a VALID plateau (detector STEADY, no dry-well air front
+    since) is a healthy well, not a clog: do not escalate the pump or count
+    toward the clog / unconfirmed exits then. Replayed on the 1376 gold wells
+    with the controller timing scaled to their faster lag, the stale-at-max
+    logic sent 70 healthy wells home as 'clogs' and left 4 flagged."""
+
+    gate_fast: bool = False
+    """Once the volume gate is open, leave on the dry-well air front at once
+    (the detector's unconfirmed 'dry-signature drop' after a steady plateau)
+    instead of waiting ~6 s for its slow-recovery check. Off: costs early leaves
+    when the volume is unknown and gains only ~7 s."""
+
     @classmethod
     def from_dict(cls, d: dict) -> "LowVolumeConfig":
         names = {f.name for f in fields(cls)}
@@ -172,6 +224,14 @@ class FlowTabPump:
     def base_rate(self) -> float:
         try:
             return float(self.tab._num(self.tab.f_rate, 0.0))
+        except Exception:
+            return 0.0
+
+    def current_rate(self) -> float:
+        """Rate the pump is running at now, boost included (for the volume drawn)."""
+        try:
+            r = getattr(self.tab, "_phase_flow_rate", None)
+            return float(r) if r is not None else self.base_rate()
         except Exception:
             return 0.0
 
@@ -222,6 +282,13 @@ class LowVolumeController:
         self.last_error: Optional[str] = None
         self.log: list = []          # (well, outcome, seconds_in_well, clears)
         self.flagged: list = []      # wells left with no valid plateau
+        # v4: volume drawn from the current well, learned dry volumes, dry backstop
+        self._vol = 0.0
+        self._vol_t: Optional[float] = None
+        self._rate_now: Optional[float] = None
+        self._vol_at_drop: Optional[float] = None
+        self._learned: list = []
+        self._ignored = 0
 
     # ---- operator ---------------------------------------------------------
     def request_next(self) -> None:
@@ -253,11 +320,29 @@ class LowVolumeController:
         if kind != "EMPTY":
             # SUSPECT = a suction-break dip or a lone spike. A dip is remembered:
             # followed by a stale signal it means the well is dry.
-            if "dip" in str(getattr(ev, "reason", "")):
-                self._last_dip = t
+            why = str(getattr(ev, "reason", ""))
+            if "dip" in why or why.startswith("dry-signature confirmed"):
+                self._last_dip = t      # the tip met air: a later stale-at-max is a dry well, not a clog
+            gate = self.volume_gate()
+            if self.cfg.gate_fast and why == "dry-signature drop" and gate is not None and self._vol >= gate:
+                self._vol_at_drop = self._vol
+                self._empty_at, self._empty_reason = t, "air"
+                logger.info(f"Low-volume: {getattr(ev, 'message', ev)} -> well empty (volume gate open)")
+                return
             logger.info(f"Low-volume: {getattr(ev, 'message', ev)}")
             return
         reason = "dip" if "dip" in str(getattr(ev, "reason", "")) else "air"
+        gate = self.volume_gate()
+        if gate is not None and self._vol < gate:
+            # The well cannot be dry yet: too little of its volume has been drawn.
+            self._ignored += 1
+            logger.info(f"Low-volume: {getattr(ev, 'message', ev)} IGNORED: only {self._vol:.0f} of "
+                        f"{gate:.0f} µL drawn (volume gate)")
+            if self._entered_t is not None and hasattr(self.detector, "rearm"):
+                self.detector.rearm(self._entered_t)
+            return
+        if self._vol_at_drop is None:
+            self._vol_at_drop = self._vol
         if self.cfg.plateau_check:
             t_air = getattr(ev, "t_air", None)
             t_ref = t if t_air is None else min(t, float(t_air))
@@ -350,10 +435,78 @@ class LowVolumeController:
         self._last_dip = None
         self._entered_t = t
         self._pending_noplat = None
+        self._well_reset(t)
         try:
             self.detector.note_move(t)
         except Exception as e:  # noqa: BLE001
             logger.debug(f"detector.note_move error: {e}")
+
+    # ---- v4: volume drawn, volume gate, dry backstop -------------------------
+    def _well_reset(self, t: float) -> None:
+        self._vol = 0.0
+        self._vol_t = t
+        self._vol_at_drop = None
+        self._ignored = 0
+
+    def _tick_volume(self, now: float, rate: Optional[float]) -> None:
+        """Integrate the pump rate (µL/min) since the last tick."""
+        if self._vol_t is not None and rate is not None and rate > 0 and now > self._vol_t:
+            self._vol += rate * (now - self._vol_t) / 60.0
+        self._vol_t = now
+
+    def volume_gate(self) -> Optional[float]:
+        """µL that must be drawn before the well can be dry, or None (unknown)."""
+        cfg = self.cfg
+        if cfg.well_volume_ul and cfg.well_volume_ul > 0:
+            return cfg.vol_gate_frac * cfg.well_volume_ul
+        if cfg.learn_volume and self._learned:
+            return cfg.vol_gate_frac * _median(self._learned)
+        return None
+
+    def _lag_now(self, rate: Optional[float]) -> float:
+        lag = getattr(self.detector, "lag_s", None)     # the detector follows every rate change
+        if isinstance(lag, (int, float)) and lag > 0:
+            return float(lag)
+        r = rate if rate and rate > 0 else 130.0
+        return 60.0 * self.cfg.dead_volume_ul / r
+
+    def _v4_check(self, now: float, rate: Optional[float]) -> Optional[str]:
+        """Dry backstop. Returns an outcome reason when the well should be left."""
+        cfg = self.cfg
+        if not cfg.dry_backstop_lag:
+            return None
+        flag = getattr(self.detector, "dry_flag", None)
+        if flag is None:
+            return None
+        t_drop, steady = flag
+        if self._entered_t is not None and t_drop < self._entered_t:
+            return None
+        if not steady and not cfg.dry_backstop_pre_steady:
+            return None
+        if getattr(self.detector, "_last_rise_t", -1e18) > t_drop:
+            return None                       # fresh sample arrived after the drop
+        gate = self.volume_gate()
+        if gate is not None and self._vol < gate:
+            return None
+        wait = (cfg.dry_backstop_gate_lag if gate is not None else cfg.dry_backstop_lag) * self._lag_now(rate)
+        if now - t_drop < wait:
+            return None
+        if self._vol_at_drop is None:
+            self._vol_at_drop = self._vol
+        self._empty_at = now
+        self._empty_reason = "dry" if steady else "noplateau"
+        return self._empty_reason
+
+    def _plateau_ok(self) -> bool:
+        """Detector says the plateau is steady and no dry-well air front was seen since."""
+        if not self.cfg.hold_on_plateau or not getattr(self.detector, "steady", False):
+            return False
+        flag = getattr(self.detector, "dry_flag", None)
+        return flag is None or (self._entered_t is not None and flag[0] < self._entered_t)
+
+    def _learn(self) -> None:
+        if self._vol_at_drop is not None and self._vol_at_drop > 0:
+            self._learned.append(self._vol_at_drop)
 
     def _leave(self) -> None:
         self._in_well = False
@@ -455,10 +608,16 @@ class LowVolumeController:
                 await self._go_home(conn)
                 if pump_ok and rate != base:
                     self._set_rate(base, "well done")
-                outcome = {"air": "empty", "noplateau": "empty-NO-PLATEAU",
+                outcome = {"air": "empty", "noplateau": "empty-NO-PLATEAU", "dry": "empty-DRY-BACKSTOP",
                            "unconfirmed": "empty-UNCONFIRMED"}.get(self._empty_reason, "empty-dip")
+                if self._empty_reason in ("air", "dip", "dry"):
+                    self._learn()
                 self.log.append((well, outcome, round(now - well_t0, 1), clears))
-                if self._empty_reason == "noplateau":
+                if self._empty_reason == "dry":
+                    self.flagged.append(well)
+                    self._say(on_progress, f"Buffer: {well} left after {now - entered:.0f}s: dry-well "
+                                           "air front, no fresh sample since - check this well")
+                elif self._empty_reason == "noplateau":
                     self.flagged.append(well)
                     self._say(on_progress, f"Buffer: {well} left after {now - entered:.0f}s: air "
                                            "with NO steady plateau before it (well empty or no "
@@ -484,6 +643,11 @@ class LowVolumeController:
                                "cap without air")
                 return True
 
+            self._tick_volume(now, self.pump.current_rate() if pump_ok and hasattr(self.pump, "current_rate")
+                              else (rate if pump_ok else None))
+            if self._v4_check(now, rate if pump_ok else None):
+                continue
+
             t_in = now - entered
             self._say(on_progress, f"Sampling: well {well} (low-volume, {t_in:.0f}s"
                                    + (f", pump {rate:g}" if pump_ok else "") + ")", log=False)
@@ -495,6 +659,8 @@ class LowVolumeController:
                     and (last_step is None or now - last_step >= cfg.step_every_s):
                 last_step = now
                 fresh = self.signal_fresh(now)
+                if fresh is False and self._plateau_ok():
+                    fresh = True           # flat on a valid plateau = healthy, not a clog
                 if cfg.dip_stale_empty and fresh is False and self._last_dip is not None \
                         and now - self._last_dip <= cfg.dip_stale_s:
                     # Tip met air, then the reading froze: the well is dry.

@@ -1,0 +1,61 @@
+GOLD LOPO test: early 3 of 1376 (2.18/1000, 95% UB 6.36/1000) right 1095 (79.6%)
+   configs chosen [('{"dd_kmed": 10, "dd_k": 10, "dd_hold_rec": 0.6, "dd_hold_s": 6, "dd_up": 5}', 10), ('{"dd_kmed": 10, "dd_k": 10, "dd_hold_rec": 0.4, "dd_hold_s": 6, "dd_up": 5}', 2), ('{"dd_kmed": 14, "dd_k": 6, "dd_hold_rec": 0.6, "dd_hold_s": 6, "dd_up": 5}', 1)]
+DRY LORO test 22 Oct: tuned on the other run -> {'dd_kmed': 10, 'dd_k': 10, 'dd_hold_rec': 0.6, 'dd_hold_s': 6, 'dd_up': 5}: caught 5/7 early 0 {'22-A1': np.float64(8.4), '22-A2': np.float64(25.1), '22-A2re': None, '22-A3': None, '22-A4': np.float64(8.5), '22-A5': np.float64(10.1), '22-A6': np.float64(10.1)}
+DRY LORO test 25 Oct: tuned on the other run -> {'dd_kmed': 10, 'dd_k': 10, 'dd_hold_rec': 0.6, 'dd_hold_s': 6, 'dd_up': 5}: caught 5/6 early 0 {'25-A1': np.float64(13.4), '25-A2': np.float64(8.3), '25-A3': np.float64(8.4), '25-B1': np.float64(10.1), '25-B2': np.float64(-26.7), '25-B3': np.float64(8.4)}
+
+all configs: gold early/right | dry caught/early(non-clog)
+{"dd_kmed": 10, "dd_k": 10, "dd_hold_rec": 0.6, "dd_hold_s": 6, "dd_up": 5}                      1  1097 | 10  0 lat  77.8
+{"dd_kmed": 10, "dd_k": 10, "dd_hold_rec": 0.4, "dd_hold_s": 6, "dd_up": 5}                      1  1096 | 10  0 lat  77.8
+{"dd_kmed": 14, "dd_k": 10, "dd_hold_rec": 0.6, "dd_hold_s": 6, "dd_up": 5}                      1  1096 | 10  0 lat  77.8
+{"dd_kmed": 14, "dd_k": 10, "dd_hold_rec": 0.4, "dd_hold_s": 6, "dd_up": 5}                      1  1095 | 10  0 lat  77.8
+{"dd_kmed": 20, "dd_k": 10, "dd_hold_rec": 0.6, "dd_hold_s": 4, "dd_up": 5}                      1  1082 | 10  0 lat  77.2
+{"dd_kmed": 20, "dd_k": 10, "dd_hold_rec": 0.8, "dd_hold_s": 6, "dd_up": 5}                      1  1081 | 10  0 lat  78.5
+{"dd_kmed": 20, "dd_k": 10, "dd_hold_rec": 0.8, "dd_hold_s": 8, "dd_up": 5}                      1  1080 | 10  0 lat  79.8
+{"dd_kmed": 20, "dd_k": 10, "dd_hold_rec": 0.4, "dd_hold_s": 4, "dd_up": 5}                      1  1081 |  9  0 lat  98.6
+{"dd_kmed": 20, "dd_k": 10, "dd_hold_rec": 0.6, "dd_hold_s": 6, "dd_up": 5}                      1  1080 |  9  0 lat  99.8
+{"dd_kmed": 20, "dd_k": 10, "dd_hold_rec": 0.6, "dd_hold_s": 8, "dd_up": 5}                      1  1080 |  9  0 lat 100.9
+{"dd_kmed": 20, "dd_k": 10, "dd_hold_rec": 0.4, "dd_hold_s": 8, "dd_up": 5}                      1  1080 |  9  0 lat 100.9
+{"dd_kmed": 20, "dd_k": 6, "dd_hold_rec": 0.4, "dd_hold_s": 8, "dd_up": 5}                       1  1079 |  9  0 lat 100.9
+{"dd_kmed": 20, "dd_k": 10, "dd_hold_rec": 0.4, "dd_hold_s": 6, "dd_up": 5}                      1  1078 |  9  0 lat  99.8
+{"dd_kmed": 14, "dd_k": 6, "dd_hold_rec": 0.6, "dd_hold_s": 6, "dd_up": 5}                       2  1104 | 10  0 lat  78.3
+{"dd_kmed": 14, "dd_k": 6, "dd_hold_rec": 0.4, "dd_hold_s": 6, "dd_up": 5}                       2  1104 | 10  0 lat  78.3
+{"dd_kmed": 14, "dd_k": 10, "dd_hold_rec": 0.6, "dd_hold_s": 4, "dd_up": 5}                      2  1101 | 10  0 lat  77.0
+{"dd_kmed": 10, "dd_k": 10, "dd_hold_rec": 0.6, "dd_hold_s": 4, "dd_up": 5}                      2  1100 | 10  0 lat  77.0
+{"dd_kmed": 14, "dd_k": 10, "dd_hold_rec": 0.4, "dd_hold_s": 4, "dd_up": 5}                      2  1100 | 10  0 lat  77.0
+{"dd_kmed": 10, "dd_k": 10, "dd_hold_rec": 0.4, "dd_hold_s": 4, "dd_up": 5}                      2  1100 | 10  0 lat  77.0
+{"dd_kmed": 10, "dd_k": 10, "dd_hold_rec": 0.8, "dd_hold_s": 6, "dd_up": 5}                      2  1098 | 10  0 lat  77.8
+{"dd_kmed": 14, "dd_k": 10, "dd_hold_rec": 0.8, "dd_hold_s": 6, "dd_up": 5}                      2  1097 | 10  0 lat  77.8
+{"dd_kmed": 14, "dd_k": 6, "dd_hold_rec": 0.4, "dd_hold_s": 8, "dd_up": 5}                       2  1091 | 10  0 lat  78.9
+{"dd_kmed": 10, "dd_k": 10, "dd_hold_rec": 0.4, "dd_hold_s": 8, "dd_up": 5}                      2  1091 | 10  0 lat  79.0
+{"dd_kmed": 10, "dd_k": 10, "dd_hold_rec": 0.8, "dd_hold_s": 8, "dd_up": 5}                      2  1091 | 10  0 lat  79.0
+{"dd_kmed": 10, "dd_k": 10, "dd_hold_rec": 0.6, "dd_hold_s": 8, "dd_up": 5}                      2  1091 | 10  0 lat  79.0
+{"dd_kmed": 14, "dd_k": 10, "dd_hold_rec": 0.4, "dd_hold_s": 8, "dd_up": 5}                      2  1089 | 10  0 lat  79.0
+{"dd_kmed": 14, "dd_k": 10, "dd_hold_rec": 0.6, "dd_hold_s": 8, "dd_up": 5}                      2  1089 | 10  0 lat  79.0
+{"dd_kmed": 14, "dd_k": 10, "dd_hold_rec": 0.8, "dd_hold_s": 8, "dd_up": 5}                      2  1089 | 10  0 lat  79.0
+{"dd_kmed": 20, "dd_k": 6, "dd_hold_rec": 0.6, "dd_hold_s": 4, "dd_up": 5}                       2  1084 | 10  0 lat  77.2
+{"dd_kmed": 20, "dd_k": 6, "dd_hold_rec": 0.8, "dd_hold_s": 6, "dd_up": 5}                       2  1082 | 10  0 lat  78.5
+{"dd_kmed": 20, "dd_k": 10, "dd_hold_rec": 0.8, "dd_hold_s": 4, "dd_up": 5}                      2  1081 | 10  0 lat  77.2
+{"dd_kmed": 20, "dd_k": 6, "dd_hold_rec": 0.8, "dd_hold_s": 8, "dd_up": 5}                       2  1078 | 10  0 lat  79.8
+{"dd_kmed": 20, "dd_k": 6, "dd_hold_rec": 0.4, "dd_hold_s": 4, "dd_up": 5}                       2  1083 |  9  0 lat  98.6
+{"dd_kmed": 20, "dd_k": 6, "dd_hold_rec": 0.6, "dd_hold_s": 6, "dd_up": 5}                       2  1081 |  9  0 lat  99.8
+{"dd_kmed": 20, "dd_k": 6, "dd_hold_rec": 0.4, "dd_hold_s": 6, "dd_up": 5}                       2  1080 |  9  0 lat  99.8
+{"dd_kmed": 20, "dd_k": 6, "dd_hold_rec": 0.6, "dd_hold_s": 8, "dd_up": 5}                       2  1078 |  9  0 lat 100.9
+{"dd_kmed": 14, "dd_k": 6, "dd_hold_rec": 0.6, "dd_hold_s": 4, "dd_up": 5}                       3  1112 | 10  0 lat  77.0
+{"dd_kmed": 14, "dd_k": 6, "dd_hold_rec": 0.4, "dd_hold_s": 4, "dd_up": 5}                       3  1111 | 10  0 lat  77.0
+{"dd_kmed": 14, "dd_k": 10, "dd_hold_rec": 0.8, "dd_hold_s": 4, "dd_up": 5}                      3  1101 | 10  0 lat  76.4
+{"dd_kmed": 10, "dd_k": 10, "dd_hold_rec": 0.8, "dd_hold_s": 4, "dd_up": 5}                      3  1100 | 10  0 lat  76.4
+{"dd_kmed": 20, "dd_k": 6, "dd_hold_rec": 0.8, "dd_hold_s": 4, "dd_up": 5}                       3  1084 | 10  0 lat  77.2
+{"dd_kmed": 14, "dd_k": 6, "dd_hold_rec": 0.8, "dd_hold_s": 6, "dd_up": 5}                       4  1106 | 10  0 lat  77.6
+{"dd_kmed": 14, "dd_k": 6, "dd_hold_rec": 0.8, "dd_hold_s": 8, "dd_up": 5}                       4  1091 | 10  0 lat  78.9
+{"dd_kmed": 14, "dd_k": 6, "dd_hold_rec": 0.6, "dd_hold_s": 8, "dd_up": 5}                       4  1090 | 10  0 lat  78.9
+{"dd_kmed": 10, "dd_k": 6, "dd_hold_rec": 0.4, "dd_hold_s": 6, "dd_up": 5}                       3  1112 |  9  1 lat 100.7
+{"dd_kmed": 10, "dd_k": 6, "dd_hold_rec": 0.6, "dd_hold_s": 6, "dd_up": 5}                       3  1112 |  9  1 lat 100.7
+{"dd_kmed": 10, "dd_k": 6, "dd_hold_rec": 0.4, "dd_hold_s": 8, "dd_up": 5}                       3  1101 |  9  1 lat 101.2
+{"dd_kmed": 14, "dd_k": 6, "dd_hold_rec": 0.8, "dd_hold_s": 4, "dd_up": 5}                       5  1111 | 10  0 lat  77.0
+{"dd_kmed": 10, "dd_k": 6, "dd_hold_rec": 0.4, "dd_hold_s": 4, "dd_up": 5}                       4  1124 |  9  1 lat  99.5
+{"dd_kmed": 10, "dd_k": 6, "dd_hold_rec": 0.6, "dd_hold_s": 4, "dd_up": 5}                       4  1124 |  9  1 lat  99.5
+{"dd_kmed": 10, "dd_k": 6, "dd_hold_rec": 0.8, "dd_hold_s": 6, "dd_up": 5}                       5  1114 |  9  1 lat 100.1
+{"dd_kmed": 10, "dd_k": 6, "dd_hold_rec": 0.8, "dd_hold_s": 8, "dd_up": 5}                       5  1103 |  9  1 lat 101.2
+{"dd_kmed": 10, "dd_k": 6, "dd_hold_rec": 0.6, "dd_hold_s": 8, "dd_up": 5}                       5  1101 |  9  1 lat 101.2
+{"dd_kmed": 10, "dd_k": 6, "dd_hold_rec": 0.8, "dd_hold_s": 4, "dd_up": 5}                       6  1125 |  9  1 lat  99.5
+{"dd_confirm": "none"}                                                                          13  1083 | 10  0 lat  72.6

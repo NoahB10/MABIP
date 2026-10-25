@@ -1,0 +1,9 @@
+{"dd_confirm": "hold", "resteady_up": 14} | GOLD early 1 right 1047 never 328 | DRY caught 9 early ['25-B1']
+    dry {'22-A1': 8.4, '22-A2': None, '22-A2re': None, '22-A3': None, '22-A4': 8.5, '22-A5': 10.1, '22-A6': 11.8, '25-A1': 13.4, '25-A2': 8.3, '25-A3': 8.4, '25-B1': -75.3, '25-B2': 8.4, '25-B3': 8.4}
+    gold early [('1811_batch6', 73, np.float64(60.3), 'air at sensor + wash-o')]
+{"dd_confirm": "hold", "resteady_up": 30} | GOLD early 1 right 1087 never 288 | DRY caught 9 early ['25-B1']
+    dry {'22-A1': 8.4, '22-A2': None, '22-A2re': None, '22-A3': None, '22-A4': 8.5, '22-A5': 10.1, '22-A6': 11.8, '25-A1': 13.4, '25-A2': 8.3, '25-A3': 8.4, '25-B1': -75.3, '25-B2': 8.4, '25-B3': 8.4}
+    gold early [('1811_batch6', 73, np.float64(60.3), 'air at sensor + wash-o')]
+{"dd_confirm": "hold", "resteady_up": 14, "dd_hold_rec": 0.5} | GOLD early 1 right 1046 never 329 | DRY caught 9 early ['25-B1']
+    dry {'22-A1': 8.4, '22-A2': None, '22-A2re': None, '22-A3': None, '22-A4': 8.5, '22-A5': 10.1, '22-A6': 11.8, '25-A1': 13.4, '25-A2': 8.3, '25-A3': 8.4, '25-B1': -75.3, '25-B2': 8.4, '25-B3': 8.4}
+    gold early [('1811_batch6', 73, np.float64(60.3), 'air at sensor + wash-o')]

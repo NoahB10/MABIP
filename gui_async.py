@@ -1425,7 +1425,8 @@ class SettingsDialog(QDialog):
                 ("max_rate", "Up to (max)", 10, 1000, 10, " µL/min"),
                 ("hold_at_max_s", "Clog if still stale at max for", 10, 1800, 10, " s"),
                 ("max_clears", "Clog clears per well", 0, 10, 1, ""),
-                ("max_dwell_s", "Safety cap per well", 60, 9999, 60, " s")):
+                ("max_dwell_s", "Safety cap per well", 60, 9999, 60, " s"),
+                ("well_volume_ul", "Liquid loaded per well (0 = not set)", 0, 5000, 10, " µL")):
             sp = QDoubleSpinBox() if key not in ("max_clears", "max_dwell_s") else QSpinBox()
             sp.setRange(lo, hi)
             sp.setSingleStep(step)
