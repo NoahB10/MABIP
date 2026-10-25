@@ -109,6 +109,20 @@ class WellEmptyConfig:
     dry_frac: float = 0.7
     dry_from_s: float = 8.0
     dry_hold_s: float = 35.0
+    # P3 (25 Oct 2026 low-volume test, OFF): a dry well's signal drops and then SETTLES at a clearly
+    # lower level (no full wash-out, no sustained jitter), while a glitch usually returns to the same
+    # plateau. Confirm when >= settle_vote of ch3/5/6 have lost >= settle_drop of their excursion and
+    # stayed flat (range <= settle_flat of the excursion) for settle_hold_s, between settle_from_s and
+    # settle_to_s after the event.  Tested and REJECTED for now: gains 2 of 13 real dry wells (25 Oct B3,
+    # 22 Oct A4) but adds 15-16 early leaves on the 1376 gold wells (1 -> 16/17, for drop 0.25-0.6) and
+    # left 22 Oct A6 86 s before it ran dry - healthy plateaus sometimes step down and stay there.
+    settle_path: bool = False
+    settle_drop: float = 0.4
+    settle_flat: float = 0.15
+    settle_vote: int = 2
+    settle_from_s: float = 20.0
+    settle_to_s: float = 90.0
+    settle_hold_s: float = 10.0
     suspect_before_steady: bool = False  # True: also report tip dips before STEADY as SUSPECT (feeds low_volume dip+stale backstop; +4 early on gold)
     n_channels: int = 6
 
@@ -312,6 +326,22 @@ class WellEmptyDetector:
                     cd.done = True
                     if hit is None and cd.jr_n and cd.jr_hi / cd.jr_n >= c.dry_frac:
                         hit = "suction break + sustained air in line (dry well)"
+            # P3: settled at a clearly lower level (dry well), not back on the plateau (glitch)
+            if hit is None and c.settle_path and cd.epre is not None and c.settle_from_s <= tt <= c.settle_to_s:
+                hw = self._window(t - c.settle_hold_s, t, self._m5)
+                if len(hw) >= 4:
+                    votes = 0
+                    for j, ch in enumerate(STRONG):
+                        exc = cd.pre[ch] - cd.b0[ch]
+                        if abs(exc) < 8 * cd.s3[j]:
+                            continue
+                        vals = [v[ch] for v in hw]
+                        lost = [(cd.pre[ch] - v) / exc for v in vals]      # sign-agnostic share of excursion lost
+                        flat = (max(vals) - min(vals)) / abs(exc)
+                        if min(lost) >= c.settle_drop and flat <= c.settle_flat:
+                            votes += 1
+                    if votes >= c.settle_vote:
+                        hit = "signal settled clearly lower after the event (dry well)"
             if hit is not None:
                 # each candidate confirms once (consumed even if it cannot be emitted)
                 if out is None and self._armed and self._move_t is not None:

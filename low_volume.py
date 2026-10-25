@@ -93,8 +93,13 @@ class LowVolumeConfig:
     plus that flat reading made early exits. Noah chose certainty over speed
     (confirmed bubbles only)."""
 
-    plateau_check: bool = True
-    """Accept a well-empty call as a GOOD sample only if, just before the tip
+    plateau_check: bool = False
+    """OFF since the v3 detector (25 Oct 2026), which already requires a steady
+    plateau before it will call a well empty. Running both conflicted: on the
+    25 Oct test v3 confirmed B1 dry, this check failed, and the dry well's
+    frozen plateau then cancelled the call as a 'glitch' (operator had to skip).
+
+    Accept a well-empty call as a GOOD sample only if, just before the tip
     met air, at least 2 channels sat on a flat plateau clearly above the
     buffer baseline (Noah, 25 Oct 2026: "the flatline beforehand is
     essential"). Scored on 15 labelled plates: false alarms 27 -> 20 with no
