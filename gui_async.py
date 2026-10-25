@@ -1417,13 +1417,6 @@ class SettingsDialog(QDialog):
             "is cleared there, and it returns to the same well.")
         lv_form.addRow("", self.lv_checkbox)
         lv = LowVolumeConfig.from_dict(getattr(self.app_state, "lv_config", {}) or {})
-        self.lv_dip_checkbox = QCheckBox("Leave on the suction dip (fastest)")
-        self.lv_dip_checkbox.setChecked(bool(lv.leave_on_dip))
-        self.lv_dip_checkbox.setToolTip(
-            "Leave the moment the needle starts pulling air (the dip on ch1/2/4), "
-            "without waiting ~50 s for the air to reach the sensor as a spike. "
-            "Faster; may occasionally leave a healthy well early.")
-        lv_form.addRow("", self.lv_dip_checkbox)
         self._lv_spins = {}
         for key, label, lo, hi, step, suffix in (
                 ("escalate_after_s", "Start checking signal after", 10, 3600, 10, " s"),
@@ -1519,8 +1512,7 @@ class SettingsDialog(QDialog):
             'notify_server': self.notify_server_edit.text().strip() or DEFAULT_SERVER,
             'notify_desktop': self.notify_desktop_checkbox.isChecked(),
             'lv_enabled': self.lv_checkbox.isChecked(),
-            'lv_config': dict({k: sp.value() for k, sp in self._lv_spins.items()},
-                              leave_on_dip=self.lv_dip_checkbox.isChecked()),
+            'lv_config': {k: sp.value() for k, sp in self._lv_spins.items()},
         }
 
 
@@ -3063,8 +3055,9 @@ class AsyncAMUZAGUI(QMainWindow):
                 self.add_to_display(f"Low-volume summary: {summary}")
                 logger.info(f"Low-volume summary: {summary}")
             if lv is not None and lv.flagged:
-                msg = (f"No valid plateau before the air in: {', '.join(lv.flagged)}. "
-                       "Those wells were empty or nothing flowed; do not trust their values.")
+                msg = (f"No confirmed valid sample in: {', '.join(lv.flagged)}. "
+                       "Those wells left without a steady plateau or without a confirmed "
+                       "bubble (empty, no flow, or unclear); check them before using their values.")
                 self.add_to_display("⚠ " + msg)
                 _notify(self, "MABIP: wells without a valid sample", msg,
                         priority="high", tags=["warning"], key="lv_flagged")

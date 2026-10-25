@@ -82,13 +82,16 @@ class LowVolumeConfig:
     hold_at_max_s: float = 60.0
     """How long to run at max_rate without air before calling it a clog."""
 
-    leave_on_dip: bool = True
-    """Leave the well on the suction-break dip, the moment the tip meets air
-    (no tube delay). Switches on the detector's fast-dip path (fast_dip),
-    chosen 22 Oct 2026 from a 10-method comparison over 30 runs: it caught
-    all 7 real dry wells ~5 s after the dip (the spike-confirming detector
-    caught 2/7 at ~33 s) at ~1.6 false alarms per in-well hour, about one
-    early exit every 33 wells. Off = wait for the air spike."""
+    leave_on_dip: bool = False
+    """Unused since the v3 detector (25 Oct 2026), which leaves only on a
+    CONFIRMED bubble after a steady plateau. Kept so older settings files
+    still load."""
+
+    dip_stale_empty: bool = False
+    """Leave when a tip dip is followed by a stale reading. Off by default:
+    a healthy plateau is flat, so a stray dip on it (e.g. a bad buffer draw)
+    plus that flat reading made early exits. Noah chose certainty over speed
+    (confirmed bubbles only)."""
 
     plateau_check: bool = True
     """Accept a well-empty call as a GOOD sample only if, just before the tip
@@ -283,7 +286,9 @@ class LowVolumeController:
         self._long.append((t, [_median([c[i] for c in last5]) for i in range(6)]))
         while self._long and t - self._long[0][0] > self.cfg.baseline_window_s:
             self._long.popleft()
-        keep = self.cfg.fresh_window_s + 30.0
+        # >= 150 s: the v3 detector confirms ~40 s after the air, and the
+        # plateau check then needs the 15-20 s before the air.
+        keep = max(self.cfg.fresh_window_s + 30.0, 150.0)
         while self._hist and t - self._hist[0][0] > keep:
             self._hist.popleft()
 
@@ -445,14 +450,19 @@ class LowVolumeController:
                 await self._go_home(conn)
                 if pump_ok and rate != base:
                     self._set_rate(base, "well done")
-                outcome = {"air": "empty", "noplateau": "empty-NO-PLATEAU"}.get(
-                    self._empty_reason, "empty-dip")
+                outcome = {"air": "empty", "noplateau": "empty-NO-PLATEAU",
+                           "unconfirmed": "empty-UNCONFIRMED"}.get(self._empty_reason, "empty-dip")
                 self.log.append((well, outcome, round(now - well_t0, 1), clears))
                 if self._empty_reason == "noplateau":
                     self.flagged.append(well)
                     self._say(on_progress, f"Buffer: {well} left after {now - entered:.0f}s: air "
                                            "with NO steady plateau before it (well empty or no "
                                            "flow) - its value is not valid, moving on")
+                elif self._empty_reason == "unconfirmed":
+                    self.flagged.append(well)
+                    self._say(on_progress, f"Buffer: {well} left after {now - entered:.0f}s: tip "
+                                           "met air but no bubble was confirmed and the signal "
+                                           "stayed stale at the max pump rate - check this well")
                 else:
                     why = {"air": "air spike", "dip": "suction dip"}.get(self._empty_reason, "dip")
                     self._say(on_progress, f"Buffer: {well} empty after {now - entered:.0f}s "
@@ -480,7 +490,7 @@ class LowVolumeController:
                     and (last_step is None or now - last_step >= cfg.step_every_s):
                 last_step = now
                 fresh = self.signal_fresh(now)
-                if fresh is False and self._last_dip is not None \
+                if cfg.dip_stale_empty and fresh is False and self._last_dip is not None \
                         and now - self._last_dip <= cfg.dip_stale_s:
                     # Tip met air, then the reading froze: the well is dry.
                     logger.info(f"Low-volume: {well} dip {now - self._last_dip:.0f}s ago and "
@@ -506,8 +516,9 @@ class LowVolumeController:
             if pump_ok and at_max_since is not None \
                     and now - at_max_since >= cfg.hold_at_max_s:
                 if self._last_dip is not None:
-                    # The tip met air in this well: it is dry, not clogged.
-                    self._empty_at, self._empty_reason = now, "dip"
+                    # The tip met air in this well, so it is probably dry, not
+                    # clogged, but no bubble was confirmed: leave, flagged.
+                    self._empty_at, self._empty_reason = now, "unconfirmed"
                     continue
                 clears += 1
                 if clears > cfg.max_clears:
@@ -561,7 +572,7 @@ class LowVolumeController:
 def build_detector(cfg: "LowVolumeConfig", flow_rate=None):
     """The well-empty detector for a low-volume run, configured from cfg."""
     from well_empty_detector import WellEmptyDetector
-    return WellEmptyDetector(flow_rate=flow_rate, fast_dip=bool(cfg.leave_on_dip))
+    return WellEmptyDetector(flow_rate=flow_rate)
 
 
 def _median(v):

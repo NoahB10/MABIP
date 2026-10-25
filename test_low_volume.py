@@ -280,9 +280,10 @@ def test_execute_method_hands_the_dwell_to_the_controller():
     assert sent[-1] == "@T"
 
 
-def test_detector_on_real_run_flags_only_the_dry_well():
-    """22 Oct 2026 14:21 run: while the needle was in a well, only H3 (the
-    candidate dry well) may be called EMPTY."""
+def test_detector_on_real_run_never_calls_a_healthy_well():
+    """22 Oct 2026 14:21 run: while the needle was in a well, no healthy well
+    may be called EMPTY (H3, the candidate dry well, is allowed but not
+    required: v3 only leaves on a confirmed bubble)."""
     import os
     from datetime import datetime
     from well_empty_detector import WellEmptyDetector
@@ -309,7 +310,7 @@ def test_detector_on_real_run_flags_only_the_dry_well():
         ev = det.update(t, ch)
         if ev and ev.kind == "EMPTY" and k and t - mv[k - 1] <= 150:
             in_well_empty.append(names[k - 1])
-    assert in_well_empty == ["H3"]
+    assert set(in_well_empty) <= {"H3"}
 
 
 
@@ -384,7 +385,7 @@ def test_dip_then_stale_is_empty_not_a_clog():
     That is a dry well; the pump must not be raised and no clog trip made."""
     pump = FakePump()
     det = DipDetector()
-    ctl = LowVolumeController(_cfg(leave_on_dip=False), det, pump=pump, poll_s=0.01)
+    ctl = LowVolumeController(_cfg(dip_stale_empty=True), det, pump=pump, poll_s=0.01)
     conn = FakeConn()
 
     async def go():
@@ -479,10 +480,32 @@ def test_slow_dip_alone_does_not_leave():
     assert ctl._empty_at is None and ctl._last_dip is not None
 
 
-def test_setting_switches_the_fast_dip_path():
+def test_build_detector_is_v3_confirmed_only():
     from low_volume import build_detector
-    assert build_detector(_cfg(leave_on_dip=True), 130).cfg.fast_dip is True
-    assert build_detector(_cfg(leave_on_dip=False), 130).cfg.fast_dip is False
+    d = build_detector(_cfg(), 130)
+    assert d.cfg.require_steady is True              # measure first
+    assert not hasattr(d.cfg, "fast_dip")              # no leave-on-dip path
+
+
+def test_dip_then_stale_by_default_escalates_then_leaves_flagged():
+    """Certainty first: a dip on a stale reading is not proof. The run escalates
+    and, still stale at the max with a dip seen, leaves flagged (not a clog trip)."""
+    pump = FakePump()
+    det = DipDetector()
+    ctl = LowVolumeController(_cfg(), det, pump=pump, poll_s=0.01)
+    conn = FakeConn()
+
+    async def go():
+        async def dip_soon():
+            await asyncio.sleep(0.05)
+            det.dip = True
+        asyncio.ensure_future(_stream(ctl, _signal("flat")))
+        asyncio.ensure_future(dip_soon())
+        return await ctl.run_in_well(conn, Method("A2", wait=60), 9, asyncio.Event())
+    assert asyncio.run(go()) is True
+    assert ctl.log[0][1] == "empty-UNCONFIRMED" and ctl.flagged == ["A2"]
+    assert pump.clears == 0
+
 
 
 # ---- plateau-before-the-air check -------------------------------------------
