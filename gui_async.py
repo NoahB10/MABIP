@@ -3062,6 +3062,12 @@ class AsyncAMUZAGUI(QMainWindow):
                                     for w, o, s, c in lv.log)
                 self.add_to_display(f"Low-volume summary: {summary}")
                 logger.info(f"Low-volume summary: {summary}")
+            if lv is not None and lv.flagged:
+                msg = (f"No valid plateau before the air in: {', '.join(lv.flagged)}. "
+                       "Those wells were empty or nothing flowed; do not trust their values.")
+                self.add_to_display("⚠ " + msg)
+                _notify(self, "MABIP: wells without a valid sample", msg,
+                        priority="high", tags=["warning"], key="lv_flagged")
             # The task is still executing right here, so this alone cannot
             # re-enable Start -- the done-callback from _watch_run_task does
             # that once it is genuinely finished. Called anyway so the nested

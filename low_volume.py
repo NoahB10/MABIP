@@ -90,6 +90,35 @@ class LowVolumeConfig:
     caught 2/7 at ~33 s) at ~1.6 false alarms per in-well hour, about one
     early exit every 33 wells. Off = wait for the air spike."""
 
+    plateau_check: bool = True
+    """Accept a well-empty call as a GOOD sample only if, just before the tip
+    met air, at least 2 channels sat on a flat plateau clearly above the
+    buffer baseline (Noah, 25 Oct 2026: "the flatline beforehand is
+    essential"). Scored on 15 labelled plates: false alarms 27 -> 20 with no
+    loss of bubbles in wells that had a plateau; on 22 Oct all 6 dry wells
+    with a plateau pass and the re-entry into an already-empty well fails.
+    A call WITHOUT a plateau is not ignored (the needle could be sitting in
+    an empty well): the run waits plateau_confirm_s for a plateau to appear
+    (then it was a glitch and listening continues), otherwise it leaves and
+    flags the well as having no valid plateau."""
+
+    plateau_window_s: float = 15.0
+    """Length of the window, ending plateau_gap_s before the air, that must be flat."""
+
+    plateau_gap_s: float = 2.0
+    """Gap left between the plateau window and the moment the tip met air."""
+
+    plateau_k: float = 8.0
+    """Plateau must sit this many noise units above the baseline."""
+
+    baseline_window_s: float = 600.0
+    """Baseline = the low (10th percentile of a 5-sample median) of the last
+    this-many seconds. Not the level just before the move: with a 60 s
+    buffer the previous well's tail is still there (22 Oct A2, A4)."""
+
+    plateau_confirm_s: float = 20.0
+    """After a call with no plateau, wait this long before leaving."""
+
     dip_stale_s: float = 180.0
     """A suction-break dip (the tip met air) followed by a stale signal within
     this long means the well is DRY, not clogged. Seen 22 Oct 2026 well A2:
@@ -171,10 +200,14 @@ class LowVolumeController:
         self._manual_next = False
         self._empty_reason = ""
         self._hist = deque()                      # (t, channels) for freshness
+        self._long = deque()                      # (t, 5-sample median) for the baseline
+        self._entered_t: Optional[float] = None
+        self._pending_noplat: Optional[float] = None
         self._dabs = [deque(maxlen=300) for _ in range(6)]
         self._prev = None
         self.last_error: Optional[str] = None
         self.log: list = []          # (well, outcome, seconds_in_well, clears)
+        self.flagged: list = []      # wells left with no valid plateau
 
     # ---- operator ---------------------------------------------------------
     def request_next(self) -> None:
@@ -210,8 +243,23 @@ class LowVolumeController:
                 self._last_dip = t
             logger.info(f"Low-volume: {getattr(ev, 'message', ev)}")
             return
+        reason = "dip" if "dip" in str(getattr(ev, "reason", "")) else "air"
+        if self.cfg.plateau_check:
+            t_air = getattr(ev, "t_air", None)
+            t_ref = t if t_air is None else min(t, float(t_air))
+            if not self.plateau_before(t_ref):
+                # No valid plateau before the air. Do not trust it, but do not
+                # ignore it either: wait for a plateau, else leave flagged.
+                if self._pending_noplat is None:
+                    self._pending_noplat = t
+                    logger.info(f"Low-volume: {getattr(ev, 'message', ev)} but NO steady "
+                                f"plateau before it; waiting {self.cfg.plateau_confirm_s:g}s")
+                if self._entered_t is not None and hasattr(self.detector, "rearm"):
+                    self.detector.rearm(self._entered_t)
+                return
+        self._pending_noplat = None
         self._empty_at = t
-        self._empty_reason = "dip" if "dip" in str(getattr(ev, "reason", "")) else "air"
+        self._empty_reason = reason
         logger.info(f"Low-volume: {getattr(ev, 'message', ev)}")
 
     # ---- freshness: is fresh fluid still reaching the sensor? -------------
@@ -225,6 +273,10 @@ class LowVolumeController:
                 self._dabs[i].append(abs(a - b))
         self._prev = ch
         self._hist.append((t, ch))
+        last5 = [c for _, c in list(self._hist)[-5:]]
+        self._long.append((t, [_median([c[i] for c in last5]) for i in range(6)]))
+        while self._long and t - self._long[0][0] > self.cfg.baseline_window_s:
+            self._long.popleft()
         keep = self.cfg.fresh_window_s + 30.0
         while self._hist and t - self._hist[0][0] > keep:
             self._hist.popleft()
@@ -253,10 +305,35 @@ class LowVolumeController:
                 moving += 1
         return moving >= self.cfg.fresh_min_channels
 
+    def _noise(self, i):
+        return max(_median(list(self._dabs[i])) * 1.4826 / 1.4142 if self._dabs[i] else 0.0, 1e-4)
+
+    def plateau_before(self, t_ref: float) -> bool:
+        """Was there a flat, non-baseline plateau just before t_ref?"""
+        cfg = self.cfg
+        lo, hi = t_ref - cfg.plateau_window_s - cfg.plateau_gap_s, t_ref - cfg.plateau_gap_s
+        seg = [c for tt, c in self._hist if lo <= tt <= hi]
+        base_pts = [c for tt, c in self._long if tt <= t_ref]
+        if len(seg) < 4 or len(base_pts) < 10:
+            return False
+        good = 0
+        for i in range(6):
+            v = sorted(c[i] for c in seg)
+            lvl = _median(v)
+            rng = v[int(0.9 * (len(v) - 1))] - v[int(0.1 * (len(v) - 1))]
+            b = sorted(c[i] for c in base_pts)
+            base = b[int(0.1 * (len(b) - 1))]
+            up, sig = lvl - base, self._noise(i)
+            if up >= cfg.plateau_k * sig and up >= 0.05 and rng <= 0.5 * up + 3 * sig:
+                good += 1
+        return good >= 2
+
     def _enter(self, t: float) -> None:
         self._in_well = True
         self._empty_at = None
         self._last_dip = None
+        self._entered_t = t
+        self._pending_noplat = None
         try:
             self.detector.note_move(t)
         except Exception as e:  # noqa: BLE001
@@ -346,16 +423,34 @@ class LowVolumeController:
                 self._say(on_progress, f"Buffer: {well} marked done by operator, moving on")
                 return True
 
+            # 1a. A call without a plateau: a plateau appearing now means it was a
+            #     glitch (keep sampling); none within plateau_confirm_s means the
+            #     well is empty or nothing flowed: leave, flagged.
+            if self._pending_noplat is not None and self._empty_at is None:
+                if self.plateau_before(now + cfg.plateau_gap_s):
+                    logger.info(f"Low-volume: {well} plateau present after all; call ignored")
+                    self._pending_noplat = None
+                elif now - self._pending_noplat >= cfg.plateau_confirm_s:
+                    self._empty_at, self._empty_reason = now, "noplateau"
+                    self._pending_noplat = None
+
             # 1. The well ran dry -> leave.
             if self._empty_at is not None:
                 await self._go_home(conn)
                 if pump_ok and rate != base:
                     self._set_rate(base, "well done")
-                outcome = "empty" if self._empty_reason == "air" else "empty-dip"
+                outcome = {"air": "empty", "noplateau": "empty-NO-PLATEAU"}.get(
+                    self._empty_reason, "empty-dip")
                 self.log.append((well, outcome, round(now - well_t0, 1), clears))
-                why = {"air": "air spike", "dip": "suction dip"}.get(self._empty_reason, "dip")
-                self._say(on_progress, f"Buffer: {well} empty after {now - entered:.0f}s "
-                                       f"({why}), moving on")
+                if self._empty_reason == "noplateau":
+                    self.flagged.append(well)
+                    self._say(on_progress, f"Buffer: {well} left after {now - entered:.0f}s: air "
+                                           "with NO steady plateau before it (well empty or no "
+                                           "flow) - its value is not valid, moving on")
+                else:
+                    why = {"air": "air spike", "dip": "suction dip"}.get(self._empty_reason, "dip")
+                    self._say(on_progress, f"Buffer: {well} empty after {now - entered:.0f}s "
+                                           f"({why}, plateau OK), moving on")
                 return True
 
             # 2. The robot ran out its dwell cap by itself.

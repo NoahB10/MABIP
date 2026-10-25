@@ -82,7 +82,7 @@ class FakeDetector:
 def _cfg(**kw):
     base = dict(max_dwell_s=900, escalate_after_s=0.1, step=20, step_every_s=0.05,
                 max_rate=160, hold_at_max_s=0.1, max_clears=2, clear_timeout_s=2.0,
-                fresh_window_s=0.1)
+                fresh_window_s=0.1, plateau_check=False)
     base.update(kw)
     return LowVolumeConfig(**base)
 
@@ -483,3 +483,103 @@ def test_setting_switches_the_fast_dip_path():
     from low_volume import build_detector
     assert build_detector(_cfg(leave_on_dip=True), 130).cfg.fast_dip is True
     assert build_detector(_cfg(leave_on_dip=False), 130).cfg.fast_dip is False
+
+
+# ---- plateau-before-the-air check -------------------------------------------
+
+def _plateau_cfg(**kw):
+    base = dict(escalate_after_s=100, plateau_check=True, plateau_window_s=0.15,
+                plateau_gap_s=0.02, baseline_window_s=5.0, plateau_confirm_s=0.2)
+    base.update(kw)
+    return _cfg(**base)
+
+
+class AirDetector(FakeDetector):
+    """Emits one EMPTY (with t_air = now) when told to, and records rearm()."""
+    def __init__(self):
+        super().__init__()
+        self.rearmed = 0
+
+    def update(self, t, ch):
+        if self.fire:
+            self.fire = False
+            class E:
+                kind, reason, message = "EMPTY", "suction-break dip (fast)", "air"
+            E.t_air = t
+            return E()
+        return None
+
+    def rearm(self, move_t):
+        self.rearmed += 1
+
+
+def _shape(kind):
+    """Signal at elapsed s: baseline, then a raised flat plateau ('plateau'),
+    or staying at baseline ('flat'), with small deterministic noise."""
+    import math
+    def f(el, i):
+        n = 0.002 * math.sin(i * 12.9898)
+        if kind == "plateau" and el > 0.3:
+            return [1.0 + n] * 6
+        if kind == "plateau-now":
+            return [1.0 + n] * 6
+        return [0.0 + n] * 6
+    return f
+
+
+def _run_with(shape, fire_at, plateau_later=None):
+    det = AirDetector()
+    ctl = LowVolumeController(_plateau_cfg(), det, pump=FakePump(), poll_s=0.01)
+    conn = FakeConn()
+
+    async def go():
+        sw = (plateau_later, _shape("plateau")) if plateau_later else None
+        asyncio.ensure_future(_stream(ctl, shape, switch=sw))
+        asyncio.ensure_future(_feed_after(ctl, det, fire_at))
+        return await ctl.run_in_well(conn, Method("B2", wait=60), 2, asyncio.Event())
+    return asyncio.run(go()), ctl, det
+
+
+def test_air_after_a_plateau_is_a_good_sample():
+    ok, ctl, det = _run_with(_shape("plateau"), 0.6)
+    assert ok is True
+    assert ctl.log[0][1] == "empty-dip" and ctl.flagged == []
+
+
+def test_air_without_a_plateau_still_leaves_but_is_flagged():
+    """The well may be empty: never sit there because the check failed."""
+    t0 = time.monotonic()
+    ok, ctl, det = _run_with(_shape("flat"), 0.6)
+    assert ok is True
+    assert ctl.log[0][1] == "empty-NO-PLATEAU" and ctl.flagged == ["B2"]
+    assert det.rearmed == 1                       # kept listening meanwhile
+    assert time.monotonic() - t0 < 3.0
+
+
+def test_plateau_appearing_after_the_call_cancels_it():
+    """A call with no plateau, then a plateau forms: it was a glitch, keep sampling."""
+    det = AirDetector()
+    ctl = LowVolumeController(_plateau_cfg(plateau_confirm_s=1.0), det, pump=FakePump(), poll_s=0.01)
+    conn = FakeConn()
+
+    async def go():
+        asyncio.ensure_future(_stream(ctl, _shape("flat"), switch=(0.65, _shape("plateau-now"))))
+        asyncio.ensure_future(_feed_after(ctl, det, 0.6))     # call with no plateau
+        asyncio.ensure_future(_feed_after(ctl, det, 1.4))     # real air after the plateau
+        return await ctl.run_in_well(conn, Method("B3", wait=60), 3, asyncio.Event())
+    assert asyncio.run(go()) is True
+    assert ctl.log[0][1] == "empty-dip" and ctl.flagged == []
+
+
+def test_plateau_check_can_be_switched_off():
+    det = AirDetector()
+    ctl = LowVolumeController(_cfg(escalate_after_s=100), det,
+                              pump=FakePump(), poll_s=0.01)
+    conn = FakeConn()
+
+    async def go():
+        asyncio.ensure_future(_stream(ctl, _shape("flat")))
+        asyncio.ensure_future(_feed_after(ctl, det, 0.3))
+        return await ctl.run_in_well(conn, Method("B4", wait=60), 4, asyncio.Event())
+    assert asyncio.run(go()) is True
+    assert ctl.log[0][1] == "empty-dip" and ctl.flagged == []

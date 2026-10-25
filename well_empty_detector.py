@@ -179,6 +179,12 @@ class WellEmptyDetector:
         self._best = None
         self._pend = []
 
+    def rearm(self, move_t: float) -> None:
+        """Keep judging the current well after a call was rejected upstream
+        (e.g. no plateau before it), without resetting what was learned."""
+        self._move_t = float(move_t)
+        self._armed = True
+
     def note_lift(self, t_s: float) -> None:
         """Call if the robot is pulled out deliberately (stops judging this well)."""
         self._armed = False
