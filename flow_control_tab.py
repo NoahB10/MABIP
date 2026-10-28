@@ -363,6 +363,7 @@ class FlowControlTab(QWidget):
         self._ff_enabled = False         # feed-forward pause/resume across moves
         self._ff_gen = 0                 # cancels stale pause/resume timers
         self._boost_until = 0.0          # monotonic time the well-entry boost ends
+        self._monitor_only = False       # run in monitor-only mode: no automatic pump changes
         self._last_air = False           # latest Fluigent air-bubble flag
         self._clearing = False           # True while the clog-clearing escalation runs
         self._abort_clear = False        # STOP / resume flag that unwinds the escalation
@@ -1793,6 +1794,20 @@ class FlowControlTab(QWidget):
                                  f"{r['expected_combined']:g} ({r['error_pct']:+.1f}%)")
         self._work(fn)
 
+    def set_monitor_only(self, on):
+        """Monitor-only run (low_volume.monitor_only): from now until it is
+        switched off, NOTHING here changes the pump by itself: no well-entry
+        boost, no feed-forward pause/resume, no flow-follows-wells ramps, no
+        per-well rate hold, no auto-burst, no automatic clog clearing. The
+        operator's own controls (Flow rate, Burst now, STOP) still work."""
+        self._monitor_only = bool(on)
+        if on:
+            self._ff_gen += 1                # cancel any pending boost-end / ff timer
+            self._phase_flow_gen += 1        # and any phase ramp in flight
+            self._boost_until = 0.0
+            self.status_msg.emit("Monitor-only run: automatic pump changes are OFF "
+                                 "(boost, feed-forward, auto-burst, auto clog-clear).")
+
     def set_override_rate(self, rate, label=""):
         """Run the pump at `rate` (combined line µL/min) now, cancelling any
         pending boost-end / feed-forward timer or phase ramp so it cannot step
@@ -1980,7 +1995,7 @@ class FlowControlTab(QWidget):
                 # the right to drive the pump on its own — that is opt-in, because
                 # a sensor reading ~0 (unprimed, dry, dropped out) is indistinguish-
                 # able from a real blockage and would burst against nothing.
-                if self.cfg.get("auto_clear", False):
+                if self.cfg.get("auto_clear", False) and not getattr(self, "_monitor_only", False):
                     self.status_msg.emit(f"⚠ [clog] {head} — auto-clearing.")
                     self.request_clog_clear("flow-sensor")
                 else:
@@ -2103,6 +2118,8 @@ class FlowControlTab(QWidget):
         boost_add = self._cfgf("ff_boost_add", 0.0)
         boost_s = self._cfgf("ff_boost_s", 0.0)
         boost = boost_add > 0 and boost_s > 0
+        if getattr(self, "_monitor_only", False):
+            return
         if (not self._ff_enabled and not boost) or self.line is None:
             return
         try:
@@ -2175,6 +2192,10 @@ class FlowControlTab(QWidget):
             self.lbl_phase.setText(f"phase: {phase}  (wells={n_wells})")
         except Exception:
             pass
+        if getattr(self, "_monitor_only", False):  # monitor-only: the phase never moves the pump
+            if phase != "buffer":
+                self._burst_done = False
+            return
         # flow-follows-wells: ramp the pump to the per-phase rate on a transition
         if self._exp_follow and self.line is not None and phase != prev:
             if phase == "buffer":
@@ -2336,7 +2357,7 @@ class FlowControlTab(QWidget):
         so the loop cannot stack them) and if no line rate is set to boost from.
 
         Returns True if a burst was actually started, False if declined."""
-        if self.line is None or self._busy or self._bursting:
+        if self.line is None or self._busy or self._bursting or getattr(self, "_monitor_only", False):
             return False
         if self._phase != "buffer":            # buffer only — never mid-well
             return False
@@ -2366,6 +2387,8 @@ class FlowControlTab(QWidget):
         NOT YET VERIFIED ON THE RIG — the reverse-push maneuver expels a small bolus
         back into the buffer; watch the first runs by hand."""
         if self.line is None or self._busy or self._bursting or self._clearing:
+            return False
+        if getattr(self, "_monitor_only", False):  # monitor-only: never clear by itself
             return False
         if self._phase == "well":              # never while recording a well
             return False

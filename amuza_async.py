@@ -989,10 +989,15 @@ class AsyncAmuzaConnection:
         on_progress: Optional[Callable[[str, int, int], None]] = None,
         on_move: Optional[Callable[[str], None]] = None,
         pause_gate: Optional[Callable[[], Awaitable[bool]]] = None,
-        dwell_controller=None
+        dwell_controller=None,
+        buffer_wait=None
     ) -> bool:
         """
         Execute a single method with interruptible waits.
+
+        buffer_wait(method, stop_event, on_progress) (async, -> bool): if given,
+        it replaces the fixed buffer_time wait (e.g. wash until the signal is
+        back at baseline). False abandons the sequence.
 
         dwell_controller (low_volume.LowVolumeController): if given, the move is
         sent with the controller's dwell cap and the controller decides when to
@@ -1015,7 +1020,11 @@ class AsyncAmuzaConnection:
         current_second = 0
 
         # Buffer time wait (interruptible)
-        if method.buffer_time > 0:
+        if buffer_wait is not None:
+            if not await buffer_wait(method, stop_event, on_progress):
+                logger.info("Stopped during buffer")
+                return False
+        elif method.buffer_time > 0:
             logger.info(f"Buffer wait: {method.buffer_time}s")
             for i in range(int(method.buffer_time * 2)):  # Check every 0.5s
                 if stop_event.is_set():
@@ -1165,7 +1174,8 @@ class AsyncAmuzaConnection:
         timing_provider: Optional[Callable[[], tuple]] = None,
         move_callback: Optional[Callable[[str], None]] = None,
         pause_gate: Optional[Callable[[], Awaitable[bool]]] = None,
-        dwell_controller=None
+        dwell_controller=None,
+        buffer_wait=None
     ) -> bool:
         """
         Execute a sequence of methods with stop support.
@@ -1215,7 +1225,8 @@ class AsyncAmuzaConnection:
                                                       on_progress=progress_callback,
                                                       on_move=move_callback,
                                                       pause_gate=pause_gate,
-                                                      dwell_controller=dwell_controller)
+                                                      dwell_controller=dwell_controller,
+                                                      buffer_wait=buffer_wait)
 
                 if not completed:
                     logger.info(f"Method not completed, stopping sequence")

@@ -29,6 +29,16 @@ Per well:
    the same well at the base rate and keep watching. Give up after
    ``max_clears`` clearing attempts and halt the run.
 
+Monitor-only (``monitor_only``, Noah 28 Oct 2026): the same leave-when-dry
+logic, but the pump is NEVER touched during the run: no step-ups, no clog
+clearing (and the GUI also turns off the well-entry boost, feed-forward pauses
+and auto-bursts). A stale signal that is not a valid plateau for
+``clog_after_s`` is a CLOG: it is logged, the operator is alerted, and the run
+pauses with the needle where it is. The operator fixes it (raises the Flow
+rate, or presses "Go to buffer"); the run continues by itself when the signal
+moves again (in the well) or is back at baseline (in the buffer), or when the
+operator presses Continue.
+
 The controller only decides; it talks to the robot, the pump and the detector
 through small interfaces so it can be tested without hardware. The robot side
 is ``AsyncAmuzaConnection`` itself; the pump side is ``FlowTabPump`` below.
@@ -199,6 +209,14 @@ class LowVolumeConfig:
     instead of waiting ~6 s for its slow-recovery check. Off: costs early leaves
     when the volume is unknown and gains only ~7 s."""
 
+    # ---- monitor-only (28 Oct 2026) -------------------------------------------
+    monitor_only: bool = False
+    """Never change the pump mid-run. A clog pauses the run and alerts the
+    operator instead of stepping the pump up and clearing at home."""
+
+    clog_after_s: float = 60.0
+    """Monitor-only: stale (flat, and not a valid plateau) this long = clog."""
+
     @classmethod
     def from_dict(cls, d: dict) -> "LowVolumeConfig":
         names = {f.name for f in fields(cls)}
@@ -289,6 +307,13 @@ class LowVolumeController:
         self._vol_at_drop: Optional[float] = None
         self._learned: list = []
         self._ignored = 0
+        # operator buttons / monitor-only pause
+        self._to_buffer = False
+        self._resume = False
+        self.state = ""              # "", "clog" (paused in the well), "buffer" (held in buffer)
+        self.clogged: list = []      # wells that clogged while the needle was in them
+        self.alert: Optional[Callable[[str, str], None]] = None   # (title, message) -> phone/desktop
+        self.wash_fn = None          # async (stop_event, on_progress, label, settle=True) -> wash result
 
     # ---- operator ---------------------------------------------------------
     def request_next(self) -> None:
@@ -297,7 +322,30 @@ class LowVolumeController:
         self._manual_next = True
         logger.info("Low-volume: operator marked the current well done")
 
+    def request_buffer(self) -> None:
+        """The operator wants the needle in the buffer now (e.g. to clear a
+        clog there). It goes back into the SAME well once the signal is back at
+        baseline, or when the operator presses Continue."""
+        self._to_buffer = True
+        logger.info("Low-volume: operator sent the needle to the buffer")
+
+    def request_resume(self) -> None:
+        """The operator says the clog is fixed / the buffer hold is done."""
+        self._resume = True
+        logger.info("Low-volume: operator pressed Continue")
+
+    def _alert(self, title, msg):
+        logger.warning(f"Low-volume: {title}: {msg}")
+        if self.alert:
+            try:
+                self.alert(title, msg)
+            except Exception as e:  # noqa: BLE001 — an alert failure must not kill the run
+                logger.debug(f"alert error: {e}")
+
     def _set_rate(self, rate, label):
+        if self.cfg.monitor_only:
+            logger.info(f"Low-volume: monitor-only, pump NOT changed ({label})")
+            return
         self.pump.set_rate(rate, label)
         if hasattr(self.detector, "set_flow_rate"):
             try:
@@ -544,6 +592,77 @@ class LowVolumeController:
         self._enter(self.clock())
         return True
 
+    async def _clog_pause_in_well(self, conn, stop_event, on_progress, well) -> str:
+        """Monitor-only: wait with the needle in the well until the operator
+        acts or the signal moves again. Never touches the pump."""
+        self.state = "clog"
+        t0 = self.clock()
+        pump_ok = self.pump is not None and self.pump.available and hasattr(self.pump, "current_rate")
+        try:
+            while True:
+                now = self.clock()
+                if stop_event.is_set():
+                    return "stop"
+                if self._manual_next:
+                    return "next"
+                if self._to_buffer:
+                    return "buffer"
+                if self._resume:
+                    self._resume = False
+                    return "resume"
+                if conn.is_ready():
+                    return "home"          # the robot ran out its dwell cap while paused
+                if self.signal_fresh(now) is True:
+                    return "fresh"
+                self._tick_volume(now, self.pump.current_rate() if pump_ok else None)
+                self._say(on_progress, f"Sampling: PAUSED - clog in {well} ({now - t0:.0f}s). Raise the "
+                                       "Flow rate, or press Go to buffer / Continue", log=False)
+                await asyncio.sleep(self.poll_s)
+        finally:
+            self.state = ""
+
+    async def _buffer_hold(self, stop_event, on_progress, well) -> str:
+        """Needle parked in the buffer at the operator's request. Back into the
+        same well when the wash reaches baseline or on Continue."""
+        self.state = "buffer"
+        task = None
+        if self.wash_fn is not None:
+            task = asyncio.ensure_future(self.wash_fn(stop_event, on_progress, f"{well} hold"))
+        capped = False
+        try:
+            while True:
+                if stop_event.is_set():
+                    return "stop"
+                if self._manual_next:
+                    return "next"
+                if self._resume:
+                    self._resume = False
+                    return "resume"
+                if task is not None and task.done():
+                    r = "stop" if task.cancelled() else task.result()
+                    task = None
+                    if r in ("baseline", "skip", "settled"):
+                        return "resume"
+                    if r == "stop":
+                        return "stop"
+                    if r in ("cap", "stuck"):
+                        if not capped:
+                            capped = True
+                            self._alert("MABIP: still not at baseline",
+                                        f"Needle in buffer before going back into {well}; the signal "
+                                        "has not returned to baseline. Fix the line, then press Continue.")
+                        # keep watching: back into the well the moment it IS back
+                        task = asyncio.ensure_future(self.wash_fn(stop_event, on_progress,
+                                                                  f"{well} hold", settle=False))
+                if task is None:
+                    self._say(on_progress, f"Buffer: holding before going back into {well}. "
+                                           "Press Continue when the line is fixed", log=False)
+                await asyncio.sleep(self.poll_s)
+        finally:
+            if task is not None and not task.done():
+                task.cancel()
+            self.state = ""
+
     def _say(self, on_progress, msg, log=True):
         if log:
             logger.info(f"Low-volume: {msg}")
@@ -562,6 +681,8 @@ class LowVolumeController:
         well = str(method.pos)
         self.last_error = None
         self._manual_next = False
+        self._to_buffer = False
+        self._resume = False
         self._empty_reason = ""
         self._enter(self.clock())
         entered = self.clock()
@@ -572,6 +693,8 @@ class LowVolumeController:
         last_step: Optional[float] = None
         at_max_since: Optional[float] = None
         clears = 0
+        stale_since: Optional[float] = None      # monitor-only clog clock
+        grace_until = entered + cfg.escalate_after_s
 
         while True:
             now = self.clock()
@@ -585,12 +708,37 @@ class LowVolumeController:
             # 0. The operator said this well is done.
             if self._manual_next:
                 self._manual_next = False
-                await self._go_home(conn)
+                if conn.is_ready():
+                    self._leave()          # already home (buffer hold)
+                else:
+                    await self._go_home(conn)
                 if pump_ok and rate != base:
                     self._set_rate(base, "well done (operator)")
                 self.log.append((well, "operator", round(now - well_t0, 1), clears))
                 self._say(on_progress, f"Buffer: {well} marked done by operator, moving on")
                 return True
+
+            # 0b. The operator sent the needle to the buffer: hold there, then go
+            #     back into the same well.
+            if self._to_buffer:
+                self._to_buffer = False
+                if conn.is_ready():
+                    self._leave()
+                else:
+                    await self._go_home(conn)
+                self._say(on_progress, f"Buffer: needle out of {well} (operator); back in when "
+                                       "the signal is at baseline, or on Continue")
+                r = await self._buffer_hold(stop_event, on_progress, well)
+                if r in ("stop", "next"):
+                    continue
+                if not await self._reenter(conn, method, port, on_move):
+                    self.last_error = f"AMUZA did not go back into {well} after the buffer hold."
+                    return False
+                self._say(on_progress, f"Sampling: back into {well}")
+                entered = self.clock()
+                grace_until = entered + cfg.escalate_after_s
+                rate, last_step, at_max_since, stale_since = base, None, None, None
+                continue
 
             # 1a. A call without a plateau: a plateau appearing now means it was a
             #     glitch (keep sampling); none within plateau_confirm_s means the
@@ -649,8 +797,51 @@ class LowVolumeController:
                 continue
 
             t_in = now - entered
-            self._say(on_progress, f"Sampling: well {well} (low-volume, {t_in:.0f}s"
-                                   + (f", pump {rate:g}" if pump_ok else "") + ")", log=False)
+            self._say(on_progress, f"Sampling: well {well} ("
+                                   + ("monitor" if cfg.monitor_only else "low-volume")
+                                   + f", {t_in:.0f}s"
+                                   + (f", pump {rate:g}" if pump_ok and not cfg.monitor_only else "")
+                                   + ")", log=False)
+
+            # 3m. Monitor-only: never touch the pump. A stale signal that is not
+            #     a valid plateau for clog_after_s is a clog: pause and alert.
+            if cfg.monitor_only:
+                if now >= grace_until and (last_step is None or now - last_step >= cfg.step_every_s):
+                    last_step = now
+                    fresh = self.signal_fresh(now)
+                    if fresh is False and self._plateau_ok():
+                        fresh = True           # flat on a valid plateau = healthy, not a clog
+                    if fresh is True:
+                        stale_since = None
+                    elif fresh is False and stale_since is None:
+                        stale_since = now
+                if stale_since is not None and now - stale_since >= cfg.clog_after_s:
+                    if self._last_dip is not None:
+                        # The tip met air in this well: dry, not clogged.
+                        self._empty_at, self._empty_reason = now, "unconfirmed"
+                        continue
+                    clears += 1
+                    if well not in self.clogged:
+                        self.clogged.append(well)
+                    msg = (f"Signal in {well} flat for {now - stale_since:.0f}s with no valid "
+                           "plateau. Run PAUSED, pump unchanged. Raise the Flow rate or press "
+                           "Go to buffer; it continues when the signal moves, or on Continue.")
+                    self._say(on_progress, f"Sampling: CLOG in {well} - paused")
+                    self._alert("MABIP: clog - run paused", msg)
+                    r = await self._clog_pause_in_well(conn, stop_event, on_progress, well)
+                    stale_since, last_step = None, None
+                    if r == "fresh":
+                        self._say(on_progress, f"Sampling: {well} signal moving again, continuing")
+                        self._alert("MABIP: flowing again", f"{well}: signal moving, run continuing.")
+                    elif r == "resume":
+                        self._say(on_progress, f"Sampling: {well} continuing (operator)")
+                        grace_until = self.clock() + cfg.escalate_after_s
+                    elif r == "home":
+                        # The robot's dwell cap ran out while paused: treat as a buffer hold.
+                        self._to_buffer = True
+                    continue
+                await asyncio.sleep(self.poll_s)
+                continue
 
             # 3. Past the grace period, judge the signal every step_every_s.
             #    Moving = fluid is arriving, leave the pump alone. Flat = stale,

@@ -71,6 +71,7 @@ from sensor_reader_async import AsyncPotentiostatReader
 from blockage_detector import BlockageDetector
 from notifier import Notifier, DEFAULT_SERVER
 from low_volume import LowVolumeConfig, LowVolumeController, FlowTabPump
+from wash_baseline import WashConfig, BaselineWash
 
 
 logger = logging.getLogger(__name__)
@@ -1417,6 +1418,15 @@ class SettingsDialog(QDialog):
             "is cleared there, and it returns to the same well.")
         lv_form.addRow("", self.lv_checkbox)
         lv = LowVolumeConfig.from_dict(getattr(self.app_state, "lv_config", {}) or {})
+        self.lv_monitor_checkbox = QCheckBox("Monitor only: never change the pump mid-run")
+        self.lv_monitor_checkbox.setChecked(bool(lv.monitor_only))
+        self.lv_monitor_checkbox.setToolTip(
+            "Stays in each well until it runs dry (like low-volume mode) and washes until "
+            "the signal is back at baseline, but never raises the pump, bursts or clears "
+            "by itself (no well-entry boost either). A clog is logged, you are alerted, "
+            "and the run PAUSES: raise the Flow rate or press 'Go to buffer'. It continues "
+            "when the signal moves again / is back at baseline, or when you press Continue.")
+        lv_form.addRow("", self.lv_monitor_checkbox)
         self._lv_spins = {}
         for key, label, lo, hi, step, suffix in (
                 ("escalate_after_s", "Start checking signal after", 10, 3600, 10, " s"),
@@ -1426,6 +1436,7 @@ class SettingsDialog(QDialog):
                 ("hold_at_max_s", "Clog if still stale at max for", 10, 1800, 10, " s"),
                 ("max_clears", "Clog clears per well", 0, 10, 1, ""),
                 ("max_dwell_s", "Safety cap per well", 60, 9999, 60, " s"),
+                ("clog_after_s", "Monitor only: clog if flat for", 10, 1800, 10, " s"),
                 ("well_volume_ul", "Liquid loaded per well (0 = not set)", 0, 5000, 10, " µL")):
             sp = QDoubleSpinBox() if key not in ("max_clears", "max_dwell_s") else QSpinBox()
             sp.setRange(lo, hi)
@@ -1437,6 +1448,32 @@ class SettingsDialog(QDialog):
             self._lv_spins[key] = sp
             lv_form.addRow(label + ":", sp)
         layout.addLayout(lv_form)
+
+        # Wash until the signal is back at the run's baseline (wash_baseline.py).
+        layout.addWidget(QLabel("<b>Wash between wells</b>"))
+        wash_form = QFormLayout()
+        wc = WashConfig.from_dict(getattr(self.app_state, "wash_config", {}) or {})
+        self.wash_checkbox = QCheckBox("End the wash when the signal is back at baseline")
+        self.wash_checkbox.setChecked(bool(wc.enabled))
+        self.wash_checkbox.setToolTip(
+            "Baseline = the 4 outputs just before the first well. After each well the "
+            "buffer wash ends when most outputs (3 of 4) are back 95 % of the way from "
+            "that well's plateau to the baseline, instead of after Buffer Time. Buffer "
+            "Time is still used once, before the first well. Always on in Monitor only.")
+        wash_form.addRow("", self.wash_checkbox)
+        self._wash_spins = {}
+        for key, label, lo, hi, step, suffix, scale in (
+                ("tol_frac", "Back = within", 1, 50, 1, " % of the plateau", 100.0),
+                ("majority", "Outputs that must be back (of 4)", 1, 4, 1, "", 1.0),
+                ("max_s", "Longest wash", 60, 7200, 60, " s", 1.0)):
+            sp = QSpinBox()
+            sp.setRange(lo, hi)
+            sp.setSingleStep(step)
+            sp.setValue(int(round(getattr(wc, key) * scale)))
+            sp.setSuffix(suffix)
+            self._wash_spins[key] = (sp, scale)
+            wash_form.addRow(label + ":", sp)
+        layout.addLayout(wash_form)
 
         # Validation message
         self.validation_label = QLabel("")
@@ -1513,7 +1550,10 @@ class SettingsDialog(QDialog):
             'notify_server': self.notify_server_edit.text().strip() or DEFAULT_SERVER,
             'notify_desktop': self.notify_desktop_checkbox.isChecked(),
             'lv_enabled': self.lv_checkbox.isChecked(),
-            'lv_config': {k: sp.value() for k, sp in self._lv_spins.items()},
+            'lv_config': dict({k: sp.value() for k, sp in self._lv_spins.items()},
+                              monitor_only=self.lv_monitor_checkbox.isChecked()),
+            'wash_config': dict({k: sp.value() / scale for k, (sp, scale) in self._wash_spins.items()},
+                                enabled=self.wash_checkbox.isChecked()),
         }
 
 
@@ -1795,6 +1835,9 @@ class AsyncAMUZAGUI(QMainWindow):
         self._active_seq_name: str = "Sampling Sequence"
         self._blockage_box = None                  # live blockage dialog, if any
         self._lv_controller = None                 # low-volume run in progress
+        self._wash = None                          # baseline wash monitor (wash_baseline.py)
+        self._wash_flagged: List[str] = []
+        self._wash_drift = 0
         self._last_burst_attempt: float = 0.0      # cooldown clock for clear bursts
 
         # Phone/desktop notifications for the events above (notifier.py).
@@ -1917,7 +1960,27 @@ class AsyncAMUZAGUI(QMainWindow):
         self.next_well_btn.setStyleSheet("QPushButton { background:#1565c0; color:white; font-weight:700; } QPushButton:hover{ background:#0d47a1; }")
         self.next_well_btn.clicked.connect(self._on_next_well)
         self.next_well_btn.setVisible(False)
-        left_col.addWidget(self.next_well_btn)
+        self.to_buffer_btn = QPushButton("Go to buffer")
+        self.to_buffer_btn.setToolTip(
+            "Take the needle out of the current well into the buffer now (e.g. to fix a "
+            "clog there). It goes back into the SAME well when the signal is back at "
+            "baseline, or when you press Continue.")
+        self.to_buffer_btn.setStyleSheet(self.next_well_btn.styleSheet())
+        self.to_buffer_btn.clicked.connect(self._on_to_buffer)
+        self.to_buffer_btn.setVisible(False)
+        self.continue_btn = QPushButton("Continue")
+        self.continue_btn.setToolTip(
+            "Clog fixed / wash done: continue now. During a clog pause the run keeps "
+            "reading this well; in the buffer it goes on (back into the well, or to the "
+            "next well) without waiting for the baseline.")
+        self.continue_btn.setStyleSheet("QPushButton { background:#2e7d32; color:white; font-weight:700; } QPushButton:hover{ background:#1b5e20; }")
+        self.continue_btn.clicked.connect(self._on_continue)
+        self.continue_btn.setVisible(False)
+        op_row = QHBoxLayout()
+        op_row.addWidget(self.next_well_btn)
+        op_row.addWidget(self.to_buffer_btn)
+        op_row.addWidget(self.continue_btn)
+        left_col.addLayout(op_row)
 
         self.settings_btn = QPushButton("Settings")
         self.settings_btn.clicked.connect(self._on_settings)
@@ -2355,19 +2418,147 @@ class AsyncAMUZAGUI(QMainWindow):
         lv.request_next()
         self.add_to_display("Marking this well done — moving to the next well…")
 
+    def _on_to_buffer(self):
+        lv = self._lv_controller
+        if lv is None:
+            self.add_to_display("Not in a low-volume / monitor run.")
+            return
+        lv.request_buffer()
+        self.add_to_display("Needle to the buffer — back into this well at baseline or on Continue…")
+
+    def _on_continue(self):
+        lv = self._lv_controller
+        wash = getattr(self, "_wash", None)
+        if lv is not None and lv.state:
+            lv.request_resume()
+            self.add_to_display("Continue: carrying on with this well…")
+        elif wash is not None:
+            wash.request_skip()
+            self.add_to_display("Continue: wash marked done, moving on…")
+        else:
+            self.add_to_display("Nothing is waiting.")
+
+    def _make_wash(self, fresh: bool):
+        """The run's baseline-wash monitor, or None when the wash is timed.
+
+        A RESUME keeps the existing one: its baseline is still the values from
+        before the FIRST well of the run, which is what the wash returns to."""
+        cfg = WashConfig.from_dict(getattr(self.app_state, "wash_config", {}) or {})
+        monitor = bool((getattr(self.app_state, "lv_config", {}) or {}).get("monitor_only"))
+        if not (cfg.enabled or monitor):
+            return None
+        old = getattr(self, "_wash", None)
+        if not fresh and old is not None and old.baseline is not None:
+            old.cfg = cfg
+            return old
+        tab = getattr(self, "flow_tab", None)
+        pump = FlowTabPump(tab)
+        return BaselineWash(cfg, rate_fn=(pump.current_rate if pump.available else None))
+
+    async def _wash_buffer_wait(self, wash, monitor, method, stop_event, on_progress) -> bool:
+        """The buffer phase before each move when the wash ends at baseline.
+
+        First well: the fixed Buffer Time, then the baseline is taken from the
+        readings just before the move. Every later well: wash until the
+        outputs are back at that baseline."""
+        if wash.baseline is None:
+            # The baseline is a measurement: confirm the flow is at the Flow
+            # rate first (closed loop; no-op when settling is off or no pump).
+            pump = FlowTabPump(getattr(self, "flow_tab", None))
+            if pump.available and pump.base_rate() > 0:
+                if not await self._settle_flow_to(pump.base_rate(), "the baseline"):
+                    return False
+            t0 = time.monotonic()
+            while time.monotonic() - t0 < method.buffer_time:
+                if stop_event.is_set():
+                    return False
+                el = int(time.monotonic() - t0)
+                on_progress(f"Buffer: {el}/{method.buffer_time}s (then baseline)", el, method.buffer_time)
+                await asyncio.sleep(0.5)
+            t1 = time.monotonic()
+            while not wash.set_baseline():
+                if stop_event.is_set():
+                    return False
+                if time.monotonic() - t1 > wash.cfg.base_window_s + 30.0:
+                    msg = ("No sensor readings to set the baseline from. "
+                           + ("Monitor-only needs the sensor: run NOT started." if monitor
+                              else "Using the fixed Buffer Time for this run."))
+                    self.add_to_display("⚠ " + msg)
+                    if monitor:
+                        self.connection.last_error = msg
+                        return False
+                    return True
+                on_progress("Buffer: measuring the baseline", 0, 0)
+                await asyncio.sleep(0.5)
+            self.add_to_display("Baseline set (4 outputs before the first well).")
+            return True
+        held = False
+        while True:
+            r = await wash.wait(stop_event, on_progress, label=str(method.pos), settle=not held)
+            last = wash.last or {}
+            rec = last.get("recovered")
+            rec_s = "" if rec is None else f", {100 * rec:.0f} % of the way back"
+            if r == "baseline":
+                self.add_to_display(f"Wash done (back at baseline, {last.get('seconds', 0):.0f}s) "
+                                    f"→ {method.pos}")
+                return True
+            if r == "skip":
+                if held:
+                    # The operator accepts the buffer level as it is now: make it the
+                    # baseline, or every later wash would hold the same way.
+                    wash.rebase()
+                    self.add_to_display("Continue: the current buffer level is the new baseline.")
+                self.add_to_display(f"Wash ended by Continue ({last.get('seconds', 0):.0f}s) → {method.pos}")
+                return True
+            if r == "settled":
+                self._wash_drift += 1
+                self.add_to_display(f"Wash settled{rec_s} (baseline drift, "
+                                    f"{last.get('seconds', 0):.0f}s) → {method.pos}")
+                return True
+            if r == "stop":
+                return False
+            if r == "nobaseline":
+                return True
+            # "stuck" (flat, far from baseline) or "cap" (longest wash reached)
+            why = ("stopped moving far from the baseline" if r == "stuck"
+                   else f"not back after {wash.cfg.max_s:.0f}s")
+            msg = (f"Wash before {method.pos}: {why} ({last.get('back', 0)}/4 at baseline{rec_s}). "
+                   "The line may not be washing (clog?).")
+            if not monitor:
+                self.add_to_display("⚠ " + msg + " Moving on; check this wash.")
+                self._wash_flagged.append(str(method.pos))
+                return True
+            if not held:
+                held = True
+                self.add_to_display("⚠ " + msg + " Holding in the buffer: fix the line (it goes "
+                                    "on by itself at baseline) or press Continue to accept the "
+                                    "current level as the new baseline.")
+                _notify(self, "MABIP: wash stuck - run held", msg + " Run held in the buffer; "
+                        "fix the line or press Continue.", priority="high", tags=["warning"],
+                        key="wash_cap")
+
     def _make_lv_controller(self):
         """A fresh low-volume controller if the mode is on, else None."""
-        if not getattr(self.app_state, "lv_enabled", False):
+        lv_cfg = getattr(self.app_state, "lv_config", {}) or {}
+        if not getattr(self.app_state, "lv_enabled", False) and not lv_cfg.get("monitor_only"):
             return None
         from low_volume import build_detector
-        cfg = LowVolumeConfig.from_dict(getattr(self.app_state, "lv_config", {}) or {})
+        cfg = LowVolumeConfig.from_dict(lv_cfg)
         tab = getattr(self, "flow_tab", None)
         pump = FlowTabPump(tab)
         rate = pump.base_rate() if pump.available else None
-        self.add_to_display(
-            "Low-volume mode: each well runs until it is empty"
-            + ("" if pump.available else " (no pump connected: no escalation or clog clearing)"))
-        return LowVolumeController(cfg, build_detector(cfg, rate), pump=pump)
+        if cfg.monitor_only:
+            self.add_to_display("Monitor-only mode: each well runs until it is empty, the wash "
+                                "until baseline; the pump is never changed by the run")
+        else:
+            self.add_to_display(
+                "Low-volume mode: each well runs until it is empty"
+                + ("" if pump.available else " (no pump connected: no escalation or clog clearing)"))
+        ctl = LowVolumeController(cfg, build_detector(cfg, rate), pump=pump)
+        ctl.alert = lambda title, msg: (self.add_to_display("⚠ " + msg),
+                                        _notify(self, title, msg, priority="high",
+                                                tags=["warning"], key="lv_" + title))
+        return ctl
 
     def _track_blockage(self, reading):
         """Feed the metabolite channels to the flow-sensor-independent blockage
@@ -2967,6 +3158,8 @@ class AsyncAMUZAGUI(QMainWindow):
             def on_seq_move(well_id):
                 # Fired the instant a move command is sent -> feed-forward pump
                 self._well_started[well_id] = time.monotonic()
+                if self._wash is not None:
+                    self._wash.note_move(time.monotonic())
                 tab = getattr(self, "flow_tab", None)
                 if tab is not None:
                     tab.on_move_command(well_id)
@@ -2986,7 +3179,27 @@ class AsyncAMUZAGUI(QMainWindow):
             self._lv_controller = self._make_lv_controller()
             _set_detector_cycling(self, self._lv_controller is None)
             self.next_well_btn.setVisible(self._lv_controller is not None)
+            self.to_buffer_btn.setVisible(self._lv_controller is not None)
             self.connection.last_error = None
+
+            # Wash to baseline (and monitor-only: no automatic pump changes).
+            lv = self._lv_controller
+            monitor = lv is not None and lv.cfg.monitor_only
+            self._wash = self._make_wash(fresh=not self.is_paused)
+            self._wash_flagged = []
+            self._wash_drift = 0
+            self.continue_btn.setVisible(self._wash is not None or lv is not None)
+            buffer_wait = None
+            if self._wash is not None:
+                wash = self._wash
+
+                async def buffer_wait(method, ev, on_progress):
+                    return await self._wash_buffer_wait(wash, monitor, method, ev, on_progress)
+                if lv is not None:
+                    lv.wash_fn = lambda ev, prog, label, settle=True: wash.wait(
+                        ev, prog, label=label, settle=settle)
+            if monitor and getattr(self, "flow_tab", None) is not None:
+                self.flow_tab.set_monitor_only(True)
 
             completed = await self.connection.execute_sequence(
                 sequence,
@@ -2996,7 +3209,8 @@ class AsyncAMUZAGUI(QMainWindow):
                 timing_provider=get_current_timing,
                 move_callback=on_seq_move,
                 pause_gate=pause_gate,
-                dwell_controller=self._lv_controller
+                dwell_controller=self._lv_controller,
+                buffer_wait=buffer_wait
             )
 
             # Wells sampled through a blockage returned stale fluid, so their
@@ -3050,6 +3264,21 @@ class AsyncAMUZAGUI(QMainWindow):
             _set_detector_cycling(self, False)
             lv, self._lv_controller = self._lv_controller, None
             self.next_well_btn.setVisible(False)
+            self.to_buffer_btn.setVisible(False)
+            self.continue_btn.setVisible(False)
+            if getattr(self, "flow_tab", None) is not None and hasattr(self.flow_tab, "set_monitor_only"):
+                self.flow_tab.set_monitor_only(False)
+            if lv is not None and lv.clogged:
+                msg = (f"Clogged while sampling: {', '.join(lv.clogged)}. The run paused there; "
+                       "check those wells' values.")
+                self.add_to_display("⚠ " + msg)
+                logger.info(msg)
+            if getattr(self, "_wash_flagged", None):
+                self.add_to_display("⚠ Wash did not reach baseline before: "
+                                    + ", ".join(self._wash_flagged))
+            if getattr(self, "_wash_drift", 0):
+                self.add_to_display(f"Note: {self._wash_drift} wash(es) ended 'settled' - the buffer "
+                                    "level had drifted from the first baseline.")
             if lv is not None and lv.log:
                 summary = ", ".join(f"{w} {o} {s:.0f}s" + (f" ({c} clears)" if c else "")
                                     for w, o, s, c in lv.log)
@@ -3622,7 +3851,13 @@ class AsyncAMUZAGUI(QMainWindow):
             self.app_state.notify_desktop = values['notify_desktop']
             self.app_state.lv_enabled = values['lv_enabled']
             self.app_state.lv_config = values['lv_config']
-            if values['lv_enabled']:
+            self.app_state.wash_config = values['wash_config']
+            if values['lv_config'].get('monitor_only'):
+                c = LowVolumeConfig.from_dict(values['lv_config'])
+                self.add_to_display(
+                    f"Monitor-only mode ON: stay until the well is dry, wash to baseline, never "
+                    f"change the pump; a signal flat for {c.clog_after_s:g}s is a clog -> pause + alert.")
+            elif values['lv_enabled']:
                 c = LowVolumeConfig.from_dict(values['lv_config'])
                 self.add_to_display(
                     f"Low-volume mode ON: stay until air; from {c.escalate_after_s:g}s check "
@@ -3813,6 +4048,9 @@ class AsyncAMUZAGUI(QMainWindow):
                 lv = self._lv_controller
                 if lv is not None:
                     lv.feed(time.monotonic(), reading.channels[:6])
+                wash = getattr(self, "_wash", None)
+                if wash is not None:
+                    wash.feed(time.monotonic(), reading.channels[:6])
 
             # Fresh detector per connection: the healthy-amplitude baseline is
             # specific to this run's electrodes and timing. Seed the cycle from

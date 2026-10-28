@@ -62,6 +62,9 @@ class AppState:
     lv_enabled: bool = False
     lv_config: Dict[str, float] = field(default_factory=dict)
 
+    # Wash until the signal is back at the run's baseline (wash_baseline.py).
+    wash_config: Dict[str, float] = field(default_factory=dict)
+
     # Calibration gains
     calibration_gains: Dict[str, float] = field(default_factory=lambda: {
         "Glutamate": 3.394,
@@ -228,6 +231,7 @@ class AppState:
             "notify_desktop": self.notify_desktop,
             "lv_enabled": self.lv_enabled,
             "lv_config": self.lv_config,
+            "wash_config": self.wash_config,
         }
 
         try:
@@ -270,6 +274,8 @@ class AppState:
                     self.lv_enabled = bool(settings["lv_enabled"])
                 if isinstance(settings.get("lv_config"), dict):
                     self.lv_config = dict(settings["lv_config"])
+                if isinstance(settings.get("wash_config"), dict):
+                    self.wash_config = dict(settings["wash_config"])
 
                 print(f"Settings loaded from {SETTINGS_FILE}")
         except Exception as e:
